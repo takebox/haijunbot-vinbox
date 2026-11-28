@@ -1,0 +1,623 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "HaijunBot system configuration schema",
+  "description": "HaijunBot system configuration schema",
+  "type": "object",
+  "properties": {
+    "mcp": {
+      "type": "array",
+      "description": "List of MCP tool configurations",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "sse",
+              "streamable",
+              "stdio"
+            ],
+            "description": "MCP client type. sse/streamable types require base_url; stdio type requires command"
+          },
+          "base_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "MCP server base URL (required for sse/streamable types; not needed for stdio type)"
+          },
+          "auth_token": {
+            "type": "string",
+            "description": "Authentication token (optional for sse/streamable types)"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Additional HTTP headers (optional for sse/streamable types)"
+          },
+          "endpoint_path": {
+            "type": "string",
+            "default": "mcp",
+            "description": "MCP server endpoint path (optional for streamable type). If base_url already contains the endpoint path, it can be set to an empty string. Default value is 'mcp'"
+          },
+          "timeout": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 2,
+            "maxItems": 2,
+            "default": [
+              10,
+              300
+            ],
+            "description": "Request timeout array [connect timeout, read timeout] (in seconds, optional for streamable type). Default value is [10, 300], meaning a connect timeout of 10 seconds and a read timeout of 300 seconds"
+          },
+          "command": {
+            "type": "string",
+            "description": "Command to execute (required for stdio type; not needed for sse/streamable types)"
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of command arguments (optional for stdio type)"
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Environment variables (optional for stdio type)"
+          },
+          "name": {
+            "type": "string",
+            "description": "Tool name (optional)"
+          },
+          "enable": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether to enable this tool (optional)"
+          }
+        }
+      }
+    },
+    "ENV": {
+      "type": "object",
+      "description": "Additional environment variables to set",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {}
+    },
+    "plugin_dirs": {
+      "type": "array",
+      "description": "List of plugin directory paths; each directory should contain a config.yaml file. Plugin configuration is merged into the main configuration, with priority: project config > plugin config > user global config",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "git_commit_prompt": {
+      "type": "string",
+      "description": "Prompt template for generating Git commit messages",
+      "default": ""
+    },
+    "llms": {
+      "type": "object",
+      "description": "Reusable LLM configuration definitions that can be referenced by name in llm_groups",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "platform": {
+            "type": "string",
+            "description": "Platform name. Use 'free' for the free-tier providers (OpenRouter, Groq, Together, Hugging Face, Gemini, 9Router, OmniRoute, OpenCode, FreeBuff) and for the optional paid lanes (OpenAI, Anthropic, Google).",
+            "default": "free"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model name"
+          },
+          "max_input_token_count": {
+            "type": "number",
+            "description": "Maximum number of input tokens",
+            "default": 200000
+          },
+          "llm_config": {
+            "type": "object",
+            "description": "LLM-specific configuration parameters, passed to the LLM client",
+            "additionalProperties": true,
+            "default": {},
+            "properties": {
+              "provider": {
+                "type": "string",
+                "description": "Provider id inside the 'free' platform. Its base URL and API key are filled from the catalog; the key can also come from the provider's environment variable.",
+                "enum": [
+                  "openrouter",
+                  "groq",
+                  "together",
+                  "huggingface",
+                  "gemini",
+                  "9router",
+                  "omniroute",
+                  "opencode",
+                  "freebuff",
+                  "openai",
+                  "anthropic",
+                  "google"
+                ],
+                "default": "groq"
+              },
+              "openai_api_key": {
+                "type": "string",
+                "description": "Provider API key. Leave empty to read it from the provider's environment variable."
+              },
+              "openai_api_base": {
+                "type": "string",
+                "description": "Override the provider base URL (optional; the catalog default is used otherwise)."
+              }
+            }
+          }
+        },
+        "required": [
+          "platform",
+          "model"
+        ]
+      },
+      "default": {}
+    },
+    "llm_group": {
+      "type": "string",
+      "description": "Select a predefined model group",
+      "default": ""
+    },
+    "llm_groups": {
+      "type": "object",
+      "description": "Predefined model configuration groups, keyed by group name. Each group must reference configurations defined in llms via normal_llm, cheap_llm, smart_llm, eval_llm; directly defining platform, model, and other parameters is no longer supported",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "normal_llm": {
+            "type": "string",
+            "description": "Name of the normal-operation LLM configuration defined in llms (required)"
+          },
+          "cheap_llm": {
+            "type": "string",
+            "description": "Name of the cheap-operation LLM configuration defined in llms (optional)"
+          },
+          "smart_llm": {
+            "type": "string",
+            "description": "Name of the smart-operation LLM configuration defined in llms (optional)"
+          },
+          "eval_llm": {
+            "type": "string",
+            "description": "Name of the structured-evaluation LLM configuration defined in llms (optional, used for decision scenarios where the model makes judgments; falls back to the Normal model if not configured)"
+          },
+          "fallback_group": {
+            "type": "string",
+            "description": "Fallback model group name (optional; must be a group name already defined in llm_groups). Only in non-interactive mode, when the models of this group fail consecutively, it automatically switches to the fallback group; no switching occurs in interactive mode or when not configured"
+          },
+          "ENV": {
+            "type": "object",
+            "description": "Environment variables specific to this model group, overriding the global ENV configuration",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "normal_llm"
+        ]
+      },
+      "default": {}
+    },
+    "execute_tool_confirm": {
+      "type": "boolean",
+      "description": "Whether confirmation is required before executing a tool",
+      "default": false
+    },
+    "tool_load_dirs": {
+      "type": "array",
+      "description": "Custom tool loading directories",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "agent_definition_dirs": {
+      "type": "array",
+      "description": "Agent definition loading directories",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "roles_dirs": {
+      "type": "array",
+      "description": "Roles loading directories",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "rules_load_dirs": {
+      "type": "array",
+      "description": "Rules loading directories",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "after_tool_call_cb_dirs": {
+      "type": "array",
+      "description": "Tool-call post-callback implementation directories",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "before_tool_call_cb_dirs": {
+      "type": "array",
+      "description": "Tool-call pre-callback implementation directories (supports intercepting and modifying tool arguments)",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "before_model_call_cb_dirs": {
+      "type": "array",
+      "description": "Model-call pre-callback implementation directories (supports extending, modifying, or compressing prompts)",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "summary_cb_dirs": {
+      "type": "array",
+      "description": "Summary callback implementation directories (including before_summary and after_summary; supports optimizing summary results or injecting knowledge)",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "central_tool_repo": {
+      "type": "string",
+      "description": "Central tool repository path or Git repository URL. Supports local directories (including git sub-paths): if it is a local directory, tools are loaded directly from it; if it is a Git URL, it is cloned into the data directory and loaded.",
+      "default": ""
+    },
+    "central_rules_repo": {
+      "type": "string",
+      "description": "Central rules repository path or Git repository URL. Supports local directories (including git sub-paths): if it is a local directory, it is added directly to the rule loading paths; if it is a Git URL, it is cloned into the data directory and loaded.",
+      "default": ""
+    },
+    "default_rule_names": {
+      "type": "array",
+      "description": "List of rule names loaded by default. These rules are merged with the --rule-names command-line argument (merged after deduplication). Supports predefining commonly used rules in the configuration file while retaining the flexibility of command-line overrides.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "print_prompt": {
+      "type": "boolean",
+      "description": "Whether to print prompts",
+      "default": false
+    },
+    "enable_tmux": {
+      "type": "boolean",
+      "description": "Whether to enable tmux functionality",
+      "default": false
+    },
+    "build_validation_timeout": {
+      "type": "number",
+      "description": "Timeout for build validation (in seconds). When build validation execution time exceeds this value, validation is terminated and a timeout is reported.",
+      "default": 30
+    },
+    "build_validation": {
+      "type": "object",
+      "description": "Static user configuration for build validation (separate from runtime state; runtime state is stored in a separate build_validation_state.yaml)",
+      "properties": {
+        "disable_build_validation": {
+          "type": "boolean",
+          "description": "Whether to disable build validation"
+        },
+        "disable_reason": {
+          "type": "string",
+          "description": "Reason for disabling build validation"
+        },
+        "custom_build_command": {
+          "type": "string",
+          "description": "Custom build command, replacing the default build validation command"
+        }
+      },
+      "additionalProperties": false
+    },
+    "enable_autonomous": {
+      "type": "boolean",
+      "description": "Whether to enable smart enhancement features (emotion recognition, ambiguity detection, conversation management, proactive interaction)",
+      "default": false
+    },
+    "enable_native_tool_calls": {
+      "type": "boolean",
+      "description": "Whether to enable native function calling (sending structured tool definitions to models that support tools). Endpoints that do not support tools automatically degrade to the plain-text protocol",
+      "default": true
+    },
+    "request_timeout": {
+      "type": "number",
+      "description": "SDK request timeout (in seconds). When not configured or set to 0, the default value 300 (5 minutes) is used to avoid requests being permanently blocked by server issues; an explicitly configured valid value takes precedence",
+      "default": 300
+    },
+    "builtin_input_handler_dirs": {
+      "type": "array",
+      "description": "List of directories for built-in input handler extension scripts; Python files in these directories are scanned and custom input handlers are dynamically registered",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "haijunbot_github_url": {
+      "type": "string",
+      "description": "GitHub repository URL for HaijunBot; the default value is written automatically when not configured",
+      "default": "https://github.com/takebox/HaijunBot.git"
+    },
+    "haijunbot_gitee_url": {
+      "type": "string",
+      "description": "Gitee repository URL for HaijunBot; the default value is written automatically when not configured",
+      "default": "https://gitee.com/takebox/HaijunBot.git"
+    },
+    "lsp": {
+      "type": "object",
+      "description": "LSP (Language Server Protocol) configuration. The haijunbot-lsp CLI and the web editor (Monaco) share this configuration, which is the single source of truth. User configuration is merged with the built-in default language configuration; for same-named languages, the user configuration takes precedence",
+      "properties": {
+        "languages": {
+          "type": "object",
+          "description": "LSP configuration defined by language name, fully overriding the built-in configuration for the same-named language. To add a new language, just add an entry here without modifying code",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string",
+                "description": "Language server launch command (executable name or absolute path). Put arguments in args, not in the same string"
+              },
+              "args": {
+                "type": "array",
+                "description": "List of language server launch arguments, e.g. [\"--stdio\"]",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "file_extensions": {
+                "type": "array",
+                "description": "List of file extensions for this language, e.g. [\".py\", \".pyi\"], used to match languages by extension",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "monaco_language": {
+                "type": "string",
+                "description": "Language id for the Monaco editor, e.g. python / typescript / rust. Defaults to the language name when empty"
+              },
+              "root_markers": {
+                "type": "array",
+                "description": "Marker files used to determine the workspace root directory, e.g. [\"pyproject.toml\", \".git\"]",
+                "items": {
+                  "type": "string"
+                },
+                "default": []
+              },
+              "initialization_options": {
+                "type": "object",
+                "description": "Initialization options passed to the LSP initialize request",
+                "default": {}
+              },
+              "install_hint": {
+                "type": "string",
+                "description": "Hint text shown to the user when the language server is not installed, e.g. \"pip install python-lsp-server\"",
+                "default": ""
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        }
+      },
+      "default": {}
+    },
+    "gateway_auth": {
+      "type": "object",
+      "description": "Gateway authentication configuration (password)",
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "description": "Whether to enable Gateway authentication",
+          "default": false
+        },
+        "password": {
+          "type": "string",
+          "description": "Fixed password (optional)"
+        },
+        "allow_unset": {
+          "type": "boolean",
+          "description": "Whether to allow access when authentication information is not configured (allowed by default, to remain compatible with the local CLI)",
+          "default": true
+        }
+      },
+      "default": {}
+    },
+    "save_session_history": {
+      "type": "boolean",
+      "description": "Whether to save session history",
+      "default": false
+    },
+    "auto_resume_session": {
+      "type": "boolean",
+      "description": "Whether to automatically resume the session (automatically resumes the most recent session on startup, without manual selection)",
+      "default": false
+    },
+    "skip_predefined_tasks": {
+      "type": "boolean",
+      "description": "Whether to skip loading predefined tasks (does not read the pre-command list)",
+      "default": false
+    },
+    "enable_request_classification": {
+      "type": "boolean",
+      "description": "Whether to enable request classification. When enabled, CodeAgent classifies the user request on its first run and loads the corresponding system prompt based on the classification result",
+      "default": false
+    },
+    "enable_quick_mode": {
+      "type": "boolean",
+      "description": "Whether to enable quick mode. When enabled, CodeAgent skips steps such as task classification, automatic rule loading, context recommendation, and methodology loading, and directly processes the user request. The command-line options -q/--quick also enable this mode",
+      "default": false
+    },
+    "enable_audit": {
+      "type": "boolean",
+      "description": "Whether to enable the audit system. When enabled, the Agent's key behavior events (user input, tool calls, task completion, etc.) are recorded to JSONL audit logs under the ~/.haijunbot/audit/ directory for security review and behavior tracking. Disabled by default",
+      "default": false
+    },
+    "tool_group": {
+      "type": "string",
+      "description": "Select a predefined tool configuration group",
+      "default": ""
+    },
+    "tool_groups": {
+      "type": "array",
+      "description": "Predefined tool configuration groups",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "use": {
+              "type": "array",
+              "description": "List of tool names to use",
+              "items": {
+                "type": "string"
+              }
+            },
+            "dont_use": {
+              "type": "array",
+              "description": "List of tool names not to use",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "submit_keys": {
+      "oneOf": [
+        {
+          "type": "array",
+          "description": "Multiline input submit shortcut list (array format)",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "string",
+          "description": "Multiline input submit shortcut (string format, comma-separated)"
+        }
+      ],
+      "default": [
+        "c-j",
+        "c-]",
+        "c-d"
+      ],
+      "description": "Multiline input submit shortcuts. Supports array format (e.g. [\"c-j\", \"c-]\", \"c-d\"]) or string format (e.g. \"c-j,c-],c-d\"). Defaults are Ctrl+J, Ctrl+], and Ctrl+D. Common shortcuts: c-j (Ctrl+J), c-] (Ctrl+]), c-d (Ctrl+D), c-enter (Ctrl+Enter)"
+    },
+    "replace_map": {
+      "type": "object",
+      "description": "Custom replacement map configuration",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "append": {
+            "type": "boolean",
+            "description": "Whether to append to existing template"
+          },
+          "template": {
+            "type": "string",
+            "description": "Replacement template content"
+          },
+          "description": {
+            "type": "string",
+            "description": "Description of the replacement"
+          }
+        },
+        "required": [
+          "template"
+        ]
+      },
+      "default": {}
+    },
+    "after_change_tools": {
+      "type": "object",
+      "description": "Configuration of tool commands to run after file changes (e.g. formatting). Keys are file extensions or file names (e.g. .py, Makefile), and values are lists of command templates. Templates support the {file_path} and {file_name} placeholders",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "default": {}
+    },
+    "lint_tools": {
+      "type": "object",
+      "description": "Static check (lint) tool command configuration. Keys are file extensions or file names (e.g. .py, Makefile), and values are lists of command templates. Templates support the {file_path}, {file_name}, and {config} placeholders",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "default": {}
+    },
+    "dependencies": {
+      "type": "object",
+      "description": "Plugin dependency declaration (used in plugin config.yaml). Supports three categories: plugins (plugin dependencies), python (Python package dependencies), and commands (system command dependencies). The old format, a flat dict ({plugin name: version constraint}) or list, is treated as plugin dependencies",
+      "properties": {
+        "plugins": {
+          "type": [
+            "object",
+            "array"
+          ],
+          "description": "Plugin dependencies: other installed HaijunBot plugins. Object form is {plugin name: version constraint}; array form is [{name, version}]",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "python": {
+          "type": [
+            "object",
+            "array"
+          ],
+          "description": "Python package dependencies. Object form is {package name: version constraint}; array form is [{name, version}]",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "commands": {
+          "type": [
+            "array",
+            "object"
+          ],
+          "description": "System command dependencies. Array form is [\"git\", \"jq\"]; object form is {\"git\": any value}",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

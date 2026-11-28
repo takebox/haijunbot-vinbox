@@ -1,0 +1,99 @@
+digraph G {
+  // --- Global Settings ---
+  graph [rankdir="LR", splines=polyline, fontname="Sans-serif", label="Diagram Title: [Use Case View] Actors and System Interaction Use Cases", labelloc="t", newrank=true, nodesep=0.9, ranksep=1.2, overlap=false];
+  node [shape=ellipse, style="filled", fillcolor="#EFEFEF", fontname="Sans-serif"];
+  edge [fontname="Sans-serif"];
+
+  // Actors
+  subgraph cluster_actors {
+    label = "Actors";
+    style = "filled";
+    color = "#dddddd";
+    node [shape=box, fillcolor="#FFE6CC", color="#D79B00"];
+    actor_user [label="CLI User (Terminal User)"];
+    actor_llm [label="LLM Platform (OpenAI/Haijun)"];
+    actor_mcp [label="MCP Service Provider (External Tools)"];
+    actor_git [label="Git Repository/Local Project"];
+    actor_web [label="Internet/Web Resources"];
+  }
+
+  // Use cases (system functions)
+  subgraph cluster_usecases {
+    label = "HaijunBot System Use Cases";
+    style = "filled";
+    color = "#e8e8e8";
+    node [shape=ellipse, fillcolor="#DAE8FC", color="#6C8EBF"];
+
+    // Sessions and tasks
+    uc_start [label="Start HaijunBot Assistant and Initialize Environment"];
+    uc_input_task [label="Input Multi-line Task/Supplementary Information"];
+    uc_select_task [label="Select Predefined Task and Add Supplementary Information"];
+    uc_interrupt [label="Interrupt Execution and Provide Supplementary Instructions"];
+    uc_save_session [label="Save Session"];
+    uc_restore_session [label="Restore Session"];
+
+    // Tool invocation and execution
+    uc_confirm_tool [label="Confirm Tool Execution"];
+    uc_shell_script [label="Run Shell Script (! Prefix) and Feedback Results"];
+    uc_edit_file [label="Edit/Rewrite File Content (PATCH Tool)"];
+    uc_memory_ops [label="Save/Retrieve Memory (save/retrieve_memory)"];
+    uc_search_web [label="Search Web Information and Summarize"];
+    uc_sub_agent [label="Delegate Sub-Agent/Sub-CodeAgent to Execute Sub-tasks"];
+    uc_mcp_tools [label="Invoke External MCP Tools"];
+    uc_tool_usage [label="View Tool Usage Instructions (ToolUsage)"];
+
+    // Configuration and data management
+    uc_edit_config [label="Edit Configuration File (Auto-select Editor)"];
+    uc_interactive_config [label="Interactive Configuration Wizard (Supplementary Settings)"];
+    uc_backup_data [label="Backup Data Directory (~/.haijunbot)"];
+    uc_restore_data [label="Restore Data Directory (~/.haijunbot)"];
+    uc_builtin_configs [label="Select Built-in Configuration (agent/multi_agent/roles)"];
+    uc_switch_jca [label="Detect Git repository and switch to code development mode (hca)"];
+
+    // Methodology and tool sharing
+    uc_share_method [label="Share Local Methodology to Central Repository"];
+    uc_share_tool [label="Share Local Tools to Central Repository"];
+  }
+
+  // Actor to use case relationships
+  actor_user -> uc_start;
+  actor_user -> uc_input_task;
+  actor_user -> uc_select_task;
+  actor_user -> uc_interrupt;
+  actor_user -> uc_save_session;
+  actor_user -> uc_restore_session;
+  actor_user -> uc_confirm_tool;
+  actor_user -> uc_shell_script;
+  actor_user -> uc_edit_file;
+  actor_user -> uc_memory_ops;
+  actor_user -> uc_search_web;
+  actor_user -> uc_sub_agent;
+  actor_user -> uc_mcp_tools;
+  actor_user -> uc_tool_usage;
+  actor_user -> uc_edit_config;
+  actor_user -> uc_interactive_config;
+  actor_user -> uc_backup_data;
+  actor_user -> uc_restore_data;
+  actor_user -> uc_builtin_configs;
+  actor_user -> uc_switch_jca;
+  actor_user -> uc_share_method;
+  actor_user -> uc_share_tool;
+
+  // Supporting actor to related use case relationships (auxiliary/external systems)
+  actor_llm -> uc_input_task [xlabel="Model Conversation/Streaming Output"];
+  actor_llm -> uc_search_web [xlabel="Model Summarization and Web Mode"];
+  actor_llm -> uc_edit_file [xlabel="Summarize/Upload File When Context Overflow"];
+  actor_llm -> uc_sub_agent [xlabel="Sub-task Model Invocation"];
+  actor_llm -> uc_mcp_tools [xlabel="Model Collaboration (When Necessary)"];
+
+  actor_mcp -> uc_mcp_tools [xlabel="Provide External Tool Capabilities"];
+  actor_web -> uc_search_web [xlabel="Scrape Page Content"];
+  actor_git -> uc_switch_jca [xlabel="Detect Git Root Directory"];
+  actor_git -> uc_share_tool [xlabel="Repository Sync/Commit"];
+  actor_git -> uc_share_method [xlabel="Repository Sync/Commit"];
+  actor_git -> uc_backup_data [xlabel="Archive/Compress"];
+  actor_git -> uc_restore_data [xlabel="Decompress/Overwrite"];
+
+  // Alignment
+  { rank=same; actor_user; actor_llm; actor_mcp; actor_git; actor_web; }
+}

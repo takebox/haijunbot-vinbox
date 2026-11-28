@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HaijunBot</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+         background:#0d1110; color:#e6efe9; }
+  header { display:flex; align-items:center; gap:12px; padding:16px 20px;
+            border-bottom:1px solid #1d2a24; background:#111815; }
+  header h1 { margin:0; font-size:17px; letter-spacing:.3px; }
+  header .sub { color:#7e9488; font-size:12px; margin-left:auto; }
+  header .refresh-btn {
+    margin-left: 12px;
+    padding: 4px 8px;
+    font-size: 11px;
+    background: #1e3a5f;
+    color: #e6efe9;
+    border: 1px solid #2d4a7e;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  header .refresh-btn:hover { background: #2d4a7e; }
+  main { padding:18px; display:grid; gap:14px;
+         grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); }
+  section { background:#121b18; border:1px solid #1f2f28; border-radius:12px; padding:14px; }
+  section h2 { margin:0 0 10px; font-size:12px; text-transform:uppercase;
+                letter-spacing:.8px; color:#8fb5a1; }
+  .value { font-size:14px; word-break:break-word; }
+  .muted { color:#6f857a; }
+  .badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:999px;
+            margin-left:6px; border:1px solid transparent; }
+  .badge.ok { background:#123a2a; color:#7be3aa; border-color:#1d5c42; }
+  .badge.warn { background:#3a2412; color:#ffbb7b; border-color:#5c3d1d; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td { padding:5px 0; border-bottom:1px dashed #1f2f28; }
+  tr:last-child td { border-bottom:none; }
+  .wide { grid-column:1/-1; }
+  .hint { margin:0; font-size:12px; color:#6f857a; }
+</style>
+<script>
+  let refreshTimeout = null;
+  function startAutoRefresh() {
+    refreshTimeout = setInterval(() => {
+      window.location.reload();
+    }, 30000);
+  }
+  function stopAutoRefresh() {
+    if (refreshTimeout) {
+      clearInterval(refreshTimeout);
+      refreshTimeout = null;
+    }
+  }
+  document.addEventListener('DOMContentLoaded', startAutoRefresh);
+</script>
+</head>
+<body>
+<header>
+  <h1>HaijunBot</h1>
+  <span class="badge ok">Vinbox</span>
+  <span class="badge warn">CDP mati</span>
+  <span class="sub"></span>
+  <button class="refresh-btn" title="Refresh status" onclick="window.location.reload()">↻</button>
+</header>
+<main>
+  <section>
+    <h2>Model (dari Vinbox)</h2>
+    <div class="value">opencode:deepseek-v4.1-flash-free</div>
+    <p class="hint">Dipilih di Settings → MODELS. HaijunBot tidak punya konfigurasi model sendiri.</p>
+  </section>
+  <section>
+    <h2>Browser</h2>
+    <div class="value">Chromium Vinbox</div>
+    <p class="hint">http://127.0.0.1:9222/json/version</p>
+  </section>
+  <section>
+    <h2>Shell</h2>
+    <div class="/usr/bin/pwsh</div>
+    <p class="hint">cwd: &lt;project-root&gt;/app/program-file</p>
+  </section>
+  <section>
+    <h2>Data</h2>
+    <div class="value">&lt;data-dir&gt;/data/haijunbot</div>
+    <p class="hint">0 sesi · 0.2 KB</p>
+  </section>
+  <section class="wide">
+    <h2>Berkas terbaru di data HaijunBot</h2>
+    <table><tbody><tr><td>executions.jsonl</td><td>0.2 KB</td><td>2026-11-12 22:42</td></tr></tbody></table>
+  </section>
+  <section class="wide">
+    <h2>Terakhir Dieksekusi</h2>
+    <table><tbody><tr><td colspan="5" class="muted">belum ada eksekusi</td></tr></tbody></table>
+  </section>
+</main>
+</body>
+</html>

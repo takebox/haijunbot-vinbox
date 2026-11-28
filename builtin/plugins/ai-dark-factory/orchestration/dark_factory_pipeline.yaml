@@ -1,0 +1,152 @@
+---
+# AI Agent Dark Factory Pipeline Orchestration Template
+# Based on ai-dark-factory plugin's orchestration rules (sw-controller coordinates only, does not execute).
+# Collaboration: planner plans → holdout generates hidden acceptance scenarios → generator generates (TDD)
+#       → validator independently evaluates → regression prevents regression → orchestrator summarizes for human approval.
+# Design orientation: Not fully unattended — fully automated segments (planning/generation/validation/regression) can be unattended,
+#           gate checkpoints retain human approval gates.
+#
+# ⚠ This file is a 【REFERENCE TEMPLATE】 only, demonstrating four-layer architecture and flow format/capabilities.
+#   Each task should dynamically generate orchestration file (saved as .df/pipeline.yaml), confirm with user, then execute.
+agents:
+  - name: "df_planner"
+    working_dir: "."
+    task: |
+      You are the Planner of the AI Dark Factory pipeline.
+      Read NLSpec, decompose functionality into implementation plan, clarify each generator's task boundaries and deliverables.
+      ## Responsibilities
+      1. Parse spec's four elements: Goal / Constraints / Interfaces / Non-goals.
+      2. Decompose functionality into independently implementable and verifiable subtasks.
+      3. Clarify interface contracts and acceptance criteria for each subtask.
+      4. Output structured implementation plan for generator execution.
+      ## Code of Conduct
+      1. Plan only, do not write code, do not overstep execution boundaries.
+      2. Follow spec_writing rules: constraints must be explicit, one spec per functionality.
+      3. Plan must be verifiable: each subtask has clear acceptance criteria.
+  - name: "df_holdout"
+    working_dir: "."
+    task: |
+      You are the Holdout Generator of the AI Dark Factory pipeline.
+      Read NLSpec and implementation plan, generate holdout scenarios 【invisible to coding side】.
+      ## Responsibilities
+      1. Use holdout_generator tool to generate scenario skeleton, then refine into acceptance scenarios for this functionality based on spec's Goal/Interfaces
+        (covering normal/boundary/exception/contract/compatibility).
+      2. Scenarios must originate from spec: each scenario corresponds to a Goal or Interface contract in spec.
+      3. Write scenarios to .df/holdout.json, marked hidden=true.
+      ## Code of Conduct
+      1. Follow holdout_discipline rules: scenarios never disclosed to coding agent.
+      2. Only generate acceptance scenarios, do not write implementation code, do not evaluate.
+      3. Scenarios must be executable and determinable pass/fail.
+  - name: "df_generator"
+    working_dir: "."
+    task: |
+      You are the Generator of the AI Dark Factory pipeline.
+      Based on planner's implementation plan and NLSpec, write code using TDD iron law.
+      ## Responsibilities
+      1. Write tests first (red), then implementation (green), then refactor.
+      2. Produce verifiable code and tests satisfying spec's interface contracts.
+      3. Follow spec's Constraints, do not overstep implementing Non-goals.
+      ## Code of Conduct
+      1. Follow tdd_iron_rule: no code without failing tests.
+      2. Follow spec_writing rules: constraints explicit, no filling gaps by judgment.
+      3. Output must be independently evaluable, do not hide tests.
+      4. Never view .df/holdout.json (holdout scenarios invisible to coding side).
+  - name: "df_validator"
+    working_dir: "."
+    task: |
+      You are the Validator of the AI Dark Factory pipeline.
+      Hold holdout scenarios (invisible to coding side), use them to independently evaluate generator's output.
+      ## Responsibilities
+      1. Read .df/holdout.json, use holdout scenarios to test generator's output,
+        record pass/fail per scenario.
+      2. Run each scenario 3 times, 2-of-3 pass to smooth LLM variance.
+      3. Output per-scenario pass/fail report to .df/report.json.
+      ## Code of Conduct
+      1. Follow holdout_discipline rules: holdout scenarios never disclosed to coding agent.
+      2. Evaluation independent and objective, do not relax standards due to generator's implementation.
+      3. Report must be structured for orchestrator aggregation.
+  - name: "df_regression"
+    working_dir: "."
+    task: |
+      You are the Regression Validator of the AI Dark Factory pipeline.
+      Run existing test suite to confirm generator's changes introduced no regression.
+      ## Responsibilities
+      1. Identify and run project's existing test commands (e.g., pytest / project-conventional test commands).
+      2. Record pass/fail results and failure details, write to .df/regression.json.
+      3. Only validate regression, do not modify code, do not evaluate new functionality (new functionality evaluated by validator).
+      ## Code of Conduct
+      1. Only run existing tests, do not add tests, do not modify code.
+      2. Regression failures must be reported truthfully, must not be ignored.
+      3. Report structured for orchestrator aggregation.
+  - name: "df_orchestrator"
+    working_dir: "."
+    task: |
+      You are the Orchestrator of the AI Dark Factory pipeline, coordinates only, does not execute.
+      Aggregate validator and regression reports, calculate gate metrics, output approval report for human approval gate.
+      ## Responsibilities
+      1. Read .df/gate_metrics.json historical ledger (if exists), pass cumulative
+        false_positives/human_overrides/total_human_reviews along with current results
+        to gate_calculator to calculate scenario pass rate, false positive rate, human override rate.
+      2. Determine if gate standards met (scenario pass rate >= 90% and regression passed).
+      3. Output structured approval report: per-scenario pass rates, failed scenario details, regression results, change diff summary.
+      ## Code of Conduct
+      1. Follow orchestration rules: coordinate only, do not execute, do not personally write code or tests.
+      2. Not fully unattended: no auto-merge, approval report to human approval gate.
+      3. Humans review pass/fail reports, do not review code line by line.
+
+# Pipeline execution order (optional field): for pipeline_runner built-in orchestration engine to drive.
+# Without flow, @OrganizeAgents still only creates agents (backward compatible); with flow, drives sequentially.
+# Artifact contract: each stage output saved to disk then passed to next stage input; orchestrator is gate (gate: true).
+#
+# ── Orchestration Engine Capability List (for selecting when dynamically generating orchestration files)──────────────────────────
+# Linear/DAG: default depends_on absent = previous stage (linear); explicit declaration enables parallel/multi-dependency.
+#   stage        Stage name (unique, for depends_on/when reference)
+#   agent        References name in agents
+#   input        Upstream artifact path; single string auto-converted to single-element list, multiple inputs as list
+#   output       This stage artifact path; non-empty and globally unique (duplicate errors)
+#   depends_on   List of dependent stages; default = previous stage (first stage has no dependency)
+#   when         Restricted expression: stage.field comparison/logic (== != >= <= > < && || !),
+#                skipped if not satisfied; fields from upstream status_file and artifact JSON content
+#   retry        Failure retry count (integer, default 0)
+#   on_error     Failure strategy: abort (default, immediate halt) / continue / skip_dependents
+#   gate         Gate: true when approve=false stops waiting for human approval
+# Top-level optional default_on_error: global default for stages without declared on_error (invalid values fall back to abort).
+# Top-level optional spec: injected as background for each stage (optional; not injected if absent).
+# Parallelism: top-level max_workers (default 4), limits concurrent stage Agents.
+# loop runtime loop primitive (re-run entire section until until satisfied or limit reached):
+#   - loop: "<loop name>"
+#     body: [stageA, stageB]        # Subgraph of already declared stages
+#     until: "contains(file(\".df/report.json\"), \"\\\"pass_rate\\\": 1.0\")"
+#     max_iterations: 3
+#   until whitelist functions: file("relative artifact path") (read artifact content within work_dir),
+#                              contains(text, substr).
+#   Applicable: scenarios needing "re-run until pass" (e.g., fix→re-validate loop).
+# ─────────────────────────────────────────────────────────────────────────
+flow:
+  - stage: "planner"
+    agent: "df_planner"
+    output: ".df/plan.md"              # Implementation plan
+  - stage: "holdout"
+    agent: "df_holdout"
+    input: ".df/plan.md"               # Depends on planner artifact
+    output: ".df/holdout.json"         # Hidden acceptance scenarios (invisible to coding side, only passed to validator)
+  - stage: "generator"
+    agent: "df_generator"
+    input: ".df/plan.md"               # Only consumes planner artifact; holdout never injected (isolation)
+    # No independent output: generator directly modifies code in working_dir (existing codebase),
+    # artifact is codebase changes (visible via git diff), not generated to separate directory.
+  - stage: "validator"
+    agent: "df_validator"
+    input: ".df/holdout.json"          # Only consumes holdout scenarios (isolation), validates modified working directory
+    output: ".df/report.json"          # Pass/fail report
+    retry: 1                           # Retry once on failure (2-of-3 implemented internally by validator)
+  - stage: "regression"
+    agent: "df_regression"
+    input: ".df/report.json"           # Depends on validation report
+    output: ".df/regression.json"      # Regression result
+    on_error: "abort"                  # Regression failure halts immediately, to human
+  - stage: "orchestrator"
+    agent: "df_orchestrator"
+    input: [".df/report.json", ".df/regression.json"]   # Depends on validation+regression reports
+    output: ".df/approval.md"          # Approval report (to human)
+    gate: true                         # Gate: stops waiting for human approval

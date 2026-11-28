@@ -1,0 +1,132 @@
+name: release-haijunbot-vinbox
+on:
+  push:
+    tags:
+      - "v*"
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            nama: linux
+          - os: macos-latest
+            nama: macos
+          - os: windows-latest
+            nama: windows
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # vite 8 butuh Node >= 20.19 / 22.12, jadi pakai 22 (bukan 20).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: src/haijunbot/haijunbot_service/frontend/package-lock.json
+
+      - name: Build frontend (di OS runner masing-masing, bukan di G:/)
+        working-directory: src/haijunbot/haijunbot_service/frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+          ls -lh dist
+          test -f dist/index.html
+
+      - name: Install build backend
+        run: pip install build
+
+      - name: Build Python wheel
+        run: python -m build --wheel --outdir dist/
+
+      - name: "Cek isi wheel (GERBANG: frontend ikut + tidak ada G:)"
+        run: |
+          ls -lh dist/
+          python -m zipfile -l dist/*.whl > wheel-list.txt
+          wc -l wheel-list.txt
+          grep -m 5 -E "frontend/dist/(index.html|assets/)" wheel-list.txt
+          grep -q "frontend/dist/index.html" wheel-list.txt \
+            || { echo "GAGAL: wheel tidak berisi frontend/dist/index.html"; exit 1; }
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          # Pola path mesin build (bukan byte acak di file minified/biner,
+          # dan bukan placeholder dokumentasi seperti C:\Users\<user>).
+          bad_patterns = [
+              b"G:\\package",
+              b"G:/package",
+              b"G:\\vinbox",
+              b"G:/vinbox",
+              b"C:\\Users\\runneradmin",
+              b"C:/Users/runneradmin",
+              b"D:\\a\\",
+              b"haijunbot-vinbox\\haijunbot-vinbox",
+              b"/home/runner/work/haijunbot-vinbox",
+              b"/Users/runner/work/haijunbot-vinbox",
+          ]
+          hits = []
+          entries = 0
+          for whl in sorted(glob.glob("dist/*.whl")):
+              with zipfile.ZipFile(whl) as z:
+                  names = z.namelist()
+                  entries += len(names)
+                  for name in names:
+                      if "node_modules/" in name:
+                          hits.append((whl, name, "node_modules ikut masuk wheel"))
+                          continue
+                      data = z.read(name)
+                      for pattern in bad_patterns:
+                          if pattern in data:
+                              hits.append((whl, name, pattern.decode("utf-8", "replace")))
+          print(f"{entries} entri diperiksa")
+          if hits:
+              print("GAGAL: ADA path mesin build di dalam wheel:")
+              for whl, name, pattern in hits[:20]:
+                  print(f"  {whl} :: {name} :: {pattern}")
+              raise SystemExit(1)
+          print("BERSIH - tidak ada path G:/C:/D: di dalam wheel")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: haijunbot-${{ matrix.nama }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Verifikasi 3 wheel dari 3 runner
+        shell: bash
+        run: |
+          find ./artifacts -name '*.whl' -print
+          count=$(find ./artifacts -name '*.whl' | wc -l)
+          if [ "$count" -ne 3 ]; then
+            echo "GAGAL: butuh 3 wheel (linux+macos+windows), dapat $count"
+            exit 1
+          fi
+          sha256sum ./artifacts/*/*.whl | tee SHA256SUMS-3runners.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          # Wheel-nya py3-none-any, jadi 3 runner menghasilkan nama file yang sama.
+          # Release menyimpan 1 wheel kanonik (build ubuntu-latest) + bukti hash 3 runner.
+          files: |
+            ./artifacts/haijunbot-linux/*.whl
+            SHA256SUMS-3runners.txt

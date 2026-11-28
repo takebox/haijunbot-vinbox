@@ -1,0 +1,222 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "haijunbot-ai-assistant"
+version = "6.1.0"
+description = "HaijunBot: An AI assistant that uses tools to interact with the system"
+readme = "README.md"
+authors = [{ name = "skyfire", email = "haijunbot@outlook.co.id" }]
+license = { file = "LICENSE" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+keywords = ["haijunbot", "ai", "assistant", "tools", "automation"]
+dependencies = [
+    "requests==2.32.3",
+    "charset-normalizer>=3.0.0",
+    "playwright==1.48.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "colorama==0.4.6",
+    "prompt_toolkit==3.0.50",
+    "pygments==2.19.2",
+    "fuzzywuzzy==0.18.0",
+    "fastapi==0.115.12",
+    "uvicorn[standard]==0.33.0",
+    "rich==14.2.0",
+    "python-Levenshtein==0.25.1",
+    "tiktoken==0.7.0",
+
+    "openai==1.78.1",
+    "juglow>=0.1.0",
+    "python-lsp-server>=1.14.0",
+    "pyte==0.8.2",
+    "pyyaml>=5.3.1",
+    "jsonnet>=0.20.0",
+    "ddgr",
+    "jinja2>=3.0.0",
+    "lxml==6.0.0",
+    "markdownify>=1.1.0",
+    "beautifulsoup4>=4.0.0",
+    "typer",
+    "packaging>=24.2",
+    "tree-sitter==0.25.2; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-javascript==0.25.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-typescript==0.23.2; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-rust==0.24.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-go==0.25.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-java==0.23.5; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-cpp==0.23.4; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-c==0.24.1; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-json==0.24.8; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-python==0.25.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-html==0.23.2; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-css==0.25.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-sql==0.3.11; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-bash==0.25.1; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-yaml==0.7.2; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "tree-sitter-markdown==0.5.1; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    "pywinauto>=0.6.9; sys_platform == 'win32'",
+    "pywinpty>=2.0.0; sys_platform == 'win32'",
+    "websockets",
+    "httpx",
+    "jieba",
+    "aiohttp>=3.9.0",
+    "psutil>=5.9.0",
+    "PyJWT>=2.7.0",
+    "bcrypt>=4.0.0",
+    # OCR text recognition: pytesseract is a Python wrapper for the system tesseract engine (lightweight),
+    # pillow is used for image reading; heavy backends (rapidocr/paddleocr/easyocr) see optional-dependencies
+    "pytesseract>=0.3.10",
+    "pillow>=10.0.0",
+    ]
+    requires-python = "==3.12.*"
+
+    [project.optional-dependencies]
+    browser = ["playwright==1.48.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'"]
+    dev = [
+        "pytest",
+        "pytest-xdist",
+        "pytest-asyncio",
+        "ruff",
+        "ty",
+        "bandit",
+        "build",
+        "twine",
+        "mkdocs-material",
+        "mkdocs-git-revision-date-localized-plugin",
+        "pymdown-extensions",
+    ]
+    # Harbor adapter tests (tests/haijunbot_eval); the adapter supports both <0.25 and >=0.25 layouts
+    eval = ["harbor>=0.25.0"]
+    clang16 = ["clang==16.*"]
+    clang17 = ["clang==17.*"]
+    clang18 = ["clang==18.*"]
+    clang19 = ["clang==19.*"]
+    clang20 = ["clang==20.*"]
+    clang21 = ["clang==21.*"]
+    tree-sitter-python = ["tree-sitter", "tree-sitter-python"]
+    # OCR heavy backends (optional): not installed by default, choose as needed
+    # rapidocr is a pure Python implementation (pulls in opencv, ~70MB), no system dependencies, recommended
+    # paddleocr / easyocr are larger (easyocr pulls in torch), install only when needed
+    ocr-rapidocr = ["rapidocr-onnxruntime>=1.3.0"]
+    ocr-paddle = ["paddleocr>=2.7.0", "paddlepaddle>=2.6.0"]
+    ocr-easyocr = ["easyocr>=1.7.0"]
+    tree-sitter-javascript = ["tree-sitter", "tree-sitter-javascript"]
+    tree-sitter-typescript = ["tree-sitter", "tree-sitter-typescript"]
+    tree-sitter-rust = ["tree-sitter", "tree-sitter-rust"]
+    tree-sitter-go = ["tree-sitter", "tree-sitter-go"]
+    tree-sitter-java = ["tree-sitter", "tree-sitter-java"]
+    tree-sitter-cpp = ["tree-sitter", "tree-sitter-cpp"]
+    tree-sitter-c = ["tree-sitter", "tree-sitter-c"]
+    tree-sitter-json = ["tree-sitter", "tree-sitter-json"]
+    tree-sitter-yaml = ["tree-sitter", "tree-sitter-yaml"]
+    tree-sitter-markdown = ["tree-sitter", "tree-sitter-markdown"]
+    tree-sitter-html = ["tree-sitter", "tree-sitter-html"]
+    tree-sitter-css = ["tree-sitter", "tree-sitter-css"]
+    tree-sitter-bash = ["tree-sitter", "tree-sitter-bash"]
+    tree-sitter-ruby = ["tree-sitter", "tree-sitter-ruby"]
+    tree-sitter-php = ["tree-sitter", "tree-sitter-php"]
+    tree-sitter-sql = ["tree-sitter", "tree-sitter-sql"]
+    tree-sitter-all = [
+        "tree-sitter==0.25.2; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-python==0.25.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-javascript==0.25.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-typescript==0.23.2; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-rust==0.24.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-go==0.25.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-java==0.23.5; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-cpp==0.23.4; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-c==0.24.1; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-json==0.24.8; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-yaml==0.7.2; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-markdown==0.5.1; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-html==0.23.2; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-css==0.25.0; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-bash==0.25.1; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-ruby==0.23.1; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-php==0.24.1; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+        "tree-sitter-sql==0.3.11; platform_machine != 'armv6l' and platform_machine != 'armv7l' and platform_machine != 'armv8l' and platform_machine != 'armhf'",
+    ]
+
+    [project.urls]
+    Homepage = "https://github.com/takebox/HaijunBot.git"
+
+    [tool.mypy]
+    ignore_missing_imports = true
+
+    [tool.pytest.ini_options]
+    minversion = "6.1.0"
+    addopts = "-ra -q --strict-markers -m 'not slow'"
+    testpaths = ["tests"]
+    python_files = ["test_*.py", "*_test.py"]
+    python_classes = ["Test*"]
+    python_functions = ["test_*"]
+    markers = [
+        "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+        "integration: marks tests as integration tests",
+        "unit: marks tests as unit tests",
+        "smoke: marks tests as smoke tests",
+        "security: marks tests as security tests",
+        "regression: marks tests as regression tests",
+        "monitoring: marks tests as monitoring tests",
+    ]
+
+    [project.scripts]
+# Playwright browser driver installation script
+    install-playwright = "haijunbot.scripts.install_playwright:install_chromium"
+    haijunbot = "haijunbot.haijunbot_agent.haijunbot:main"
+    haijunbot-agent-dispatcher = "haijunbot.haijunbot_agent.hjbd_eli:app"
+    hjb = "haijunbot.haijunbot_agent.haijunbot:main"
+    hjbd = "haijunbot.haijunbot_agent.hjbd_eli:app"
+    haijunbot-code-agent = "haijunbot.haijunbot_code_agent.code_agent:main"
+    hca = "haijunbot.haijunbot_code_agent.code_agent:main"
+    haijunbot-code-agent-dispatcher = "haijunbot.haijunbot_code_agent.hcad_eli:app"
+    hcad = "haijunbot.haijunbot_code_agent.hcad_eli:app"
+    haijunbot-smart-shell = "haijunbot.haijunbot_smart_shell.main:main"
+    hss = "haijunbot.haijunbot_smart_shell.main:main"
+    haijunbot-platform-manager = "haijunbot.haijunbot_platform_manager.main:main"
+    hpm = "haijunbot.haijunbot_platform_manager.main:main"
+    haijunbot-git-commit = "haijunbot.haijunbot_git_utils.git_commiter:main"
+    haijunbot-memory-organizer = "haijunbot.haijunbot_memory_organizer.memory_organizer:main"
+    hmo = "haijunbot.haijunbot_memory_organizer.memory_organizer:main"
+    hgc = "haijunbot.haijunbot_git_utils.git_commiter:main"
+    haijunbot-git-squash = "haijunbot.haijunbot_git_squash.main:main"
+    hgs = "haijunbot.haijunbot_git_squash.main:main"
+    haijunbot-agent = "haijunbot.haijunbot_agent.main:main"
+    ha = "haijunbot.haijunbot_agent.main:main"
+    haijunbot-tool = "haijunbot.haijunbot_tools.eli.main:main"
+    ht = "haijunbot.haijunbot_tools.eli.main:main"
+    haijunbot-methodology = "haijunbot.haijunbot_methodology.main:main"
+    hm = "haijunbot.haijunbot_methodology.main:main"
+    haijunbot-sec = "haijunbot.haijunbot_sec.eli:main"
+    hsec = "haijunbot.haijunbot_sec.eli:main"
+    haijunbot-c2rust = "haijunbot.haijunbot_c2rust.eli:main"
+    hc2r = "haijunbot.haijunbot_c2rust.eli:main"
+    haijunbot-config = "haijunbot.haijunbot_config.eli:app"
+    hcfg = "haijunbot.haijunbot_config.eli:app"
+    haijunbot-lsp = "haijunbot.haijunbot_lsp.eli:app"
+    hlsp = "haijunbot.haijunbot_lsp.eli:app"
+    haijunbot-browser = "haijunbot.haijunbot_browser.eli:app"
+    hb = "haijunbot.haijunbot_browser.eli:app"
+    haijunbot-windows = "haijunbot.haijunbot_windows.eli:app"
+    hw = "haijunbot.haijunbot_windows.eli:app"
+    haijunbot-web-gateway = "haijunbot.haijunbot_web_gateway.eli:app"
+    hwg = "haijunbot.haijunbot_web_gateway.eli:app"
+    haijunbot-service = "haijunbot.haijunbot_service.eli:app"
+    hservice = "haijunbot.haijunbot_service.eli:app"
+    haijunbot-quick-config = "haijunbot.haijunbot_utils.quick_config:app"
+    hqc = "haijunbot.haijunbot_utils.quick_config:app"
+    haijunbot-rules-index = "haijunbot.haijunbot_rules_index.eli:main"
+    hri = "haijunbot.haijunbot_rules_index.eli:main"
+
+
+
+
+
+

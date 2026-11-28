@@ -1,0 +1,16 @@
+{
+  "name": "command_injection_cross_file",
+  "description": "cross_filecommand injection：user inputcross_filepropagate tosystem()call",
+  "vulnerability_type": "taint",
+  "cross_file": true,
+  "expected_issues": [
+    {
+      "pattern": "command_exec",
+      "file": "exec.c"
+    },
+    {
+      "pattern": "sprintf",
+      "file": "process.c"
+    }
+  ]
+}

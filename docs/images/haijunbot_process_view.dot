@@ -1,0 +1,117 @@
+digraph G {
+  // --- Global Settings ---
+  graph [rankdir="LR", splines=polyline, fontname="Sans-serif", label="Diagram Title: [Process View] Runtime Behavior and Communication Flow", labelloc="t", newrank=true, nodesep=0.7, ranksep=1.1, overlap=false];
+  node [shape=box, style="rounded,filled", fillcolor="#EFEFEF", fontname="Sans-serif"];
+  edge [fontname="Sans-serif"];
+
+  // Main process and core loop
+  subgraph cluster_main {
+    label = "Main Process and Core Loop";
+    style = "filled";
+    color = "#dddddd";
+    node [fillcolor="#DAE8FC", color="#6C8EBF"];
+    cli_proc [label="CLI Main Process"];
+    agent_loop [label="AgentRunLoop (Loop)"];
+    session_mgr [label="SessionManager (Session State)"];
+    interrupt_handler [label="Interrupt Handling (Ctrl+C/User Intervention)"];
+  }
+
+  // Model invocation and streaming output (threads/connections)
+  subgraph cluster_model {
+    label = "Model Invocation and Streaming Output";
+    style = "filled";
+    color = "#e8e8e8";
+    node [fillcolor="#D5E8D4", color="#82B366"];
+    model_openai [label="OpenAI Platform\nAPI Stream (client.stream)"];
+    model_haijun [label="Haijun Platform\nAPI Stream (client.stream)"];
+    system_prompt [label="System Prompt Injection"];
+    file_upload [label="File Upload (Supported Platforms)"];
+  }
+
+  // Tool execution and subprocesses/sessions
+  subgraph cluster_tools_runtime {
+    label = "Tool Execution and External Processes";
+    style = "filled";
+    color = "#f8f8f8";
+    node [fillcolor="#F8CECC", color="#B85450"];
+    tool_registry [label="ToolRegistry (Tool Selection/Invocation)"];
+    execute_script_proc [label="execute_script\nSubprocess (script wrapper)"];
+    virtual_tty_sess [label="virtual_tty\nPersistent TTY Session/Subprocess"];
+    mcp_stdio [label="MCP stdio\nSubprocess"];
+    mcp_sse [label="MCP SSE\nEvent Thread+HTTP"];
+    mcp_stream [label="MCP Streamable\nHTTP Stream Request"];
+  }
+
+  // Event-driven and memory/analysis
+  subgraph cluster_events {
+    label = "Event-Driven and Memory/Analysis";
+    style = "filled";
+    color = "#f0f0f0";
+    node [fillcolor="#FFF2CC", color="#B57800"];
+    event_bus [label="EventBus (Sync Publish/Subscribe)"];
+    memory_mgr [label="MemoryManager (Memory Prompts/Save)"];
+    task_analyzer [label="TaskAnalyzer (Task Analysis Loop)"];
+    stats_mgr [label="StatsManager (Metrics Count/Display)"];
+  }
+
+  // Data storage interaction (runtime)
+  subgraph cluster_data {
+    label = "Runtime Data Interaction";
+    style = "filled";
+    color = "#f7f7f7";
+    node [shape=cylinder, fillcolor="#E1D5E7", color="#9673A6"];
+    mem_store [label="Memory Store\n(~/.haijunbot / project.memory)"];
+    tools_repo [label="Tools/Methodology Directory\n(local/central repo)"];
+  }
+
+  // --- Runtime Flow Relationships ---
+  // Main flow startup
+  cli_proc -> agent_loop [xlabel="Start/Dispatch Loop"];
+
+  // Each round: assemble prompt -> model call (streaming)
+  agent_loop -> system_prompt [xlabel="Build System/Additional Prompts"];
+  system_prompt -> model_openai [xlabel="chat_until_success"];
+  system_prompt -> model_haijun [xlabel="chat_until_success"];
+
+  // File upload (context overflow or methodology/file analysis)
+  agent_loop -> file_upload [xlabel="When Upload Needed"];
+
+  // Streaming response returns to main loop
+  model_openai -> agent_loop [xlabel="Streaming Response"];
+  model_haijun -> agent_loop [xlabel="Streaming Response"];
+
+  // Tool invocation path
+  agent_loop -> tool_registry [xlabel="Detect/Parse Tool Blocks"];
+  tool_registry -> execute_script_proc [xlabel="Script Execution (Temporary Subprocess)"];
+  tool_registry -> virtual_tty_sess [xlabel="Interactive Session (Persistent TTY)"];
+  tool_registry -> mcp_stdio [xlabel="External MCP (Local Process)"];
+  tool_registry -> mcp_sse [xlabel="External MCP (SSE Remote)"];
+  tool_registry -> mcp_stream [xlabel="External MCP (HTTP Stream)"];
+
+  // Tool results return and merge
+  execute_script_proc -> agent_loop [xlabel="stdout/stderr Merge"];
+  virtual_tty_sess -> agent_loop [xlabel="Screen/Output Polling"];
+  mcp_stdio -> agent_loop [xlabel="Tool Results"];
+  mcp_sse -> agent_loop [xlabel="Tool Results"];
+  mcp_stream -> agent_loop [xlabel="Tool Results"];
+
+  // Event-driven hooks
+  agent_loop -> event_bus [xlabel="before/after_tool_call\nbefore/after_summary\nbefore/after_model_call\nhistory_clear"];
+  event_bus -> memory_mgr [xlabel="Trigger Memory Save/Tag Prompts"];
+  event_bus -> task_analyzer [xlabel="Trigger Analysis/Satisfaction Collection"];
+  tool_registry -> stats_mgr [xlabel="Tool Call Count"];
+  execute_script_proc -> stats_mgr [xlabel="Call Count", style=dashed];
+  virtual_tty_sess -> stats_mgr [xlabel="Call Count", style=dashed];
+
+  // Session and interrupt
+  agent_loop -> session_mgr [xlabel="prompt/length/save/restore"];
+  interrupt_handler -> agent_loop [xlabel="skip/continue/complete"];
+
+  // Memory and data flow
+  memory_mgr -> mem_store [xlabel="Write/Read Memory"];
+  tool_registry -> tools_repo [xlabel="Scan and Load Tools/Methodologies", style=dashed];
+
+  // Alignment
+  { rank=same; model_openai; model_haijun; }
+  { rank=same; execute_script_proc; virtual_tty_sess; mcp_stdio; mcp_sse; mcp_stream; }
+}

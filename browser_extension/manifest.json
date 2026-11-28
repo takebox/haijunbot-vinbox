@@ -1,0 +1,66 @@
+{
+  "manifest_version": 3,
+  "name": "HaijunBot Browser Bridge",
+  "version": "6.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr0CsKiXoXNUeCb0uRRwZddnwzt5EUnYSNUb9j9AOKnoWZKqed+CS9Zg248i4wiN/dzCPHvCZ9E+aLELIY+sj9cxt2JEVkF91rvMWFFJZyW51KanJO7GXSK3w997MkBMggCUnTZXxvShzuaooD3g26hA7ZfLd6xwS3F1HdPrLzrAwpIE7INqCKw87orUrB143gmZ/5pSpneEXhoPEx7xsnCjzKEIfNlTfxuAC6s4yaUITB6QPoBlRUVyF23Y9FchvVKF6MBYPe3lqPMtODDTc12p+FbDC/MkBnNnx4JCpNJbGkh0KbtIcU4ZHOrxolnNReb/YberQeyR2dIQ49H1y7wIDAQAB",
+  "description": "Allows HaijunBot Agent to operate web pages in the user's real browser (connects to gateway, reuses login sessions)",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "activeTab",
+    "storage",
+    "debugger",
+    "bookmarks",
+    "history",
+    "downloads",
+    "sessions",
+    "topSites",
+    "readingList",
+    "contextMenus",
+    "alarms",
+    "notifications",
+    "search",
+    "idle",
+    "favicon",
+    "webNavigation",
+    "tabGroups",
+    "unlimitedStorage",
+    "cookies",
+    "webRequest",
+    "management",
+    "nativeMessaging",
+    "proxy",
+    "privacy",
+    "browsingData",
+    "contentSettings"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background/service_worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "HaijunBot Browser Bridge",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content/content_script.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

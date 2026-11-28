@@ -1,0 +1,23 @@
+{
+  "name": "cross_function_uaf",
+  "description": "cross-functionUAF：firstcallfreefunctionaftercallusefunction",
+  "difficulty": "easy",
+  "vulnerability_type": "use_after_free",
+  "expected_issues": [
+    {
+      "pattern": "use_after_free_suspect",
+      "file": "main.c",
+      "line": 5
+    }
+  ],
+  "files": [
+    "helper.c",
+    "main.c"
+  ],
+  "cross_file": true,
+  "tags": [
+    "uaf",
+    "cross-file",
+    "call-order"
+  ]
+}

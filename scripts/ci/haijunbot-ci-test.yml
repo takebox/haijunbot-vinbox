@@ -1,0 +1,119 @@
+---
+# yamllint disable rule:line-length
+# =============================================================================
+# HaijunBot CI test workflow template
+# -----------------------------------------------------------------------------
+# Purpose: on push/PR triggers, first run tests with HaijunBot and report results, then optionally run standard pytest.
+#       Compared with a plain pytest flow, HaijunBot can automatically analyze test failures, locate root causes, and give fix suggestions.
+#
+# Usage:
+#   1. Copy this file into your repository at .github/workflows/haijunbot-ci-test.yml
+#   2. Configure environment variables (HaijunBot reads the API Key from the standard LLM environment variables, see below):
+#      - OPENAI_API_KEY     (OpenAI platform) API Key for calling the LLM
+#      - JUGLOW_API_KEY  (Juglow platform) API Key for calling the LLM
+#      - OPENAI_API_BASE    (optional) custom OpenAI-compatible endpoint
+#      - HAIJUNBOT_MODEL       (optional) specify the model, defaults to gpt-5
+#      - HAIJUNBOT_PLATFORM    (optional) specify the platform, defaults to openai
+#   3. Adjust TEST_COMMAND as needed (default pytest -v)
+#
+#   Note: On first run HaijunBot automatically generates default config (non-interactive); the API Key is injected via standard
+#        environment variables (OPENAI_API_KEY / JUGLOW_API_KEY), no preexisting config.yaml required.
+#        You can also persist config using hqc non-interactive mode: hqc --platform openai --base-url <url>
+#        --api-key <key> --model <model> --skip-test (writes to ~/.haijunbot/config.yaml).
+# Principle: reuse HaijunBot headless non-interactive mode (hjb -n --task-file), handing the test command
+#       to HaijunBot to execute and analyze the result, outputting a structured report.
+# =============================================================================
+name: HaijunBot CI Test
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  haijunbot-ci-test:
+    name: HaijunBot CI Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install HaijunBot (haijunbot-ai-assistant) from PyPI, suitable for any user repository
+          pip install haijunbot-ai-assistant
+
+      - name: Prepare HaijunBot task file
+        id: task
+        env:
+          TEST_COMMAND: ${{ vars.HAIJUNBOT_TEST_COMMAND || 'pytest -v' }}
+        run: |
+          cat > /tmp/haijunbot-task.json <<'EOF'
+          {
+            "task_desc": "Please run the test command in the current repository and analyze the results. Output a structured report: 1) test command; 2) pass/fail statistics; 3) if failed, list the failing cases, locate the root cause, and give fix suggestions; 4) overall conclusion (pass or fail).",
+            "background": "This is the HaijunBot CI test in GitHub Actions. The test command is: ${TEST_COMMAND}. Please run the command first, then analyze the results based on the output.",
+            "status_file": "/tmp/haijunbot-status.json"
+          }
+          EOF
+
+      - name: Run HaijunBot test (headless)
+        id: haijunbot
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JUGLOW_API_KEY: ${{ secrets.JUGLOW_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          HAIJUNBOT_MODEL: ${{ secrets.HAIJUNBOT_MODEL }}
+          HAIJUNBOT_PLATFORM: ${{ secrets.HAIJUNBOT_PLATFORM }}
+          # Skip the interactive config wizard on first run (no TTY in the CI environment)
+          HAIJUNBOT_SKIP_INTERACTIVE_CONFIG: "1"
+        run: |
+          hjb -n --task-file /tmp/haijunbot-task.json || true
+
+      - name: Read HaijunBot test result
+        id: result
+        run: |
+          if [ -f /tmp/haijunbot-status.json ]; then
+            echo "status=$(jq -r '.status' /tmp/haijunbot-status.json)" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f /tmp/haijunbot-status.output ]; then
+            {
+              echo "output<<EOF"
+              cat /tmp/haijunbot-status.output
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post test report comment
+        if: steps.result.outputs.output != '' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '## 🤖 HaijunBot CI Test Report',
+              '',
+              '> Status: ' + (process.env.TEST_STATUS || 'unknown'),
+              '',
+              '```',
+              process.env.TEST_OUTPUT || '(no output)',
+              '```'
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+        env:
+          TEST_STATUS: ${{ steps.result.outputs.status }}
+          TEST_OUTPUT: ${{ steps.result.outputs.output }}

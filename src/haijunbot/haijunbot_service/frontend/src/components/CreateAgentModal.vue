@@ -1,0 +1,777 @@
+<template>
+  <div class="modal-overlay" v-if="visible">
+    <div class="modal create-agent-modal" ref="modalEl">
+      <h2>Create Agent</h2>
+      <div class="form-grid create-agent-layout">
+        <div class="form-column create-agent-column create-agent-column-left">
+          <div class="form-group" v-if="nodeOptions.length > 0">
+            <label>Target Node</label>
+            <select :value="nodeId" @change="$emit('update:nodeId', $event.target.value)" class="form-control">
+              <option v-for="node in nodeOptions" :key="node.node_id" :value="node.node_id">
+                {{ formatNodeLabel(node) }}
+              </option>
+            </select>
+            <div class="form-help">The master node is selected by default; when copying an Agent, the source node is inherited by default.</div>
+          </div>
+          <div class="form-group" v-if="noNodeAccess">
+            <div class="error-message">The current user has no node access permissions and cannot create an Agent. Please contact an administrator to assign node permissions.</div>
+          </div>
+          <div class="form-group">
+            <label>Agent Type</label>
+            <div class="radio-group">
+              <label class="radio-label">
+                <input type="radio" :checked="agentType === 'agent'" @change="$emit('update:agentType', 'agent')" />
+                <span class="radio-text">General Agent</span>
+                <span class="radio-desc">Suited for everyday tasks and general operations</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" :checked="agentType === 'code_agent'" @change="$emit('update:agentType', 'code_agent')" />
+                <span class="radio-text">Code Agent</span>
+                <span class="radio-desc">Focused on code analysis and development tasks</span>
+              </label>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Access Control (optional)</label>
+            <div class="acl-section">
+              <div class="acl-field">
+                <label class="acl-label">Users who can view (read)</label>
+                <div class="acl-user-list">
+                  <label v-for="user in userOptions" :key="user.user_id" class="checkbox-label">
+                    <input type="checkbox" :value="user.user_id" :checked="accessAclRead.includes(user.user_id)" @change="toggleAclRead(user.user_id, $event)" />
+                    {{ user.display_name || user.user_id }}
+                  </label>
+                  <div v-if="userOptions.length === 0" class="form-help">No selectable users</div>
+                </div>
+              </div>
+              <div class="acl-field">
+                <label class="acl-label">Users who can interact (interact)</label>
+                <div class="acl-user-list">
+                  <label v-for="user in userOptions" :key="user.user_id" class="checkbox-label">
+                    <input type="checkbox" :value="user.user_id" :checked="accessAclInteract.includes(user.user_id)" @change="toggleAclInteract(user.user_id, $event)" />
+                    {{ user.display_name || user.user_id }}
+                  </label>
+                  <div v-if="userOptions.length === 0" class="form-help">No selectable users</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="form-column create-agent-column create-agent-column-right">
+          <div class="form-group">
+            <label>Agent Name (optional)</label>
+            <input ref="nameInput" :value="agentName" @input="$emit('update:agentName', $event.target.value)" type="text" class="form-control" placeholder="e.g.: dev-env Agent" />
+          </div>
+          <div class="form-group">
+            <label>Model Group</label>
+            <select :value="modelGroup" @change="$emit('update:modelGroup', $event.target.value)" class="form-control">
+              <option v-for="group in modelGroups" :key="group.name" :value="group.name">
+                {{ group.name }} ({{ group.smart_model }}, {{ group.normal_model }}, {{ group.cheap_model }})
+              </option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Proxy Node (optional)</label>
+            <select :value="proxyNode" @change="$emit('update:proxyNode', $event.target.value)" class="form-control">
+              <option value="">No proxy (direct call)</option>
+              <option v-for="node in nodeOptions" :key="node.node_id" :value="node.node_id">
+                {{ formatNodeLabel(node) }}
+              </option>
+            </select>
+            <div class="form-help">Once specified, LLM requests will be forwarded through the proxy node; if left blank, they are called directly.</div>
+          </div>
+
+          <div class="form-group">
+            <label>Working Directory</label>
+            <div class="input-with-button">
+              <input :value="workDir" @input="$emit('update:workDir', $event.target.value)" type="text" class="form-control" placeholder="/path/to/workspace" />
+              <button class="btn select-dir-btn" @click="$emit('selectDir')">Select Directory</button>
+            </div>
+            <!-- Recent working directories (filtered by node) -->
+            <div v-if="filteredRecentWorkDirs && filteredRecentWorkDirs.length > 0" class="recent-dirs-section">
+              <div class="recent-dirs-title">Recently used working directories</div>
+              <div class="recent-dirs-list">
+                <span
+                  v-for="(dir, index) in filteredRecentWorkDirs"
+                  :key="index"
+                  class="recent-dir-tag"
+                  @click="$emit('update:workDir', dir.path)"
+                  :title="dir.path">
+                  {{ dir.path.split('/').filter(Boolean).pop() || dir.path }}
+                </span>
+              </div>
+            </div>
+          </div>
+          <div v-if="agentType === 'code_agent'" class="form-group">
+            <div class="toggle-wrapper">
+              <label class="toggle-switch">
+                <input :checked="codeAgentWorktree" @change="$emit('update:codeAgentWorktree', $event.target.checked)" type="checkbox" class="toggle-input" />
+                <span class="toggle-slider"></span>
+              </label>
+              <div class="toggle-info">
+                <span class="toggle-label-text">Enable worktree</span>
+                <span class="form-help">Use a separate git worktree for Code Agents to develop in isolation.</span>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <div class="toggle-wrapper">
+              <label class="toggle-switch">
+                <input :checked="quickMode" @change="$emit('update:quickMode', $event.target.checked)" type="checkbox" class="toggle-input" />
+                <span class="toggle-slider"></span>
+              </label>
+              <div class="toggle-info">
+                <span class="toggle-label-text">Turbo Mode</span>
+                <span class="form-help">Skip task classification, rule loading, context suggestions, etc., and execute the task directly.</span>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <div class="toggle-wrapper">
+              <label class="toggle-switch">
+                <input :checked="restoreSession" @change="$emit('update:restoreSession', $event.target.checked)" type="checkbox" class="toggle-input" />
+                <span class="toggle-slider"></span>
+              </label>
+              <div class="toggle-info">
+                <span class="toggle-label-text">Restore Session on Startup</span>
+                <span class="form-help">Automatically restore the last session on startup.</span>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <div class="toggle-wrapper">
+              <label class="toggle-switch">
+                <input :checked="noInteractionMode" @change="$emit('update:noInteractionMode', $event.target.checked)" type="checkbox" class="toggle-input" />
+                <span class="toggle-slider"></span>
+              </label>
+              <div class="toggle-info">
+                <span class="toggle-label-text">Non-interactive Mode</span>
+                <span class="form-help">When enabled, a task description is required and the Agent will execute the task automatically without waiting for user confirmation.</span>
+              </div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Task Description <span v-if="noInteractionMode" class="required">*</span></label>
+            <textarea :value="taskDescription" @input="$emit('update:taskDescription', $event.target.value)" class="form-control" rows="4" placeholder="Optional; if filled in, the Agent executes this task on startup (required in non-interactive mode)" :class="{ 'error-border': noInteractionMode && !taskDescription.trim() }"></textarea>
+            <div class="form-help" v-if="noInteractionMode && !taskDescription.trim()" style="color: var(--color-error);">A task description is required in non-interactive mode</div>
+          </div>
+        </div>
+      </div>
+      <div v-if="createError" class="error-message">{{ createError }}</div>
+      <div class="modal-actions">
+        <button class="btn secondary" @click="$emit('cancel')">Cancel</button>
+        <button class="btn primary" @click="$emit('create')" :disabled="!workDir.trim() || noNodeAccess">Create</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { computed, nextTick, ref, watch, onUnmounted } from 'vue'
+
+const props = defineProps({
+  visible: Boolean,
+  nodeOptions: { type: Array, default: () => [] },
+  nodeId: { type: String, default: '' },
+  noNodeAccess: { type: Boolean, default: false },
+  agentType: { type: String, default: 'agent' },
+  agentName: { type: String, default: '' },
+  modelGroups: { type: Array, default: () => [] },
+  modelGroup: { type: String, default: 'default' },
+  proxyNode: { type: String, default: '' },
+  workDir: { type: String, default: '~' },
+  codeAgentWorktree: { type: Boolean, default: false },
+  quickMode: { type: Boolean, default: false },
+  restoreSession: { type: Boolean, default: false },
+  noInteractionMode: { type: Boolean, default: false },
+  taskDescription: { type: String, default: '' },
+  formatNodeLabel: { type: Function, default: (node) => node.node_id },
+  createError: { type: String, default: '' },
+  accessAclRead: { type: Array, default: () => [] },
+  accessAclInteract: { type: Array, default: () => [] },
+  userOptions: { type: Array, default: () => [] },
+  recentWorkDirs: { type: Array, default: () => [] },
+  currentNodeId: { type: String, default: '' },
+  // Whether the directory selection dialog is open: when open, Enter should be handled by the directory dialog and must not trigger creation
+  dirDialogOpen: { type: Boolean, default: false }
+})
+
+const emit = defineEmits([
+  'update:nodeId',
+  'update:agentType',
+  'update:agentName',
+  'update:modelGroup',
+  'update:proxyNode',
+  'update:workDir',
+  'update:codeAgentWorktree',
+  'update:quickMode',
+  'update:restoreSession',
+  'update:noInteractionMode',
+  'update:taskDescription',
+  'update:accessAclRead',
+  'update:accessAclInteract',
+  'cancel',
+  'create',
+  'selectDir'
+])
+
+// Agent name input reference: auto-focus when the modal opens
+const nameInput = ref(null)
+
+// Modal container reference: only respond to Enter coming from inside the modal to avoid false triggers (e.g. pressing Enter while the directory selection dialog is open creating directly)
+const modalEl = ref(null)
+
+// Filter recently used working directories by the current node
+const filteredRecentWorkDirs = computed(() => {
+  if (!props.currentNodeId) return []
+  return (props.recentWorkDirs || []).filter(d => d && d.nodeId === props.currentNodeId)
+})
+
+function toggleAclRead(userId, event) {
+  const current = [...props.accessAclRead]
+  if (event.target.checked) {
+    if (!current.includes(userId)) current.push(userId)
+  } else {
+    const idx = current.indexOf(userId)
+    if (idx > -1) current.splice(idx, 1)
+  }
+  emit('update:accessAclRead', current)
+}
+
+function toggleAclInteract(userId, event) {
+  const current = [...props.accessAclInteract]
+  if (event.target.checked) {
+    if (!current.includes(userId)) current.push(userId)
+  } else {
+    const idx = current.indexOf(userId)
+    if (idx > -1) current.splice(idx, 1)
+  }
+  emit('update:accessAclInteract', current)
+}
+
+// Keyboard-only support: press Enter inside an input (not a multiline textarea) to submit creation, Esc to close (parent global Esc as fallback)
+function handleKeydown(event) {
+  if (!props.visible) return
+  // When the directory selection dialog is open, Enter should be handled by the directory dialog (select/enter directory) and must not trigger creation
+  if (props.dirDialogOpen) return
+  if (event.key === 'Enter') {
+    // Only respond to Enter coming from inside this modal; do not submit when focus is outside the modal (e.g. the directory selection dialog),
+    // to avoid "press Enter to confirm after selecting a directory" being mistaken for "create Agent"
+    if (modalEl.value && !modalEl.value.contains(event.target)) return
+    const tag = event.target?.tagName?.toLowerCase()
+    // Enter inside a textarea is for newlines and is not intercepted; when a button is focused, the browser handles it natively
+    if (tag === 'textarea' || tag === 'button' || tag === 'select') return
+    if (props.noNodeAccess || !props.workDir.trim()) return
+    event.preventDefault()
+    emit('create')
+  }
+}
+
+watch(
+  () => props.visible,
+  (val) => {
+    if (val) {
+      document.addEventListener('keydown', handleKeydown)
+      // Auto-focus the Agent name input when the modal opens, for convenient keyboard-only input
+      nextTick(() => nameInput.value?.focus())
+    } else {
+      document.removeEventListener('keydown', handleKeydown)
+    }
+  }
+)
+
+onUnmounted(() => document.removeEventListener('keydown', handleKeydown))
+</script>
+
+<style scoped>
+/* Recent working directory styles */
+.recent-dirs-section {
+  margin-top: 8px;
+}
+.recent-dirs-title {
+  font-size: 0.85em;
+  color: var(--color-text-secondary, #8ba3b8);
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+.recent-dirs-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.recent-dir-tag {
+  display: inline-block;
+  padding: 4px 8px;
+  background-color: var(--color-bg-tertiary, #16263a);
+  border-radius: 4px;
+  font-size: 0.85em;
+  color: var(--color-text-primary, #d6e4f0);
+  cursor: pointer;
+  transition: all 0.2s;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-dir-tag:hover {
+  background-color: var(--color-primary, #20c8ff);
+  color: white;
+}
+
+/* ACL configuration area styles */
+.acl-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.acl-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.acl-label {
+  font-size: 0.85em;
+  color: var(--color-text-secondary, #8ba3b8);
+  font-weight: 500;
+}
+.acl-user-list {
+  max-height: 150px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+}
+.acl-user-list .checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9em;
+  cursor: pointer;
+}
+.acl-user-list .checkbox-label input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+
+/* Modal overlay */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--color-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+  padding: 20px;
+}
+
+/* Modal base styles */
+.modal-overlay .modal {
+  background: rgba(9, 16, 28, 0.86);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 14px;
+  padding: 28px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(32, 200, 255, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.modal-overlay .modal.create-agent-modal {
+  max-width: min(50vw, 960px) !important;
+  width: min(50vw, 960px);
+  max-height: calc(var(--app-height, 100vh) - 40px);
+  overflow-y: auto;
+}
+
+.create-agent-modal h2 {
+  margin: 0 0 20px 0;
+  font-size: 18px;
+  color: var(--color-text-primary);
+}
+
+/* Responsive grid layout */
+.create-agent-modal .form-grid {
+  display: grid;
+  gap: 20px;
+}
+
+.create-agent-modal .form-grid.create-agent-layout {
+  grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.2fr);
+  align-items: start;
+}
+
+.create-agent-modal .form-column {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.create-agent-modal .create-agent-options-column {
+  gap: 12px;
+}
+
+/* Tablet and below: keep two columns but allow tighter spacing */
+@media (max-width: 1023px) {
+  .modal-overlay .modal.create-agent-modal {
+    width: 90%;
+    max-width: 900px !important;
+  }
+
+  .create-agent-modal .form-grid.create-agent-layout {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Mobile: single-column layout */
+@media (max-width: 768px) {
+  .modal-overlay .modal.create-agent-modal {
+    width: 100%;
+    max-width: 100% !important;
+  }
+
+  .create-agent-modal .form-grid.create-agent-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.create-agent-modal .form-control {
+  width: 100%;
+  padding: 10px 12px;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--tile-radius-xs);
+  color: var(--color-text-primary);
+  font-size: 14px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.create-agent-modal .form-control:focus {
+  outline: none;
+  border-color: var(--color-accent);
+  background: var(--color-bg-tertiary);
+  box-shadow: 0 0 0 2px var(--color-accent-subtle),
+    0 0 12px rgba(32, 200, 255, 0.2);
+}
+
+.create-agent-modal select.form-control option {
+  background: var(--color-bg-secondary);
+  color: var(--color-text-primary);
+}
+
+.create-agent-modal .modal-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.create-agent-modal .btn {
+  flex: 1;
+  padding: 10px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+}
+
+.create-agent-modal .btn.secondary {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+  border: 1px solid var(--color-border-subtle);
+}
+
+.create-agent-modal .btn.secondary:hover {
+  background: var(--color-bg-hover);
+  border-color: var(--color-accent);
+}
+
+.create-agent-modal .btn.primary {
+  background: linear-gradient(135deg, #0a3a5c 0%, #20c8ff 100%);
+  color: #060911;
+  font-weight: 600;
+  border: 1px solid rgba(32, 200, 255, 0.3);
+  box-shadow: 0 4px 12px rgba(0, 120, 190, 0.25);
+  transition: all 0.2s ease;
+}
+
+.create-agent-modal .btn.primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(32, 200, 255, 0.35);
+}
+
+.create-agent-modal .btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none !important;
+}
+
+/* Error message styles */
+.error-message {
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: rgba(255, 60, 72, 0.1);
+  border: 1px solid var(--color-error);
+  border-radius: var(--tile-radius);
+  color: var(--color-error);
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-line;
+}
+
+/* Radio group styles */
+.create-agent-modal .radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.create-agent-modal .radio-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  background: var(--color-bg-secondary);
+  border: none;
+  border-radius: var(--tile-radius);
+  cursor: pointer;
+}
+
+.create-agent-modal .radio-label:hover {
+  background: var(--color-bg-primary);
+  border-color: var(--color-border-subtle);
+  transform: translateY(-1px);
+}
+
+.create-agent-modal .radio-label:has(input:checked) {
+  background: var(--color-accent-subtle);
+  border-color: var(--color-accent);
+}
+
+.create-agent-modal .radio-label input[type="radio"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--color-border-subtle);
+  border-radius: 50%;
+  background: var(--color-bg-primary);
+  cursor: pointer;
+  position: relative;
+}
+
+.create-agent-modal .radio-label input[type="radio"]:hover {
+  border-color: var(--color-border-subtle);
+}
+
+.create-agent-modal .radio-label input[type="radio"]:checked {
+  border-color: var(--color-accent);
+  background: var(--color-accent-subtle);
+}
+
+.create-agent-modal .radio-label input[type="radio"]:checked::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 8px;
+  height: 8px;
+  background: var(--color-accent);
+  border-radius: 50%;
+}
+
+.create-agent-modal .radio-text {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.create-agent-modal .radio-desc {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  line-height: 1.4;
+}
+
+/* Form help text styles */
+.form-help {
+  display: block;
+  margin: 0;
+  padding: 0;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+/* Form group styles */
+.form-group {
+  margin-bottom: 16px;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  letter-spacing: 0.01em;
+}
+
+/* Input-with-button styles */
+.input-with-button {
+  display: flex;
+  gap: 10px;
+}
+
+.input-with-button .form-control {
+  flex: 1;
+  width: auto;
+}
+
+.select-dir-btn {
+  padding: 10px 16px;
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+  border: none;
+  border-radius: var(--tile-radius-xs);
+  font-size: 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.select-dir-btn:hover {
+  background: var(--color-bg-tertiary);
+}
+
+/* Toggle switch styles */
+.toggle-wrapper {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: flex-start;
+  gap: 16px;
+  padding: 16px 20px;
+  background: var(--color-bg-secondary);
+  border: none;
+  outline: none;
+  outline-offset: -1px;
+  border-radius: var(--tile-radius-sm);
+  box-shadow: var(--tile-shadow);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.toggle-wrapper:hover {
+  border-color: var(--color-accent);
+  outline-color: var(--color-accent);
+}
+
+.toggle-wrapper:active {
+  transform: scale(0.98);
+}
+
+.toggle-switch {
+  position: relative;
+  display: block;
+  width: 52px;
+  height: 30px;
+  flex-shrink: 0;
+  cursor: pointer;
+  margin: 0;
+  padding: 0;
+  line-height: 0;
+}
+
+.toggle-input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: var(--color-bg-secondary);
+  border: none;
+  box-shadow: var(--tile-shadow);
+  border-radius: var(--tile-radius-sm);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  outline: none;
+  outline-offset: -1px;
+}
+
+.toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 24px;
+  width: 24px;
+  left: 3px;
+  bottom: 3px;
+  background-color: var(--color-text-primary);
+
+  border-radius: 50%;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: var(--tile-shadow);
+  border: none;
+}
+
+.toggle-input:checked + .toggle-slider {
+  background: linear-gradient(135deg, var(--color-accent) 0%, var(--color-accent-dark) 100%);
+  border-color: var(--color-accent);
+  box-shadow: var(--tile-shadow);
+  outline-color: var(--color-accent);
+}
+
+.toggle-input:checked + .toggle-slider:before {
+  transform: translateX(22px);
+  background-color: var(--color-text-primary);
+  box-shadow: var(--tile-shadow);
+  border-color: var(--color-accent);
+}
+
+.toggle-switch:hover .toggle-slider {
+
+}
+
+.toggle-switch:hover .toggle-slider:before {
+  background-color: var(--color-text-primary);
+}
+
+.toggle-switch:active .toggle-slider {
+  transform: scale(0.95);
+}
+
+.toggle-switch:active .toggle-slider:before {
+  transform: translateX(22px) scale(0.95);
+}
+
+.toggle-input:disabled + .toggle-slider {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.toggle-info {
+  flex: 1 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  justify-content: center !important;
+  gap: 4px;
+}
+
+.toggle-label-text {
+  display: block;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  letter-spacing: -0.01em;
+  line-height: 1.4;
+  margin: 0;
+  padding: 0;
+}
+</style>

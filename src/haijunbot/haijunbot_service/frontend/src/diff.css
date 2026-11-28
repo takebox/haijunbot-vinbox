@@ -1,0 +1,184 @@
+/* Side-by-side diff styles */
+.diff-side-by-side {
+  background: var(--color-bg-tertiary);
+  border-radius: var(--tile-radius);
+  overflow-x: auto;
+  margin: 8px 0;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.diff-header {
+  background: var(--color-accent-subtle);
+  padding: 8px 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.diff-file-path {
+  color: var(--color-text-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+/* File paths in chat/editor diffs are clickable: give a clickable visual hint */
+.diff-file-path[data-diff-file-path] {
+  cursor: pointer;
+}
+.diff-file-path[data-diff-file-path]:hover {
+  color: var(--color-accent, #58a6ff);
+  text-decoration: underline;
+}
+
+.diff-stats {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-family: "SF Mono", Monaco, Consolas, "Courier New", monospace;
+}
+
+.diff-additions {
+  color: var(--color-success);
+  font-weight: 600;
+}
+
+.diff-deletions {
+  color: var(--color-error);
+  font-weight: 600;
+}
+
+.diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-family: "SF Mono", Monaco, Consolas, "Courier New", monospace;
+  font-size: 12px;
+}
+
+.diff-table colgroup col:nth-child(1) {
+  width: 50px;
+}
+
+.diff-table colgroup col:nth-child(2) {
+  width: calc(50% - 50px);
+}
+
+.diff-table colgroup col:nth-child(3) {
+  width: 50px;
+}
+
+.diff-table colgroup col:nth-child(4) {
+  width: calc(50% - 50px);
+}
+
+/* Inline diff (mobile): single column, fixed-width line-number column, content fills the rest */
+.diff-inline .diff-table colgroup col:nth-child(1) {
+  width: 44px;
+}
+
+.diff-inline .diff-table colgroup col:nth-child(2) {
+  width: calc(100% - 44px);
+}
+
+.diff-row {
+}
+
+.diff-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.diff-row-equal {
+  /* Background color moved to the td level */
+}
+
+.diff-row-delete {
+  /* Background color moved to the td level */
+}
+
+.diff-row-insert {
+  /* Background color moved to the td level */
+}
+
+.diff-line-num {
+  color: var(--color-text-secondary);
+  padding: 2px 6px;
+  text-align: right;
+  width: 50px;
+  user-select: none;
+  border-right: 1px solid var(--color-border-subtle);
+  vertical-align: top;
+}
+
+.diff-content {
+  padding: 2px 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  vertical-align: top;
+  box-sizing: border-box;
+}
+
+.diff-content code {
+  font-family: "SF Mono", Monaco, Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.2;
+  background: transparent;
+  padding: 0;
+  white-space: inherit;
+  word-break: inherit;
+  overflow-wrap: inherit;
+}
+
+.diff-deleted {
+  background: rgba(255, 71, 87, 0.25);
+  color: var(--color-text-primary);
+}
+
+.diff-deleted code {
+  background: inherit;
+}
+
+.diff-added {
+  background: rgba(0, 255, 136, 0.25);
+  color: var(--color-text-primary);
+}
+
+.diff-added code {
+  background: inherit;
+}
+
+.diff-separator td {
+  height: 8px;
+  background: var(--color-bg-secondary);
+  border-top: 1px solid var(--color-border-subtle);
+  border-bottom: 1px solid var(--color-border-subtle);
+  padding: 0;
+}
+
+.diff-error {
+  color: var(--color-error);
+  padding: 8px 12px;
+  font-weight: 600;
+}
+
+/* Mobile diff adaptations */
+@media (max-width: 768px) {
+  .diff-header {
+    padding: 6px 10px;
+  }
+
+  .diff-file-path {
+    font-size: 13px;
+  }
+
+  .diff-content {
+    font-size: 11px;
+    padding: 2px 4px;
+  }
+
+  .diff-line-num {
+    width: 40px;
+    font-size: 10px;
+  }
+}

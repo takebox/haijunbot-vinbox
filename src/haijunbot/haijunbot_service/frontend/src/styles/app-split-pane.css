@@ -1,0 +1,275 @@
+/* Chat room / terminal view embedded in the editor main area: fills the main area */
+.workspace-main-embed-view {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.workspace-main-embed-view > * {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Free splitting: content container of each pane (fills the leaf body) */
+.workspace-pane-content-slot {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.workspace-pane-content-slot > * {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Free splitting: the tab bar inside a file pane has a fixed height and does not stretch with flex */
+.workspace-pane-content-slot > .workspace-pane-tabs {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+/* Free splitting: each pane's own save / read-only buttons, fixed to the right of the tab bar and not scrolling with the tabs */
+.workspace-pane-actions {
+  position: sticky;
+  right: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding-left: 6px;
+  background: var(--color-bg-secondary, #1e1e1e);
+}
+
+.workspace-pane-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.workspace-pane-action:hover:not(:disabled) {
+  background: var(--color-bg-hover, rgba(255, 255, 255, 0.08));
+}
+
+.workspace-pane-action.editable {
+  color: var(--color-accent, #4a9eff);
+}
+
+.workspace-pane-action:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Free splitting: placeholder for inactive panes */
+.workspace-pane-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 20px;
+  color: var(--color-text-secondary);
+  text-align: center;
+  cursor: pointer;
+}
+/* Free splitting: read-only preview of an inactive file pane (content visible but not editable, so users don't think the editor disappeared) */
+.workspace-pane-preview {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  cursor: pointer;
+  background: var(--color-bg-secondary);
+}
+.workspace-pane-preview-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-primary);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+.workspace-pane-preview-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.workspace-pane-preview-hint {
+  flex: 0 0 auto;
+  opacity: 0.7;
+}
+.workspace-pane-preview-body {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  font-family: 'Consolas', 'Microsoft YaHei', monospace;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--color-text-secondary);
+  white-space: pre;
+  tab-size: 4;
+  user-select: text;
+}
+
+/* Free splitting: session panel container inside a session leaf */
+.workspace-pane-session-wrap {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-pane-session-wrap > * {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Free splitting: panel container inside a chat / terminal leaf (same shape as a session leaf) */
+.workspace-pane-embed-wrap {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-pane-embed-wrap > * {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Free splitting: container inside a diff leaf (same shape as session/chat/terminal leaves) */
+.workspace-pane-diff-wrap {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Diff view inside a diff pane (same style as the .workspace-diff-* in WorkspacePanel.vue, here a scoped copy for App.vue) */
+.workspace-pane-diff-wrap .workspace-diff-view {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-pane-diff-wrap .workspace-diff-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-secondary);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+
+.workspace-pane-diff-wrap .workspace-diff-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+
+.workspace-pane-diff-wrap .workspace-diff-title:hover {
+  text-decoration: underline;
+}
+
+.workspace-pane-diff-wrap .workspace-diff-hash {
+  color: var(--color-text-secondary);
+  font-family: monospace;
+}
+
+.workspace-pane-diff-wrap .workspace-diff-truncated {
+  color: var(--color-warning, #e6a23c);
+}
+
+.workspace-pane-diff-wrap .workspace-diff-toggle,
+.workspace-pane-diff-wrap .workspace-diff-close {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.workspace-pane-diff-wrap .workspace-diff-toggle:hover,
+.workspace-pane-diff-wrap .workspace-diff-close:hover {
+  color: var(--color-text-primary);
+  border-color: var(--color-text-secondary);
+}
+
+.workspace-pane-diff-wrap .workspace-diff-nav {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.workspace-pane-diff-wrap .workspace-diff-nav:hover {
+  color: var(--color-text-primary);
+  border-color: var(--color-text-secondary);
+}
+
+.workspace-pane-diff-wrap .workspace-diff-status {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.workspace-pane-diff-wrap .workspace-diff-status.error {
+  color: var(--color-danger, #f56c6c);
+}
+
+.workspace-pane-diff-wrap .workspace-diff-monaco {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+

@@ -1,0 +1,26 @@
+{
+  "name": "basic_cross_file_uaf",
+  "description": "cross_fileUAF：allocate、use、freeinnotsamefile",
+  "difficulty": "easy",
+  "vulnerability_type": "use_after_free",
+  "expected_issues": [
+    {
+      "pattern": "use_after_free_suspect",
+      "file": "main.c",
+      "function": "main",
+      "line": 8
+    }
+  ],
+  "files": [
+    "alloc.c",
+    "use.c",
+    "free.c",
+    "main.c"
+  ],
+  "cross_file": true,
+  "tags": [
+    "uaf",
+    "cross-file",
+    "memory-management"
+  ]
+}

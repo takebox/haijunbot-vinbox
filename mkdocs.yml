@@ -1,0 +1,350 @@
+# yamllint disable rule:line-length
+---
+site_name: HaijunBot Documentation
+site_description: AI-powered coding assistant with multi-agent architecture
+site_author: HaijunBot Team
+site_url: https://takebox.github.io/HaijunBot/
+docs_dir: docs
+exclude_docs: |
+  _*.md
+  */_*.md
+  design/
+  competition/
+  landing/
+  images/
+  GITHUB_PAGES_DEPLOYMENT.md
+  collaborative_agent_paper.md
+  HaijunBot_vs_ZeroClaw_Comparison_Report.md
+  HaijunBot_vs_ZeroClaw_Comparison_Report_v2.md
+# Repository
+repo_url: https://github.com/takebox/HaijunBot
+edit_uri: edit/main/docs/
+# Navigation
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Project Introduction: haijunbot_book/1.Project_Introduction.md
+      - Quick Start: haijunbot_book/2.Quick_Start.md
+      - Core Concepts and Architecture: haijunbot_book/3.Core_Concepts_and_Architecture.md
+  - user-manual:
+      - General Agent:
+          - Appending Supplementary Information to Predefined Tasks: user-manual/01_general-agent/Appending_Supplementary_Information_to_Predefined_Tasks.md
+          - Loading Rules from Project Global Central and Builtin Directories: user-manual/01_general-agent/Loading_Rules_from_Project_Global_Central_and_Builtin_Directories.md
+          - Running the General Agent in Non-Interactive Mode: user-manual/01_general-agent/Running_the_General_Agent_in_Non-Interactive_Mode.md
+          - Using hjbd to Input Multiline Tasks and Dispatch to tmux: user-manual/01_general-agent/Using_jvsd_to_Input_Multiline_Tasks_and_Dispatch_to_tmux.md
+          - Using hjbd to Dispatch Single-Line Tasks: user-manual/01_general-agent/Using_jvsd_to_Dispatch_Single-Line_Tasks.md
+          - Using Prefixed Rule Names to Precisely Load project global central builtin Rules: user-manual/01_general-agent/Using_Prefixed_Rule_Names_to_Precisely_Load_project_global_central_builtin_Rules.md
+          - Using the General Agent to Execute Tasks Interactively: user-manual/01_general-agent/Using_the_General_Agent_to_Execute_Tasks_Interactively.md
+          - Switching Model Groups: user-manual/01_general-agent/Switching_Model_Groups.md
+          - Loading and Selecting Predefined Tasks at Startup: user-manual/01_general-agent/Loading_and_Selecting_Predefined_Tasks_at_Startup.md
+          - Auto-Compressing History Summarizing and Clearing Context when Too Long: user-manual/01_general-agent/Auto-Compressing_History_Summarizing_and_Clearing_Context_when_Too_Long.md
+          - Deciding Whether to Continue Pending Tool Calls after Interruption: user-manual/01_general-agent/Deciding_Whether_to_Continue_Pending_Tool_Calls_after_Interruption.md
+          - Auto-Triggering Task Analysis after Task Completion: user-manual/01_general-agent/Auto-Triggering_Task_Analysis_after_Task_Completion.md
+          - Letting the System Decide Whether to Save Long-Term Memory at Task End: user-manual/01_general-agent/Letting_the_System_Decide_Whether_to_Save_Long-Term_Memory_at_Task_End.md
+          - Auto-Appending Past Experience to Context when Methodology is Enabled: user-manual/01_general-agent/Auto-Appending_Past_Experience_to_Context_when_Methodology_is_Enabled.md
+          - Pinning Long-Lived Supplementary Requirements in a Conversation: user-manual/01_general-agent/Pinning_Long-Lived_Supplementary_Requirements_in_a_Conversation.md
+          - Previewing Tool and Argument Summaries Before Calls: user-manual/01_general-agent/Previewing_Tool_and_Argument_Summaries_Before_Calls.md
+          - Auto-Saving Memory Before Clearing History or Finishing When Forced Memory is On: user-manual/01_general-agent/Auto-Saving_Memory_Before_Clearing_History_or_Finishing_When_Forced_Memory_is_On.md
+          - Manually Deciding Whether to Run Tool Calls after Confirmation Enabled: user-manual/01_general-agent/Manually_Deciding_Whether_to_Run_Tool_Calls_after_Confirmation_Enabled.md
+          - Checking Git commit Consistency Before Restoring a Session: user-manual/01_general-agent/Checking_Git_commit_Consistency_Before_Restoring_a_Session.md
+          - Checking History Against Model Token Limits Before Restoring: user-manual/01_general-agent/Checking_History_Against_Model_Token_Limits_Before_Restoring.md
+          - Choosing Reset to Old commit or Continue when Restoring: user-manual/01_general-agent/Choosing_Reset_to_Old_commit_or_Continue_when_Restoring.md
+          - Preserving Original Goal Fixed Content and Recent Memory After Summarization: user-manual/01_general-agent/Preserving_Original_Goal_Fixed_Content_and_Recent_Memory_After_Summarization.md
+          - Referencing Files in Input and Auto-Attaching Symbol Info: user-manual/01_general-agent/Referencing_Files_in_Input_and_Auto-Attaching_Symbol_Info.md
+          - Interrupting Model Output and Entering Human Intervention: user-manual/01_general-agent/Interrupting_Model_Output_and_Entering_Human_Intervention.md
+          - Auto-Loading Methodology for Similar Past Issues on First Run: user-manual/01_general-agent/Auto-Loading_Methodology_for_Similar_Past_Issues_on_First_Run.md
+          - Restoring History Sessions: user-manual/01_general-agent/Restoring_History_Sessions.md
+          - Manually Triggering Task Analysis Directly: user-manual/01_general-agent/Manually_Triggering_Task_Analysis_Directly.md
+          - Specifying a Custom Config File: user-manual/01_general-agent/Specifying_a_Custom_Config_File.md
+          - Saving by Session Name and Auto-Cleaning Old Sessions: user-manual/01_general-agent/Saving_by_Session_Name_and_Auto-Cleaning_Old_Sessions.md
+          - Viewing Rule File Paths Content Previews and Activation Status: user-manual/01_general-agent/Viewing_Rule_File_Paths_Content_Previews_and_Activation_Status.md
+          - Activating and Deactivating Rules: user-manual/01_general-agent/Activating_and_Deactivating_Rules.md
+          - Executing Tasks Passed from the Command Line Directly: user-manual/01_general-agent/Executing_Tasks_Passed_from_the_Command_Line_Directly.md
+          - Auto-Saving Sessions to the Project .haijunbot sessions Directory: user-manual/01_general-agent/Auto-Saving_Sessions_to_the_Project_.haijunbot_sessions_Directory.md
+          - Auto-Loading Currently Activated Rules: user-manual/01_general-agent/Auto-Loading_Currently_Activated_Rules.md
+          - Using Built-in Markers for Summary History Clear Config Reload Tools and Rules: user-manual/01_general-agent/Using_Built-in_Markers_for_Summary_History_Clear_Config_Reload_Tools_and_Rules.md
+          - Switching Multiline Input and Confirmation via Unified Interaction: user-manual/01_general-agent/Switching_Multiline_Input_and_Confirmation_via_Unified_Interaction.md
+      - CodeAgent:
+          - Temporarily Switching Model or Tool Groups for the Code Agent: user-manual/02_codeagent/Temporarily_Switching_Model_or_Tool_Groups_for_the_Code_Agent.md
+          - Appending Tools for the Code Agent: user-manual/02_codeagent/Appending_Tools_for_the_Code_Agent.md
+          - Using hcad to Input Multiline Code Tasks and Dispatch to tmux: user-manual/02_codeagent/Using_jcad_to_Input_Multiline_Code_Tasks_and_Dispatch_to_tmux.md
+          - Using hcad to Dispatch Code Tasks Directly: user-manual/02_codeagent/Using_jcad_to_Dispatch_Code_Tasks_Directly.md
+          - Using the Code Agent to Execute Tasks Interactively: user-manual/02_codeagent/Using_the_Code_Agent_to_Execute_Tasks_Interactively.md
+          - Using Turbo Mode to Execute Tasks Quickly: user-manual/02_codeagent/Using_Turbo_Mode_to_Execute_Tasks_Quickly.md
+          - Disabling Automatic Code Review of the Code Agent: user-manual/02_codeagent/Disabling_Automatic_Code_Review_of_the_Code_Agent.md
+          - Enabling System Prompt Auto-Optimization for the Code Agent: user-manual/02_codeagent/Enabling_System_Prompt_Auto-Optimization_for_the_Code_Agent.md
+          - Creating a Minimal gitattributes for a Repo on Windows: user-manual/02_codeagent/Creating_a_Minimal_gitattributes_for_a_Repo_on_Windows.md
+          - Sharing Runtime haijunbot Data but Isolating Rule Files in worktree: user-manual/02_codeagent/Sharing_Runtime_haijunbot_Data_but_Isolating_Rule_Files_in_worktree.md
+          - Auto-Showing Enhanced diff Preview and Per-File Patch Summaries: user-manual/02_codeagent/Auto-Showing_Enhanced_diff_Preview_and_Per-File_Patch_Summaries.md
+          - Auto-Running Build Verification After Code Changes: user-manual/02_codeagent/Auto-Running_Build_Verification_After_Code_Changes.md
+          - Auto-Running Formatting or Post-Change Processing After Edits: user-manual/02_codeagent/Auto-Running_Formatting_or_Post-Change_Processing_After_Edits.md
+          - Auto-Performing Checkpoint Commits After Code Changes: user-manual/02_codeagent/Auto-Performing_Checkpoint_Commits_After_Code_Changes.md
+          - Auto-Running Static Checks and Showing Auto-Fix Suggestions: user-manual/02_codeagent/Auto-Running_Static_Checks_and_Showing_Auto-Fix_Suggestions.md
+          - Auto-Updating Context and Generating Impact Analysis After Changes: user-manual/02_codeagent/Auto-Updating_Context_and_Generating_Impact_Analysis_After_Changes.md
+          - Auto-Truncating Overly Large diffs During Review: user-manual/02_codeagent/Auto-Truncating_Overly_Large_diffs_During_Review.md
+          - Auto-Fixing Malformed JSON in Review Results: user-manual/02_codeagent/Auto-Fixing_Malformed_JSON_in_Review_Results.md
+          - Auto-Creating an Initial Commit for Uncommitted Repos in worktree: user-manual/02_codeagent/Auto-Creating_an_Initial_Commit_for_Uncommitted_Repos_in_worktree.md
+          - Auto-Committing Uncommitted Main Repo Changes in worktree: user-manual/02_codeagent/Auto-Committing_Uncommitted_Main_Repo_Changes_in_worktree.md
+          - Auto-Creating Branches and Work Dirs in worktree: user-manual/02_codeagent/Auto-Creating_Branches_and_Work_Dirs_in_worktree.md
+          - Resetting to Initial Commit After Rejected Commit Records: user-manual/02_codeagent/Resetting_to_Initial_Commit_After_Rejected_Commit_Records.md
+          - Replaying Accepted Commit Records and Generating Standard Messages: user-manual/02_codeagent/Replaying_Accepted_Commit_Records_and_Generating_Standard_Messages.md
+          - Confirming Acceptance of Auto-Generated Commit Records: user-manual/02_codeagent/Confirming_Acceptance_of_Auto-Generated_Commit_Records.md
+          - Continuously Reviewing Code in Infinite Mode: user-manual/02_codeagent/Continuously_Reviewing_Code_in_Infinite_Mode.md
+          - Turning Build Failure Errors into Fix Hints: user-manual/02_codeagent/Turning_Build_Failure_Errors_into_Fix_Hints.md
+          - Choosing to Disable Build Verification and Use Static Checks: user-manual/02_codeagent/Choosing_to_Disable_Build_Verification_and_Use_Static_Checks.md
+          - Auto-Detecting Risky Large Deletions and Reverting if Needed: user-manual/02_codeagent/Auto-Detecting_Risky_Large_Deletions_and_Reverting_if_Needed.md
+          - Manually Deciding Whether to Continue Reviewing: user-manual/02_codeagent/Manually_Deciding_Whether_to_Continue_Reviewing.md
+          - Auto-Appending Risk Warnings for High-Risk Edits: user-manual/02_codeagent/Auto-Appending_Risk_Warnings_for_High-Risk_Edits.md
+          - Restoring Code Agent Sessions: user-manual/02_codeagent/Restoring_Code_Agent_Sessions.md
+          - Running Multi-Round Review and Fix Loops: user-manual/02_codeagent/Running_Multi-Round_Review_and_Fix_Loops.md
+          - Dispatching Code Agent Tasks to tmux Windows: user-manual/02_codeagent/Dispatching_Code_Agent_Tasks_to_tmux_Windows.md
+          - Auto-Recommending Relevant Code Context to User Needs: user-manual/02_codeagent/Auto-Recommending_Relevant_Code_Context_to_User_Needs.md
+          - Auto-Updating gitignore with Default Ignore Rules: user-manual/02_codeagent/Auto-Updating_gitignore_with_Default_Ignore_Rules.md
+          - Auto-Adjusting Git Line Endings to Reduce Noise in diffs: user-manual/02_codeagent/Auto-Adjusting_Git_Line_Endings_to_Reduce_Noise_in_diffs.md
+          - Letting the Code Agent Read Tasks from a Task File: user-manual/02_codeagent/Letting_the_Code_Agent_Read_Tasks_from_a_Task_File.md
+          - Running Code Agent Tasks in a Git Worktree: user-manual/02_codeagent/Running_Code_Agent_Tasks_in_a_Git_Worktree.md
+          - Setting Max Review Iterations for the Code Agent: user-manual/02_codeagent/Setting_Max_Review_Iterations_for_the_Code_Agent.md
+          - Enabling Web Gateway via the Code Agent: user-manual/02_codeagent/Enabling_Web_Gateway_via_the_Code_Agent.md
+          - Custom Post-Change Commands via after change tools Config: user-manual/02_codeagent/Custom_Post-Change_Commands_via_after_change_tools_Config.md
+      - Platform & Configuration:
+          - Feature Index and Mapping: user-manual/03_platform-and-config/00_Feature_Index_and_Mapping.md
+          - Starting an OpenAI-Compatible API Service: user-manual/03_platform-and-config/Starting_an_OpenAI-Compatible_API_Service.md
+          - Choosing a Free-Tier Provider: user-manual/03_platform-and-config/Choosing_a_Free_Tier_Provider.md
+          - Editing Config in the Web Config UI: user-manual/03_platform-and-config/Editing_Config_in_the_Web_Config_UI.md
+          - Enabling Auto Methodology Extraction After Tasks: user-manual/03_platform-and-config/Enabling_Auto_Methodology_Extraction_After_Tasks.md
+          - Enabling or Disabling Build Verification After Edits: user-manual/03_platform-and-config/Enabling_or_Disabling_Build_Verification_After_Edits.md
+          - Enabling or Disabling Change Impact Analysis: user-manual/03_platform-and-config/Enabling_or_Disabling_Change_Impact_Analysis.md
+          - Enabling Confirmation Before Tool Execution: user-manual/03_platform-and-config/Enabling_Confirmation_Before_Tool_Execution.md
+          - Enabling Smart Enhancement Capabilities: user-manual/03_platform-and-config/Enabling_Smart_Enhancement_Capabilities.md
+          - Enabling Auto Memory Organization: user-manual/03_platform-and-config/Enabling_Auto_Memory_Organization.md
+          - Auto-Filtering Relevant Methodology by Current Needs: user-manual/03_platform-and-config/Auto-Filtering_Relevant_Methodology_by_Current_Needs.md
+          - Enabling CodeAgent Auto-Restore of Sessions: user-manual/03_platform-and-config/Enabling_CodeAgent_Auto-Restore_of_Sessions.md
+          - Enabling Session History Saving: user-manual/03_platform-and-config/Enabling_Session_History_Saving.md
+          - Quickly Configuring OpenAI or Haijun Platforms: user-manual/03_platform-and-config/Quickly_Configuring_OpenAI_or_Haijun_Platforms.md
+          - Extending Platforms and Letting the System Discover Them: user-manual/03_platform-and-config/Extending_Platforms_and_Letting_the_System_Discover_Them.md
+          - Starting Conversations by Role Config: user-manual/03_platform-and-config/Starting_Conversations_by_Role_Config.md
+          - Connecting the Jev TypeSafe Platform: user-manual/03_platform-and-config/Connecting_the_Jev_TypeSafe_Platform.md
+          - Controlling Whether diff Shows Line Numbers: user-manual/03_platform-and-config/Controlling_Whether_diff_Shows_Line_Numbers.md
+          - Viewing Available Resource Stats at Startup: user-manual/03_platform-and-config/Viewing_Available_Resource_Stats_at_Startup.md
+          - Viewing Current Platform and Model Info: user-manual/03_platform-and-config/Viewing_Current_Platform_and_Model_Info.md
+          - Talking Directly to the Current Model: user-manual/03_platform-and-config/Talking_Directly_to_the_Current_Model.md
+          - Managing LLM Configuration: user-manual/03_platform-and-config/Managing_LLM_Configuration.md
+          - Managing Model Groups and Setting the Default: user-manual/03_platform-and-config/Managing_Model_Groups_and_Setting_the_Default.md
+          - Customizing Git Commit Message Templates: user-manual/03_platform-and-config/Customizing_Git_Commit_Message_Templates.md
+          - Adjusting diff Display Mode: user-manual/03_platform-and-config/Adjusting_diff_Display_Mode.md
+          - Adjusting Large-File diff Thresholds: user-manual/03_platform-and-config/Adjusting_Large-File_diff_Thresholds.md
+          - Adjusting Build Verification Timeout: user-manual/03_platform-and-config/Adjusting_Build_Verification_Timeout.md
+          - Skipping Predefined Task Selection at Startup: user-manual/03_platform-and-config/Skipping_Predefined_Task_Selection_at_Startup.md
+          - Connecting External Tools via MCP Config: user-manual/03_platform-and-config/Connecting_External_Tools_via_MCP_Config.md
+          - Limiting Tools via Whitelist and Blacklist: user-manual/03_platform-and-config/Limiting_Tools_via_Whitelist_and_Blacklist.md
+          - Configuring the Central Tool Repository: user-manual/03_platform-and-config/Configuring_the_Central_Tool_Repository.md
+          - Configuring the Central Methodology Repository: user-manual/03_platform-and-config/Configuring_the_Central_Methodology_Repository.md
+          - Configuring the Central Rules Repository: user-manual/03_platform-and-config/Configuring_the_Central_Rules_Repository.md
+          - Configuring Submit Shortcuts for Multiline Input: user-manual/03_platform-and-config/Configuring_Submit_Shortcuts_for_Multiline_Input.md
+          - Configuring Custom Callback Dirs After Tool Calls: user-manual/03_platform-and-config/Configuring_Custom_Callback_Dirs_After_Tool_Calls.md
+          - Configuring the Structured Evaluation Model: user-manual/03_platform-and-config/Configuring_the_Structured_Evaluation_Model.md
+          - Configuring Gateway Password and Policy When Unset: user-manual/03_platform-and-config/Configuring_Gateway_Password_and_Policy_When_Unset.md
+          - Configuring Custom Input Tags and Text Replacements: user-manual/03_platform-and-config/Configuring_Custom_Input_Tags_and_Text_Replacements.md
+          - Configuring Extra Agent Definition Directories: user-manual/03_platform-and-config/Configuring_Extra_Agent_Definition_Directories.md
+          - Configuring Extra Tool Load Directories: user-manual/03_platform-and-config/Configuring_Extra_Tool_Load_Directories.md
+          - Configuring Extra Methodology Load Directories: user-manual/03_platform-and-config/Configuring_Extra_Methodology_Load_Directories.md
+          - Configuring Extra Rule Load Directories: user-manual/03_platform-and-config/Configuring_Extra_Rule_Load_Directories.md
+          - Configuring Extra Role Directories: user-manual/03_platform-and-config/Configuring_Extra_Role_Directories.md
+          - Configuring Default Auto-Loaded Rules: user-manual/03_platform-and-config/Configuring_Default_Auto-Loaded_Rules.md
+      - Web UI & Gateway:
+          - Feature Index and Mapping: user-manual/04_web-ui-and-gateway/00_Feature_Index_and_Mapping.md
+          - Node Mode Deployment and Integration Handbook: user-manual/04_web-ui-and-gateway/Node_Mode_Deployment_and_Integration_Handbook.md
+          - Using the File Tree and Online Editor: user-manual/04_web-ui-and-gateway/Using_the_File_Tree_and_Online_Editor.md
+          - Logging into Web Gateway with a Password: user-manual/04_web-ui-and-gateway/Logging_into_Web_Gateway_with_a_Password.md
+          - Using the Newcomer Guide to Get Started: user-manual/04_web-ui-and-gateway/Using_the_Newcomer_Guide_to_Get_Started.md
+          - Using the Standalone Terminal Panel: user-manual/04_web-ui-and-gateway/Using_the_Standalone_Terminal_Panel.md
+          - Inserting Common Content with the Completion Panel: user-manual/04_web-ui-and-gateway/Inserting_Common_Content_with_the_Completion_Panel.md
+          - Distributed Gateway Deployment Method: user-manual/04_web-ui-and-gateway/Distributed_Gateway_Deployment_Method.md
+          - Creating General or Code Agents: user-manual/04_web-ui-and-gateway/Creating_General_or_Code_Agents.md
+          - Starting the Web Gateway Service: user-manual/04_web-ui-and-gateway/Starting_the_Web_Gateway_Service.md
+          - Intervening While an Agent is Running: user-manual/04_web-ui-and-gateway/Intervening_While_an_Agent_is_Running.md
+          - Viewing an Agent Nodes in the Web UI: user-manual/04_web-ui-and-gateway/Viewing_an_Agent_Nodes_in_the_Web_UI.md
+          - Entering Content and Responding to Confirmations in the Web UI: user-manual/04_web-ui-and-gateway/Entering_Content_and_Responding_to_Confirmations_in_the_Web_UI.md
+          - Connecting to HaijunBot Gateway from the Browser: user-manual/04_web-ui-and-gateway/Connecting_to_HaijunBot_Gateway_from_the_Browser.md
+          - Viewing Terminal Output in Messages: user-manual/04_web-ui-and-gateway/Viewing_Terminal_Output_in_Messages.md
+          - Duplicating Renaming and Deleting Agents: user-manual/04_web-ui-and-gateway/Duplicating_Renaming_and_Deleting_Agents.md
+          - Restoring Agent Sessions: user-manual/04_web-ui-and-gateway/Restoring_Agent_Sessions.md
+          - Opening Settings and Managing Connections and History: user-manual/04_web-ui-and-gateway/Opening_Settings_and_Managing_Connections_and_History.md
+          - Viewing Agent Running Status: user-manual/04_web-ui-and-gateway/Viewing_Agent_Running_Status.md
+          - Viewing and Switching Agents in the Web UI: user-manual/04_web-ui-and-gateway/Viewing_and_Switching_Agents_in_the_Web_UI.md
+          - Managing History and Reconnecting: user-manual/04_web-ui-and-gateway/Managing_History_and_Reconnecting.md
+          - Managing Input Buffers and History Input: user-manual/04_web-ui-and-gateway/Managing_Input_Buffers_and_History_Input.md
+          - Adjusting Sidebar and Floating Window Layout: user-manual/04_web-ui-and-gateway/Adjusting_Sidebar_and_Floating_Window_Layout.md
+          - Editing Config Files in the Web UI: user-manual/04_web-ui-and-gateway/Editing_Config_Files_in_the_Web_UI.md
+          - Using Shortcuts for Quick Operations: user-manual/04_web-ui-and-gateway/Using_Shortcuts_for_Quick_Operations.md
+          - Using the Management Sidebar: user-manual/04_web-ui-and-gateway/Using_the_Management_Sidebar.md
+          - Managing Scheduled Tasks and Scheduling: user-manual/04_web-ui-and-gateway/Managing_Scheduled_Tasks_and_Scheduling.md
+          - Viewing Version and About Info: user-manual/04_web-ui-and-gateway/Viewing_Version_and_About_Info.md
+      - Tools & Efficiency:
+          - Feature Index and Mapping: user-manual/05_tools-and-efficiency/00_Feature_Index_and_Mapping.md
+          - Adding Prefixes to Git Commit Messages: user-manual/05_tools-and-efficiency/Adding_Prefixes_to_Git_Commit_Messages.md
+          - Adding Suffixes to Git Commit Messages: user-manual/05_tools-and-efficiency/Adding_Suffixes_to_Git_Commit_Messages.md
+          - Installing the Smart Shell Not-Found Handler for bash: user-manual/05_tools-and-efficiency/Installing_the_Smart_Shell_Not-Found_Handler_for_bash.md
+          - Installing the Smart Shell Not-Found Handler for fish: user-manual/05_tools-and-efficiency/Installing_the_Smart_Shell_Not-Found_Handler_for_fish.md
+          - Installing the Smart Shell Not-Found Handler for zsh: user-manual/05_tools-and-efficiency/Installing_the_Smart_Shell_Not-Found_Handler_for_zsh.md
+          - Importing Memories from a JSON File: user-manual/05_tools-and-efficiency/Importing_Memories_from_a_JSON_File.md
+          - Extracting Methodology from URL Content: user-manual/05_tools-and-efficiency/Extracting_Methodology_from_URL_Content.md
+          - Extracting Methodology from Text Files: user-manual/05_tools-and-efficiency/Extracting_Methodology_from_Text_Files.md
+          - Listing All Methodologies: user-manual/05_tools-and-efficiency/Listing_All_Methodologies.md
+          - Listing All Available Tools: user-manual/05_tools-and-efficiency/Listing_All_Available_Tools.md
+          - Uninstalling the Smart Shell Not-Found Handler: user-manual/05_tools-and-efficiency/Uninstalling_the_Smart_Shell_Not-Found_Handler.md
+          - Importing Methodology Files: user-manual/05_tools-and-efficiency/Importing_Methodology_Files.md
+          - Exporting Methodologies to a JSON File: user-manual/05_tools-and-efficiency/Exporting_Methodologies_to_a_JSON_File.md
+          - Exporting Memories to a JSON File: user-manual/05_tools-and-efficiency/Exporting_Memories_to_a_JSON_File.md
+          - Organizing and Merging Long-Term Memories: user-manual/05_tools-and-efficiency/Organizing_and_Merging_Long-Term_Memories.md
+          - Viewing All Available Rule Indexes: user-manual/05_tools-and-efficiency/Viewing_All_Available_Rule_Indexes.md
+          - Viewing a Single Tool Details: user-manual/05_tools-and-efficiency/Viewing_a_Single_Tool_Details.md
+          - Generating Shell Commands in Natural Language: user-manual/05_tools-and-efficiency/Generating_Shell_Commands_in_Natural_Language.md
+          - Auto-Generating Git Commit Messages: user-manual/05_tools-and-efficiency/Auto-Generating_Git_Commit_Messages.md
+          - Calling Specific Tools Directly from the CLI: user-manual/05_tools-and-efficiency/Calling_Specific_Tools_Directly_from_the_CLI.md
+      - Specialized Capabilities:
+          - Extracting Designs from Code: user-manual/06_specialized-capabilities/Extracting_Designs_from_Code.md
+          - Analyzing Vulnerabilities and Generating Reports: user-manual/06_specialized-capabilities/Analyzing_Vulnerabilities_and_Generating_Reports.md
+          - Analyzing External Security Issue JSON: user-manual/06_specialized-capabilities/Analyzing_External_Security_Issue_JSON.md
+          - Switching Conversation Styles: user-manual/06_specialized-capabilities/Switching_Conversation_Styles.md
+          - Running Security Scans: user-manual/06_specialized-capabilities/Running_Security_Scans.md
+          - Running the Migration Pipeline: user-manual/06_specialized-capabilities/Running_the_Migration_Pipeline.md
+          - Querying Known Vulnerabilities and CVEs: user-manual/06_specialized-capabilities/Querying_Known_Vulnerabilities_and_CVEs.md
+          - Rendering Architecture Diagram PNGs: user-manual/06_specialized-capabilities/Rendering_Architecture_Diagram_PNGs.md
+          - Generating Graphviz Architecture Diagrams: user-manual/06_specialized-capabilities/Generating_Graphviz_Architecture_Diagrams.md
+          - Generating and Saving Scripts: user-manual/06_specialized-capabilities/Generating_and_Saving_Scripts.md
+          - Generating Project-Level Reverse-Engineering Docs: user-manual/06_specialized-capabilities/Generating_Project-Level_Reverse-Engineering_Docs.md
+          - Researching Official Docs and Generating Deployment Steps: user-manual/06_specialized-capabilities/Researching_Official_Docs_and_Generating_Deployment_Steps.md
+          - Script Usage and Testing Methods: user-manual/06_specialized-capabilities/Script_Usage_and_Testing_Methods.md
+          - Checking Refactoring Consistency via Commits: user-manual/06_specialized-capabilities/Checking_Refactoring_Consistency_via_Commits.md
+          - Pre-Deployment Environment and Dependency Checks: user-manual/06_specialized-capabilities/Pre-Deployment_Environment_and_Dependency_Checks.md
+          - Configuring Security Scans: user-manual/06_specialized-capabilities/Configuring_Security_Scans.md
+          - Configuring Migration Settings: user-manual/06_specialized-capabilities/Configuring_Migration_Settings.md
+          - Resetting and Re-running the Migration Pipeline: user-manual/06_specialized-capabilities/Resetting_and_Re-running_the_Migration_Pipeline.md
+          - Verifying Functional Alignment: user-manual/06_specialized-capabilities/Verifying_Functional_Alignment.md
+          - Verifying Refactoring Logical Consistency: user-manual/06_specialized-capabilities/Verifying_Refactoring_Logical_Consistency.md
+  - Usage Guide & Advanced Topics:
+      - Usage Guide: haijunbot_book/4.Usage_Guide.md
+      - Feature Extensions: haijunbot_book/5.Feature_Extensions.md
+      - Advanced Topics: haijunbot_book/6.Advanced_Topics.md
+  - Best Practices:
+      - best_practices/HaijunBot_Rule_System_Introduction.md
+      - best_practices/Best_Practices_for_Using_Rules.md
+      - best_practices/rules_best_practices.md
+      - best_practices/jcad_Best_Practices.md
+      - best_practices/Interactive_Code_Development_with_jca.md
+      - best_practices/Parallel_Development_with_jcad.md
+      - best_practices/Introducing_MCP_and_TRACKS_via_Rules.md
+      - best_practices/Adding_New_Rules_via_Reglas.md
+      - best_practices/Introducing_CodeAgent_and_Agent_into_a_Project.md
+      - best_practices/haijunbot_agent_cli_invocation.md
+  - Technical Documentation:
+      - README: technical/README.md
+      - adversarial agent expert system: technical/adversarial_agent_expert_system.md
+      - Implementation Details:
+          - README: technical/implementation/README.md
+          - context compression strategies: technical/implementation/context_compression_strategies.md
+          - context compression flow: technical/implementation/context_compression_flow.md
+          - agent comparison analysis: technical/implementation/agent_comparison_analysis.md
+          - lsp language extension: technical/implementation/lsp_language_extension.md
+  - Comparisons & Analysis:
+      - haijunbot vs codex cli: compare/haijunbot_vs_codex_cli.md
+      - haijunbot vs haijun code agent: compare/haijunbot_vs_haijun_code_agent.md
+      - haijunbot vs openviking: compare/haijunbot_vs_openviking.md
+      - haijunbot code agent evolution plan: compare/haijunbot_code_agent_evolution_plan.md
+      - HaijunBot Deep Analysis Report: HaijunBot_Deep_Analysis_Report.md
+      - Goal Preservation Mechanism Analysis: Goal_Preservation_Mechanism_Analysis.md
+  - Deployment & Operations:
+      - haijunbot config: haijunbot_config.md
+      - offline installation: offline_installation.md
+      - Starting the Web Gateway Service: user-manual/04_web-ui-and-gateway/Starting_the_Web_Gateway_Service.md
+  - Help & Community:
+      - Contributing: haijunbot_book/7.Contributing.md
+      - FAQ: haijunbot_book/8.FAQ.md
+      - Appendix: haijunbot_book/9.Appendix.md
+# Theme configuration
+theme:
+  name: material
+  language: en
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+  icon:
+    repo: fontawesome/brands/github
+# Plugins
+plugins:
+  - search:
+      lang:
+        - en
+        - zh
+  - git-revision-date-localized:
+      enable_creation_date: true
+# Markdown extensions
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - toc:
+      permalink: true
+      toc_depth: 3
+      slugify:
+        !!python/object/apply:pymdownx.slugs.slugify { kwds: { case: lower } }
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+# Extra configuration
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/takebox/HaijunBot
+      name: GitHub
+  version:
+    provider: automatic

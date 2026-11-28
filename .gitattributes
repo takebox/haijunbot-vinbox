@@ -1,0 +1,10 @@
+# HaijunBot recommended minimal line ending configuration
+# By default all text files use LF, only Windows-specific files use CRLF
+
+# Default to LF for all text files
+* text=auto eol=lf
+
+# Windows batch files require CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

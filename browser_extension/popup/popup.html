@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HaijunBot Browser Bridge</title>
+    <style>
+      body {
+        width: 480px;
+        margin: 0;
+        padding: 12px;
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        font-size: 13px;
+        color: #222;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 10px;
+      }
+      label {
+        display: block;
+        margin-bottom: 4px;
+        color: #555;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 6px;
+        margin-bottom: 8px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 12px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      button {
+        flex: 1;
+        padding: 7px;
+        border: none;
+        border-radius: 4px;
+        background: #2f6fed;
+        color: #fff;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      button.secondary {
+        background: #888;
+      }
+      button.mini {
+        flex: none;
+        padding: 3px 8px;
+        font-size: 11px;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .status {
+        padding: 8px;
+        border-radius: 4px;
+        background: #f2f2f2;
+        margin-bottom: 10px;
+        line-height: 1.5;
+      }
+      .dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #bbb;
+        margin-right: 6px;
+      }
+      .dot.connected {
+        background: #2bb673;
+      }
+      .dot.connecting {
+        background: #e8a33d;
+      }
+      .dot.disconnected {
+        background: #cc4444;
+      }
+      .hint {
+        color: #888;
+        font-size: 11px;
+        line-height: 1.5;
+      }
+      .gw-list {
+        margin-bottom: 10px;
+      }
+      .gw-item {
+        border: 1px solid #e0e0e0;
+        border-radius: 4px;
+        padding: 8px;
+        margin-bottom: 6px;
+      }
+      .gw-item .gw-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+      }
+      .gw-item .gw-url {
+        font-weight: 600;
+        word-break: break-all;
+        flex: 1;
+      }
+      .gw-item .gw-meta {
+        margin-top: 4px;
+      }
+      .gw-item .gw-actions {
+        display: flex;
+        gap: 6px;
+        margin-top: 6px;
+      }
+      .confirm-box {
+        display: none;
+        border: 1px solid #e8a33d;
+        background: #fff8ec;
+        border-radius: 4px;
+        padding: 8px;
+        margin-bottom: 10px;
+      }
+      .confirm-box.show {
+        display: block;
+      }
+      .confirm-box .title {
+        font-weight: 600;
+        margin-bottom: 4px;
+      }
+      code {
+        background: #f2f2f2;
+        padding: 1px 3px;
+        border-radius: 3px;
+      }
+      .log-box {
+        margin-top: 10px;
+        border: 1px solid #e0e0e0;
+        border-radius: 4px;
+        padding: 6px;
+        max-height: 260px;
+        overflow-y: auto;
+        background: #fafafa;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 11px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .log-box .log-line {
+        border-bottom: 1px dashed #eee;
+        padding: 1px 0;
+      }
+      .log-box .log-line:last-child {
+        border-bottom: none;
+      }
+      .log-title {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: 12px;
+        font-weight: 600;
+        font-size: 12px;
+      }
+      .log-title button {
+        flex: none;
+        padding: 2px 8px;
+        font-size: 11px;
+        background: #888;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>HaijunBot Browser Bridge</h1>
+
+    <label for="gateway">Add gateway address</label>
+    <input
+      id="gateway"
+      type="text"
+      placeholder="https://hjb-ai.cn or http://127.0.0.1:8000"
+    />
+    <div class="row">
+      <button id="connectBtn">Add and Connect</button>
+    </div>
+
+    <div class="gw-list" id="gwList"></div>
+
+    <!-- Gateway allow/block list: prevents gateways that are "logged into occasionally" from being auto-discovered and connected long-term -->
+    <div class="log-title">
+      <span>Gateway Allow/Block List</span>
+    </div>
+    <label for="gfMode">Mode</label>
+    <select id="gfMode">
+      <option value="off">Off (no restriction)</option>
+      <option value="whitelist">Whitelist (allow only listed)</option>
+      <option value="blacklist">Blacklist (block only listed)</option>
+    </select>
+    <label for="gfPatterns">Match rules (one per line, host:port, supports * and ?)</label>
+    <textarea
+      id="gfPatterns"
+      rows="4"
+      placeholder="*.example.com:*&#10;192.168.1.10:8080"
+      style="
+        width: 100%;
+        box-sizing: border-box;
+        padding: 6px;
+        margin-bottom: 8px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 11px;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        resize: vertical;
+      "
+    ></textarea>
+    <div class="row">
+      <button id="gfSaveBtn">Save List</button>
+    </div>
+    <div class="hint">
+      Off by default. When the whitelist is active, only gateways on the list may connect (empty list = deny all);
+      when the blacklist is active, only gateways on the list are blocked. List changes only affect new connections; existing connections are not disconnected.
+    </div>
+
+    <!-- High-risk action secondary confirmation (placeholder: will be triggered by background in the future) -->
+    <div class="confirm-box" id="confirmBox">
+      <div class="title">⚠️ High-Risk Action Confirmation</div>
+      <div id="confirmDesc" class="hint">
+        The Agent is requesting to perform an action that may cause irreversible consequences.
+      </div>
+      <div class="row" style="margin-top: 8px">
+        <button id="confirmYes">Allow</button>
+        <button id="confirmNo" class="secondary">Deny</button>
+      </div>
+    </div>
+
+    <div class="hint">
+      You can connect to multiple HaijunBot gateways simultaneously, each with an independent connection.<br />
+      Login sessions are automatically reused from the HaijunBot web page already logged into in the browser; no need to manually fill in a Token.<br />
+      Note: All gateways share the same set of browser tabs.
+    </div>
+
+    <!-- Script management (Tampermonkey-like): install / list / enable-disable / uninstall custom page scripts -->
+    <div class="log-title">
+      <span>Script Management (Tampermonkey-like)</span>
+    </div>
+
+    <label for="scriptName">Script name</label>
+    <input id="scriptName" type="text" placeholder="e.g. mysite" />
+
+    <label for="scriptSource">Script source code</label>
+    <textarea
+      id="scriptSource"
+      rows="6"
+      placeholder="Must export globalThis.__HAIJUNBOT_SCRIPT__ = { name, actions: {...} } or module.exports = {...}"
+      style="
+        width: 100%;
+        box-sizing: border-box;
+        padding: 6px;
+        margin-bottom: 8px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 11px;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        resize: vertical;
+      "
+    ></textarea>
+
+    <label for="scriptFile">Or import from a local file</label>
+    <input id="scriptFile" type="file" accept=".js,text/javascript" />
+
+    <div class="row">
+      <button id="scriptInstallBtn">Install Script</button>
+    </div>
+
+    <label for="scriptUrl">Or install from URL</label>
+    <input
+      id="scriptUrl"
+      type="text"
+      placeholder="https://example.com/my-script.js"
+    />
+    <div class="row">
+      <button id="scriptInstallUrlBtn">Install from URL</button>
+    </div>
+    <div class="hint">
+      Only http/https is supported; internal network / local addresses are rejected.
+      The source code is downloaded by the extension backend and is not displayed here.
+    </div>
+
+    <div class="gw-list" id="scriptList"></div>
+
+    <div class="log-title">
+      <span>Connection Diagnostic Log</span>
+      <button id="clearLogBtn" class="secondary">Clear</button>
+    </div>
+    <div class="log-box" id="logBox"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

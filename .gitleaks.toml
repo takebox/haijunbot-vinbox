@@ -1,0 +1,26 @@
+# Gitleaks scan configuration
+#
+# Description: This file unifies Gitleaks scan rules and allowlist, shared by
+#   - Pre-commit hook .githooks/pre-commit (staged scan)
+#   - Full history scan (gitleaks git --log-opts="--all")
+# to ensure consistent behavior in both places.
+#
+# [extend] useDefault = true means extending on top of Gitleaks built-in default rule set.
+# Must keep: If only [allowlist] is written without extend, Gitleaks considers the rule set empty,
+# causing all detection to fail (confirmed in practice).
+#
+# The allowlist is only used to exclude false positive paths that are "definitely not real credentials",
+# to avoid noise on every scan. Excluded items are:
+#   - tests/haijunbot_sec/datasets/  —— Intentionally constructed leak sample test fixtures (sk-..., RSA private keys, etc.)
+#   - browser_extension/manifest.json —— RSA public key (not private key), false positive by generic-api-key
+#
+# Warning: Real credentials (such as API keys in .haijunbot/memory) must never be added to this allowlist.
+
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+    '''^tests/haijunbot_sec/datasets/''',
+    '''^browser_extension/manifest\.json$''',
+]

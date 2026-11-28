@@ -1,0 +1,101 @@
+digraph G {
+  // --- Global Settings ---
+  graph [rankdir="LR", splines=polyline, fontname="Sans-serif", label="Diagram Title: [Deployment View] Physical Nodes and Network Interaction", labelloc="t", newrank=true, nodesep=0.8, ranksep=1.1, overlap=false];
+  node [shape=box, style="rounded,filled", fillcolor="#EFEFEF", fontname="Sans-serif"];
+  edge [fontname="Sans-serif"];
+
+  // Local node
+  subgraph cluster_local {
+    label = "Local Host (Developer Workstation)";
+    style = "filled";
+    color = "#dddddd";
+    node [fillcolor="#DAE8FC", color="#6C8EBF"];
+
+    tty [label="Terminal/CLI\n(haijunbot, haijunbot-agent, ...)", shape=cds, fillcolor="#FFE6CC", color="#D79B00"];
+    agent_proc [label="HaijunBot Agent Process\n(Agent + AgentRunLoop)"];
+    tool_registry [label="Tool Registry\n(ToolRegistry)"];
+    event_bus [label="Event Bus\n(EventBus)"];
+    session_mgr [label="Session Management\n(SessionManager)"];
+
+// Local subprocesses/sessions
+    node [fillcolor="#F8CECC", color="#B85450"];
+    exec_script [label="execute_script Subprocess\n(script wrapper execution)"];
+    vtty_proc [label="virtual_tty Persistent TTY Session\n(subprocess)"];
+    mcp_stdio_proc [label="MCP stdio Client Process"];
+
+    // Local data directories
+    node [shape=cylinder, fillcolor="#E1D5E7", color="#9673A6"];
+    data_home [label="~/.haijunbot\nData/Memory/Stats/Cache"];
+    data_project [label="./.haijunbot\nProject Memory/Sessions"];
+  }
+
+  // External LLM platforms
+  subgraph cluster_llm {
+    label = "External LLM Platforms";
+    style = "filled";
+    color = "#e8e8e8";
+    node [fillcolor="#D5E8D4", color="#82B366"];
+    llm_openai [label="OpenAI Platform\n(HTTPS + Streaming)"];
+    llm_haijun [label="Haijun Platform\n(HTTPS + Streaming)"];
+    { rank=same; llm_openai; llm_haijun; }
+  }
+
+  // Remote MCP services
+  subgraph cluster_mcp_remote {
+    label = "MCP Remote Services";
+    style = "filled";
+    color = "#f7f7f7";
+    node [fillcolor="#E1D5E7", color="#9673A6"];
+    mcp_sse_srv [label="MCP SSE Service\n(/sse + /messages)"];
+    mcp_stream_srv [label="MCP Streamable Service\n(/mcp Streaming HTTP)"];
+  }
+
+  // Central repositories and internet resources
+  subgraph cluster_repos {
+    label = "Central Repositories / Internet Resources";
+    style = "filled";
+    color = "#f0f0f0";
+    node [fillcolor="#FFF2CC", color="#B57800"];
+    central_tool_repo [label="Central Tool Repository (Git)\n(~/.haijunbot/central_tool_repo)"];
+    central_method_repo [label="Central Methodology Repository (Git)\n(~/.haijunbot/central_methodology_repo)"];
+    internet [label="Internet/Web Resources\n(HTTP/HTTPS)", shape=component];
+  }
+
+  // --- Deployment connections and protocol annotations ---
+  // Local interaction
+  tty -> agent_proc [xlabel="Command/Task Input"];
+  agent_proc -> session_mgr [xlabel="Save/Restore Session", style=dashed];
+  agent_proc -> event_bus [xlabel="Event Publish", style=dashed];
+  agent_proc -> tool_registry [xlabel="Load/Invoke Tools"];
+
+  // Local subprocesses/sessions
+  tool_registry -> exec_script [xlabel="fork/exec Subprocess"];
+  tool_registry -> vtty_proc [xlabel="Create PTY Session"];
+  tool_registry -> mcp_stdio_proc [xlabel="Start MCP Local Process"];
+
+  // Local data mounting
+  agent_proc -> data_home [xlabel="Read/Write Config/Stats/Memory"];
+  agent_proc -> data_project [xlabel="Project Memory/.haijunbot"];
+
+  // LLM platform communication (HTTPS/Streaming)
+  agent_proc -> llm_openai [xlabel="HTTPS (OpenAI API)"];
+  agent_proc -> llm_haijun [xlabel="HTTPS (Haijun API)"];
+
+  // MCP remote communication
+  tool_registry -> mcp_sse_srv [xlabel="HTTPS SSE Channel"];
+  tool_registry -> mcp_stream_srv [xlabel="HTTPS Streaming Invocation"];
+
+  // Central repository sync (Git)
+  tool_registry -> central_tool_repo [xlabel="Clone/Update/Load Tools"];
+  agent_proc -> central_method_repo [xlabel="Share/Pull Methodologies"];
+
+  // Internet access (tools/scraping)
+  exec_script -> internet [xlabel="External Commands Access Network", style=dashed];
+  vtty_proc -> internet [xlabel="Interactive Session Network Access", style=dashed];
+  tool_registry -> internet [xlabel="search_web Scrape/Access", style=dashed];
+
+  // Alignment
+  { rank=same; llm_openai; llm_haijun; }
+  { rank=same; mcp_sse_srv; mcp_stream_srv; }
+  { rank=same; central_tool_repo; central_method_repo; internet; }
+}

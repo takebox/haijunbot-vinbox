@@ -1,0 +1,331 @@
+/* ==================== Responsive adaptation (Plan 1: progressive) ==================== */
+
+/* Tablet adaptation (768px - 1024px) */
+@media (min-width: 769px) and (max-width: 1024px) {
+  /* Sidebar width adjustment */
+  .agent-sidebar {
+    width: 280px;
+  }
+  
+  /* Button optimization */
+  .icon-btn {
+    padding: 8px 12px;
+    font-size: 17px;
+  }
+  
+  /* Message area */
+  .messages {
+    padding: 18px;
+  }
+}
+
+/* Mobile adaptation (< 768px) */
+@media (max-width: 768px) {
+  .create-agent-modal {
+    max-height: calc(100vh - 32px);
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .workspace-panel {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100vw !important;
+    height: var(--app-height, 100vh) !important;
+    border-radius: 0 !important;
+    border: 1px solid var(--color-border-subtle) !important;
+    z-index: 2000 !important;
+  }
+
+  .workspace-panel-header {
+    cursor: default;
+    padding: 6px 10px;
+  }
+
+  .workspace-panel-toolbar {
+    padding: 0 10px;
+  }
+
+  .workspace-panel-content,
+  .workspace-panel-content-main {
+    min-height: 0;
+  }
+
+  .workspace-resize-handle {
+    display: none !important;
+  }
+
+  /* ========== Terminal panel optimization ========== */
+  .terminal-panel {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    border-radius: 0 !important;
+    z-index: 2000 !important;
+  }
+  
+  .terminal-resize-handle {
+    display: none !important;
+  }
+  
+  /* ========== Sidebar optimization ========== */
+  .agent-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 999;
+    background: var(--color-bg-secondary);
+  }
+  
+  .agent-sidebar.collapsed {
+    width: 0;
+  }
+  
+  .agent-sidebar-header {
+    padding: 12px 16px;
+  }
+  
+  .agent-sidebar-header h3 {
+    font-size: 13px;
+  }
+  
+  .agent-list {
+    padding: 8px 12px;
+  }
+  
+  .agent-item {
+    padding: 10px;
+  }
+  .agent-checkbox input[type="checkbox"] {
+    width: 20px;
+    height: 20px;
+  }
+
+  .batch-actions-bar {
+    padding: 10px 12px;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .batch-actions-info {
+    font-size: 12px;
+  }
+
+  .batch-actions-buttons {
+    width: 100%;
+    justify-content: flex-end;
+  }
+  
+  /* ========== Button optimization ========== */
+  .icon-btn {
+    padding: 12px;
+    min-width: 44px;
+    min-height: 44px;
+    font-size: 18px;
+  }
+  
+  .manual-interrupt-btn {
+    padding: 10px 14px;
+    min-height: 44px;
+    font-size: 13px;
+  }
+  
+  /* ========== Message area optimization ========== */
+  .messages {
+    padding: 12px 10px;
+  }
+  
+  .message {
+    padding: 10px 12px;
+    border-radius: 10px;
+  }
+  
+  .message-content {
+    gap: 6px;
+  }
+  
+  .message-content .message-body {
+    font-size: 13px;
+  }
+  
+  .message-content .message-meta-left {
+    gap: 6px 8px;
+    flex-wrap: wrap;
+  }
+  
+  .message-meta-left .badge {
+    font-size: 9px;
+    padding: 2px 6px;
+  }
+  
+  .message-meta-left .agent-name {
+    font-size: 9px;
+  }
+  
+  .message-meta-left .timestamp {
+    font-size: 9px;
+  }
+  
+  /* User input message optimization */
+  .message.message-user_input {
+    max-width: 85%;
+  }
+  
+  .message.message-user_input .message-meta-left {
+    min-width: auto;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  
+  /* ========== Input area optimization ========== */
+  .input-wrapper {
+    padding: 12px;
+  }
+  
+  .input-wrapper textarea {
+    min-height: 100px;
+    padding: 12px;
+    font-size: 14px;
+  }
+  
+  .input-wrapper .input-hint {
+    font-size: 12px;
+  }
+  
+  /* Action button optimization */
+  .send-btn,
+  .complete-btn,
+  .action-btn {
+    padding: 10px 16px;
+    min-height: 44px;
+    font-size: 13px;
+  }
+  
+  /* ========== Modal optimization ========== */
+  .modal {
+    padding: 20px;
+    max-width: 95%;
+    border-radius: var(--tile-radius-sm);
+  }
+  
+  .modal-header h2,
+  .connect-modal h2,
+  .settings-modal h2 {
+    font-size: 18px;
+  }
+  
+  .form-group label {
+    font-size: 12px;
+  }
+  
+  /* ========== Font optimization ========== */
+  body {
+    font-size: 14px;
+  }
+  
+  /* ========== Terminal optimization ========== */
+  .terminal-wrapper {
+    margin-top: 12px;
+    max-height: 400px;
+  }
+  
+  .terminal-host {
+    min-height: 300px;
+  }
+  
+  /* ========== Diff optimization ========== */
+  /* Moved into global styles because content inserted via v-html cannot use scoped styles */
+
+  /* ========== Panel mobile: force single panel ========== */
+  .panel-grid {
+    grid-template-columns: 1fr !important;
+    grid-template-rows: 1fr !important;
+    padding: 0 !important;
+    gap: 0 !important;
+    height: 100% !important;
+    min-height: 0 !important;
+  }
+
+  .session-panel {
+    border-radius: 0 !important;
+    border: none !important;
+  }
+  /* ========== Editor sidebar / Git view mobile adaptation ========== */
+  /* The mobile editor panel is fullscreen; the sidebar becomes a bottom drawer (55% height),
+     so the diff / editor content in the main area above remains visible when the sidebar is open,
+     and clicking "✕" always collapses the sidebar to view the full main area */
+  .workspace-sidebar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: auto;
+    z-index: 20;
+    height: 55%;
+    min-width: 0;
+    max-width: none;
+    width: 100% !important;
+    border-right: none;
+    border-top: 1px solid var(--color-border-subtle);
+    background: var(--color-bg-secondary);
+    box-shadow: 0 -6px 18px rgba(0, 0, 0, 0.35);
+  }
+  /* No mouse on mobile, hide the drag-to-resize handle (JS side also blocks below 768px) */
+  .workspace-sidebar-resize-handle {
+    display: none;
+  }
+  .workspace-sidebar-header {
+    padding: 8px 10px;
+  }
+  /* Show the mobile-only close button on mobile, and enlarge the tap area */
+  .workspace-sidebar-close-mobile {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 36px;
+    min-height: 36px;
+    font-size: 16px;
+  }
+  /* Hide the desktop close button on mobile to avoid showing two close buttons */
+  .workspace-sidebar-close-desktop {
+    display: none;
+  }
+  /* Git commit list: readability first on mobile, slightly enlarge font size and tap areas */
+  .workspace-git-panel {
+    font-size: 13px;
+  }
+  .workspace-git-commit {
+    padding: 6px 8px 6px 2px;
+  }
+  .workspace-git-commit-subject {
+    font-size: 13px;
+  }
+  .workspace-git-commit-meta {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .workspace-git-file {
+    padding: 6px 4px;
+    font-size: 12px;
+  }
+  /* Mobile diff view: main area fullscreen, enlarge header button tap areas */
+  .workspace-diff-toggle,
+  .workspace-diff-close {
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+  .workspace-diff-nav {
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+}
+

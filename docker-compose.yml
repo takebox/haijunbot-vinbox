@@ -1,0 +1,23 @@
+services:
+  haijunbot:
+    image: ghcr.io/takebox/haijunbot:latest
+    container_name: haijunbot
+    # Use haijunbot user (UID 1000) and current user's group ID to prevent file permission issues
+    # Files created inside the container will belong to haijunbot user, GID matches host group for external access
+    user: "1000:${GID:-1000}"
+    volumes:
+      # Mount current directory to container workspace
+      - .:/workspace
+      # Mount HaijunBot configuration files (optional, preserves local config)
+      - ${HOME}/.haijunbot:/home/haijunbot/.haijunbot
+      # Mount Git configuration (optional, preserves Git user info)
+      - ${HOME}/.gitconfig:/home/haijunbot/.gitconfig:ro
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      # Preserve terminal color output (allows override from host)
+      - TERM=${TERM:-xterm-256color}
+    # If network access is needed (e.g., accessing external APIs)
+    network_mode: bridge
+

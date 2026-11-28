@@ -1,0 +1,34 @@
+{
+  "name": "cross_func_path_traversal",
+  "description": "cross_filepath traversal：user inputcross_filepropagate，passsnprintfconcatenatepathafteropenfile。currentdetector onlycandetectstrcatnotsafeAPI，path_traversal patternmissed detection",
+  "difficulty": "medium",
+  "vulnerability_type": "path_traversal",
+  "expected_issues": [
+    {
+      "pattern": "strcat",
+      "file": "path_builder.c",
+      "function": "append_subdir"
+    }
+  ],
+  "known_gaps": [
+    {
+      "pattern": "path_traversal",
+      "file": "path_builder.c",
+      "function": "build_path",
+      "reason": "c_checkeronlydetectstrcat/strncat+fopenof3line window，omitsnprintfconcatenatepathpattern"
+    }
+  ],
+  "files": [
+    "input.c",
+    "path_builder.c",
+    "file_opener.c",
+    "main.c"
+  ],
+  "cross_file": true,
+  "tags": [
+    "path-traversal",
+    "cross-file",
+    "taint",
+    "known-gap"
+  ]
+}

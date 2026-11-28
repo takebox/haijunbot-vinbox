@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# HaijunBot pre-commit protection: scan staged content to intercept suspected real credentials (keys/tokens/private keys, etc.).
+#
+# Background: Historically, a real API token in .haijunbot/memory was committed and pushed to a public repository.
+# This hook checks staged changes before each git commit and aborts if suspected real credentials are found.
+#
+# Scanners (both run in sequence, either hit aborts the commit, complementary):
+#   1. Gitleaks (if installed): broad rule coverage (AWS/GitHub/private keys/high-entropy tokens, etc.).
+#      Prompts to run scripts/install-gitleaks.sh if not installed.
+#   2. Custom lightweight scanner (zero dependencies): supplements Gitleaks default rules for "generic assignment-type
+#      password" scenarios (e.g., db_password = "..." / DB_PASSWORD="...").
+#   Note: The two are in an "AND" relationship, not "OR" — even with Gitleaks installed, the custom scanner must still run,
+#   otherwise generic plaintext passwords will be missed (Gitleaks default rules don't match password assignments).
+#
+# Activation (run once per clone):
+#   git config core.hooksPath .githooks
+# Or run scripts/install-git-hooks.sh
+#
+# Emergency bypass (not recommended, leaves a record in commit message):
+#   HAIJUNBOT_ALLOW_SECRETS=1 git commit ...
+set -euo pipefail
+
+# Allow explicit bypass (e.g., for committing test samples)
+if [ "${HAIJUNBOT_ALLOW_SECRETS:-0}" = "1" ]; then
+    echo "[pre-commit] HAIJUNBOT_ALLOW_SECRETS=1, skipping credential scan." >&2
+    exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Run Gitleaks first (if installed), then custom scanner; either hit aborts the commit.
+GITLEAKS_BIN="$(command -v gitleaks || true)"
+if [ -z "$GITLEAKS_BIN" ]; then
+    echo "[pre-commit] gitleaks not detected, using custom lightweight scanner only." >&2
+    echo "[pre-commit] Recommended to install Gitleaks for more comprehensive detection: bash scripts/install-gitleaks.sh" >&2
+else
+    # Use gitleaks to scan staged area.
+    # Note: gitleaks git subcommand returns 0 even if leaks are found, but with --report-path,
+    # it returns 1 if leaks exist and 0 if none (verified in practice), so exit code can be used directly.
+    TMP_REPORT="$(mktemp)"
+    trap 'rm -f "$TMP_REPORT"' EXIT
+
+    if ! "$GITLEAKS_BIN" git --no-banner --staged --redact=20 \
+            --report-format json --report-path "$TMP_REPORT" . >/dev/null 2>&1; then
+        echo "[pre-commit] Gitleaks detected suspected real credentials, commit aborted." >&2
+        echo "[pre-commit] Detailed report (redacted):" >&2
+        python3 - "$TMP_REPORT" <<'PYEOF'
+import json, sys
+try:
+    findings = json.load(open(sys.argv[1]))
+except Exception:
+    findings = []
+for f in findings:
+    print(f"  - {f.get('File','?')}:{f.get('StartLine','?')} Rule={f.get('RuleID','?')} Content={f.get('Secret','')[:25]}")
+PYEOF
+        echo "[pre-commit] Please remove or fix the above suspected credentials and retry; if it is a false positive, update the .gitleaks.toml allowlist." >&2
+        exit 1
+    fi
+fi
+
+# Custom scanner always runs: supplements Gitleaks default rules for generic assignment-type passwords
+# (e.g., db_password = "..." / DB_PASSWORD="..."). On hit, it aborts the commit with exit code 1.
+exec python3 "$REPO_ROOT/.githooks/scan_staged_secrets.py"

@@ -1,0 +1,17 @@
+{
+  "name": "null_check_cross_file",
+  "description": "cross_filenull pointercheck：conditional expressioncross_filepropagate",
+  "difficulty": "easy",
+  "vulnerability_type": "data_flow",
+  "expected_issues": [],
+  "files": [
+    "checker.c",
+    "main.c"
+  ],
+  "cross_file": true,
+  "tags": [
+    "data-flow",
+    "cross-file",
+    "null-check"
+  ]
+}

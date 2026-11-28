@@ -1,0 +1,130 @@
+---
+# yamllint disable rule:line-length
+# =============================================================================
+# HaijunBot PR auto review workflow template
+# -----------------------------------------------------------------------------
+# Purpose: on PR triggers, use HaijunBot CodeAgent to perform a code review of the git diff, and publish the structured
+#       review conclusion as a PR comment.
+#
+# Usage:
+#   1. Copy this file into your repository at .github/workflows/haijunbot-pr-review.yml
+#   2. Configure environment variables (HaijunBot reads the API Key from the standard LLM environment variables, see below):
+#      - OPENAI_API_KEY     (OpenAI platform) API Key for calling the LLM
+#      - JUGLOW_API_KEY  (Juglow platform) API Key for calling the LLM
+#      - OPENAI_API_BASE    (optional) custom OpenAI-compatible endpoint
+#      - HAIJUNBOT_MODEL       (optional) specify the model, defaults to gpt-5
+#      - HAIJUNBOT_PLATFORM    (optional) specify the platform, defaults to openai
+#      - HAIJUNBOT_REVIEW_RULES (optional) additional review rules, comma-separated
+#   3. Grant the workflow pull-requests: write permission (for posting review comments)
+#
+#   Note: On first run HaijunBot automatically generates default config (non-interactive); the API Key is injected via standard
+#        environment variables (OPENAI_API_KEY / JUGLOW_API_KEY), no preexisting config.yaml required.
+#        You can also persist config using hqc non-interactive mode: hqc --platform openai --base-url <url>
+#        --api-key <key> --model <model> --skip-test (writes to ~/.haijunbot/config.yaml).
+# Principle: reuse HaijunBot headless non-interactive mode (hjb -n -T), with the --task-file
+#       status_file mechanism to get structured output, then parse the .output file as the comment content.
+# =============================================================================
+name: HaijunBot PR Review
+
+"on":
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  haijunbot-pr-review:
+    name: HaijunBot Code Review
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install HaijunBot
+        run: |
+          pip install --upgrade pip
+          # Install HaijunBot (haijunbot-ai-assistant) from PyPI, suitable for any user repository
+          pip install haijunbot-ai-assistant
+
+      - name: Compute PR diff
+        id: diff
+        run: |
+          # Generate the diff of the PR changes for HaijunBot to review
+          git diff origin/${{ github.event.pull_request.base.ref }}...HEAD > /tmp/pr.diff || true
+          echo "diff_lines=$(wc -l < /tmp/pr.diff)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare HaijunBot task file
+        id: task
+        run: |
+          # Build the --task-file JSON: contains task_desc / background / status_file
+          cat > /tmp/haijunbot-task.json <<'EOF'
+          {
+            "task_desc": "Please perform a professional code review of this PR's code changes. Output a structured conclusion: 1) issue list (mark each issue with severity critical/warning/info and file location); 2) improvement suggestions; 3) overall conclusion (approve or request_changes).",
+            "background": "This is HaijunBot automatic review in GitHub Actions. Please review the diff content in /tmp/pr.diff and, based on the repository context, give actionable review comments.",
+            "status_file": "/tmp/haijunbot-status.json"
+          }
+          EOF
+
+      - name: Run HaijunBot review (headless)
+        id: haijunbot
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JUGLOW_API_KEY: ${{ secrets.JUGLOW_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          HAIJUNBOT_MODEL: ${{ secrets.HAIJUNBOT_MODEL }}
+          HAIJUNBOT_PLATFORM: ${{ secrets.HAIJUNBOT_PLATFORM }}
+          HAIJUNBOT_REVIEW_RULES: ${{ vars.HAIJUNBOT_REVIEW_RULES }}
+          # Skip the interactive config wizard on first run (no TTY in the CI environment)
+          HAIJUNBOT_SKIP_INTERACTIVE_CONFIG: "1"
+        run: |
+          # Run the review in non-interactive mode; status is written to status_file, output to .output
+          hjb -n --task-file /tmp/haijunbot-task.json --rule-names "code_review${HAIJUNBOT_REVIEW_RULES:+,$HAIJUNBOT_REVIEW_RULES}" || true
+
+      - name: Read HaijunBot review result
+        id: result
+        run: |
+          # Read the status file and output
+          if [ -f /tmp/haijunbot-status.json ]; then
+            echo "status=$(jq -r '.status' /tmp/haijunbot-status.json)" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f /tmp/haijunbot-status.output ]; then
+            {
+              echo "output<<EOF"
+              cat /tmp/haijunbot-status.output
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post review comment
+        if: steps.result.outputs.output != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '## 🤖 HaijunBot Code Review Result',
+              '',
+              '> Status: ' + (process.env.REVIEW_STATUS || 'unknown'),
+              '',
+              '```',
+              process.env.REVIEW_OUTPUT || '(no output)',
+              '```'
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+        env:
+          REVIEW_STATUS: ${{ steps.result.outputs.status }}
+          REVIEW_OUTPUT: ${{ steps.result.outputs.output }}

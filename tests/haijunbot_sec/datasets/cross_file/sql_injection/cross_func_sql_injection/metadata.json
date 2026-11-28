@@ -1,0 +1,39 @@
+{
+  "name": "cross_func_sql_injection",
+  "description": "cross_fileSQL injection：user inputcross_filepropagate，passstrcatconcatenateSQLafterexecute。currentdetector onlycandetectstrcpy/strcatnotsafeAPI，sql_injection patternmissed detection",
+  "difficulty": "medium",
+  "vulnerability_type": "sql_injection",
+  "expected_issues": [
+    {
+      "pattern": "strcpy",
+      "file": "query_builder.c",
+      "function": "build_select_query"
+    },
+    {
+      "pattern": "strcat",
+      "file": "query_builder.c",
+      "function": "build_select_query"
+    }
+  ],
+  "known_gaps": [
+    {
+      "pattern": "sql_injection",
+      "file": "query_builder.c",
+      "function": "build_select_query",
+      "reason": "c_checkeronlydetectsprintf/snprintfconcatenateSQL，omitstrcpy+strcatconcatenatepattern"
+    }
+  ],
+  "files": [
+    "input.c",
+    "query_builder.c",
+    "executor.c",
+    "main.c"
+  ],
+  "cross_file": true,
+  "tags": [
+    "sql-injection",
+    "cross-file",
+    "taint",
+    "known-gap"
+  ]
+}

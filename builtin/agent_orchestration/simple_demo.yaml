@@ -1,0 +1,79 @@
+---
+# Simple orchestration example (for demonstrating pipeline DAG visualization)
+#
+# This is a minimally runnable orchestration file, demonstrating the "fan-out → parallel → fan-in" DAG structure:
+#
+#            ┌─> worker_a ─┐
+#   planner ─┤             ├─> aggregator
+#            └─> worker_b ─┘
+#
+# Usage:
+#   1. First select this file in the orchestration popup, or directly specify the path;
+#   2. Run with the pipeline_runner tool:
+#        orchestration_file: builtin/agent_orchestration/simple_demo.yaml
+#        working_dir: <working_directory>
+#   3. To preview the orchestration plan without actually executing, add dry_run: true.
+#
+# Notes:
+#   - Background information for each stage's Agent can be written in the top-level spec field (embedded in this file),
+#     or omitted, directly using each stage's task.
+#   - All stage Agents are persistent hjb Agents, with outputs written to the .df/ directory.
+spec: |
+  Input background for the demo pipeline: split a to-do list into two independent subtasks for parallel processing,
+  then aggregate into a final deliverable. Each stage only needs to complete its responsibilities and produce the corresponding file.
+agents:
+  - name: "demo_planner"
+    working_dir: "."
+    task: |
+      You are the planner for the demo pipeline.
+      Read the pipeline background, split the requirements into two independent subtasks, and assign them to two executors.
+      Output a brief plan (Markdown) listing the goals and acceptance criteria for both subtasks.
+      Only plan, do not execute.
+
+  - name: "demo_worker_a"
+    working_dir: "."
+    task: |
+      You are executor A for the demo pipeline.
+      Based on the planning output, complete the subtask assigned to A and write the results as a brief report.
+      Only do your own part, do not overstep.
+
+  - name: "demo_worker_b"
+    working_dir: "."
+    task: |
+      You are executor B for the demo pipeline.
+      Based on the planning output, complete the subtask assigned to B and write the results as a brief report.
+      Only do your own part, do not overstep.
+
+  - name: "demo_aggregator"
+    working_dir: "."
+    task: |
+      You are the aggregator for the demo pipeline.
+      Read reports A and B, merge them into a final deliverable, and provide a brief summary.
+      Only aggregate, do not redo the work of A and B.
+
+# Pipeline execution order (DAG):
+#   planner runs first; worker_a / worker_b run in parallel; aggregator waits for both to complete before running.
+flow:
+  - stage: "planner"
+    agent: "demo_planner"
+    output: ".df/demo_plan.md"          # Planning output
+
+  - stage: "worker_a"
+    agent: "demo_worker_a"
+    depends_on: ["planner"]             # Depends on planning
+    input: ".df/demo_plan.md"
+    output: ".df/demo_a.md"             # A's report
+
+  - stage: "worker_b"
+    agent: "demo_worker_b"
+    depends_on: ["planner"]             # Parallel with worker_a
+    input: ".df/demo_plan.md"
+    output: ".df/demo_b.md"             # B's report
+
+  - stage: "aggregator"
+    agent: "demo_aggregator"
+    depends_on: ["worker_a", "worker_b"]  # Waits for both executors to complete
+    input:
+      - ".df/demo_a.md"
+      - ".df/demo_b.md"
+    output: ".df/demo_final.md"         # Final deliverable

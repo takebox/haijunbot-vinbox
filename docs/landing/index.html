@@ -1,0 +1,1251 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HaijunBot AI - Supercharge Your Development Efficiency</title>
+    <meta
+      name="description"
+      content="Locally hosted, ready out-of-the-box, deeply customizable AI development assistant"
+    />
+    <link rel="icon" href="haijunbot.png" type="image/png" />
+    <style>
+      *,
+      *::before,
+      *::after {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      :root {
+        --bg: #0a0a0f;
+        --bg2: #12121a;
+        --c: rgba(255, 255, 255, 0.04);
+        --ch: rgba(255, 255, 255, 0.08);
+        --bd: rgba(255, 255, 255, 0.08);
+        --bh: rgba(255, 255, 255, 0.15);
+        --t1: #f0f0f5;
+        --t2: #8888a0;
+        --t3: #55556a;
+        --ac: #6366f1;
+        --al: #818cf8;
+        --ag: rgba(99, 102, 241, 0.25);
+        --gr: #34d399;
+        --bl: #60a5fa;
+        --or: #fb923c;
+        --r: 16px;
+        --rs: 10px;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+        background: var(--bg);
+        color: var(--t1);
+        line-height: 1.6;
+        overflow-x: hidden;
+      }
+      a {
+        color: var(--al);
+        text-decoration: none;
+        transition: color 0.2s;
+      }
+      a:hover {
+        color: #a5b4fc;
+      }
+      .ctn {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 0 24px;
+      }
+      section {
+        padding: 100px 0;
+        position: relative;
+      }
+      .sl {
+        display: inline-block;
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+        color: var(--al);
+        margin-bottom: 16px;
+        padding: 4px 14px;
+        border: 1px solid var(--ag);
+        border-radius: 20px;
+        background: rgba(99, 102, 241, 0.08);
+      }
+      .st {
+        font-size: clamp(28px, 4vw, 42px);
+        font-weight: 700;
+        line-height: 1.2;
+        margin-bottom: 16px;
+        background: linear-gradient(135deg, #f0f0f5, #8888a0);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      .sd {
+        font-size: 17px;
+        color: var(--t2);
+        max-width: 600px;
+        margin-bottom: 48px;
+      }
+      nav {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 100;
+        padding: 16px 0;
+        backdrop-filter: blur(20px);
+        background: rgba(10, 10, 15, 0.8);
+        border-bottom: 1px solid var(--bd);
+      }
+      nav .ctn {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+      .nl {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 20px;
+        font-weight: 700;
+        color: var(--t1);
+      }
+      .nl img {
+        width: 32px;
+        height: 32px;
+        border-radius: 8px;
+      }
+      .nk {
+        display: flex;
+        gap: 32px;
+        list-style: none;
+      }
+      .nk a {
+        color: var(--t2);
+        font-size: 14px;
+        font-weight: 500;
+      }
+      .nk a:hover {
+        color: var(--t1);
+      }
+      .nc {
+        padding: 8px 20px;
+        background: var(--ac);
+        color: #fff;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 600;
+        transition: all 0.2s;
+      }
+      .nc:hover {
+        background: var(--al);
+        color: #fff;
+      }
+      .nm {
+        display: none;
+        background: none;
+        border: none;
+        color: var(--t1);
+        font-size: 24px;
+        cursor: pointer;
+        z-index: 101;
+      }
+      .nk-mobile {
+        position: fixed;
+        top: 0;
+        right: -280px;
+        width: 280px;
+        height: 100vh;
+        background: var(--bg);
+        border-left: 1px solid var(--bd);
+        padding: 80px 20px 40px;
+        z-index: 99;
+        transition: right 0.3s ease;
+        overflow-y: auto;
+      }
+      .nk-mobile.active {
+        right: 0;
+      }
+      .nk-mobile-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 98;
+        opacity: 0;
+        visibility: hidden;
+        transition:
+          opacity 0.3s,
+          visibility 0.3s;
+      }
+      .nk-mobile-overlay.active {
+        opacity: 1;
+        visibility: visible;
+      }
+      .hero {
+        padding: 160px 0 100px;
+        text-align: center;
+        position: relative;
+        overflow: hidden;
+      }
+      .hero::before {
+        content: "";
+        position: absolute;
+        top: -200px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 800px;
+        height: 800px;
+        background: radial-gradient(circle, var(--ag), transparent 70%);
+        pointer-events: none;
+      }
+      .hb {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 16px;
+        background: var(--c);
+        border: 1px solid var(--bd);
+        border-radius: 20px;
+        font-size: 13px;
+        color: var(--t2);
+        margin-bottom: 32px;
+      }
+      .hb .dot {
+        width: 6px;
+        height: 6px;
+        background: var(--gr);
+        border-radius: 50%;
+        animation: pulse 2s infinite;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.4;
+        }
+      }
+      .hero h1 {
+        font-size: clamp(36px, 6vw, 64px);
+        font-weight: 800;
+        line-height: 1.15;
+        margin-bottom: 24px;
+        background: linear-gradient(135deg, #fff, #818cf8 50%, #34d399);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+      .hero > p {
+        font-size: clamp(16px, 2vw, 20px);
+        color: var(--t2);
+        max-width: 640px;
+        margin: 0 auto 40px;
+        line-height: 1.7;
+      }
+      .hbs {
+        display: flex;
+        gap: 16px;
+        justify-content: center;
+        flex-wrap: wrap;
+        margin-bottom: 64px;
+      }
+      .bp {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 14px 32px;
+        background: var(--ac);
+        color: #fff;
+        border-radius: 12px;
+        font-size: 16px;
+        font-weight: 600;
+        transition: all 0.2s;
+      }
+      .bp:hover {
+        background: var(--al);
+        color: #fff;
+        transform: translateY(-2px);
+        box-shadow: 0 8px 30px var(--ag);
+      }
+      .bs {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 14px 32px;
+        background: var(--c);
+        color: var(--t1);
+        border: 1px solid var(--bd);
+        border-radius: 12px;
+        font-size: 16px;
+        font-weight: 600;
+        transition: all 0.2s;
+      }
+      .bs:hover {
+        background: var(--ch);
+        border-color: var(--bh);
+        transform: translateY(-2px);
+      }
+      .term {
+        max-width: 800px;
+        margin: 0 auto;
+        background: var(--bg2);
+        border: 1px solid var(--bd);
+        border-radius: var(--r);
+        overflow: hidden;
+        text-align: left;
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+      }
+      .term-h {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 16px;
+        background: rgba(255, 255, 255, 0.03);
+        border-bottom: 1px solid var(--bd);
+      }
+      .td {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+      }
+      .td.r {
+        background: #ff5f57;
+      }
+      .td.y {
+        background: #ffbd2e;
+      }
+      .td.g {
+        background: #28c840;
+      }
+      .term-t {
+        flex: 1;
+        text-align: center;
+        font-size: 12px;
+        color: var(--t3);
+      }
+      .term-b {
+        padding: 20px;
+        font-family: "SF Mono", "Fira Code", Consolas, monospace;
+        font-size: 14px;
+        line-height: 1.8;
+        min-height: 180px;
+      }
+      .tl {
+        margin-bottom: 4px;
+      }
+
+      .tp {
+        color: var(--gr);
+      }
+      .tc {
+        color: var(--t1);
+      }
+      .to {
+        color: var(--t2);
+      }
+
+      .tt {
+        color: var(--t3);
+      }
+      .cur {
+        display: inline-block;
+        width: 8px;
+        height: 16px;
+        background: var(--al);
+        animation: blink 1s step-end infinite;
+        vertical-align: text-bottom;
+      }
+      @keyframes blink {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0;
+        }
+      }
+      .g3 {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 24px;
+      }
+      .mc {
+        background: var(--c);
+        border: 1px solid var(--bd);
+        border-radius: var(--r);
+        padding: 36px 28px;
+        transition: all 0.3s;
+        position: relative;
+        overflow: hidden;
+      }
+      .mc::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: linear-gradient(90deg, var(--ac), var(--gr));
+        opacity: 0;
+        transition: opacity 0.3s;
+      }
+      .mc:hover {
+        border-color: var(--bh);
+        background: var(--ch);
+        transform: translateY(-4px);
+      }
+      .mc:hover::before {
+        opacity: 1;
+      }
+      .mi {
+        width: 48px;
+        height: 48px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 12px;
+        font-size: 24px;
+        margin-bottom: 20px;
+      }
+      .mi.c1 {
+        background: rgba(52, 211, 153, 0.12);
+        color: var(--gr);
+      }
+      .mi.c2 {
+        background: rgba(99, 102, 241, 0.12);
+        color: var(--al);
+      }
+      .mi.c3 {
+        background: rgba(96, 165, 250, 0.12);
+        color: var(--bl);
+      }
+      .mc h3 {
+        font-size: 20px;
+        font-weight: 700;
+        margin-bottom: 12px;
+      }
+      .mc > p {
+        font-size: 14px;
+        color: var(--t2);
+        margin-bottom: 20px;
+        line-height: 1.7;
+      }
+      .mc-img {
+        width: 100%;
+        border-radius: var(--rs);
+        border: 1px solid var(--bd);
+        margin-bottom: 20px;
+        display: block;
+      }
+      .cb {
+        background: var(--bg);
+        border: 1px solid var(--bd);
+        border-radius: var(--rs);
+        padding: 14px 16px;
+        font-family: "SF Mono", "Fira Code", monospace;
+        font-size: 13px;
+        color: var(--t2);
+        overflow-x: auto;
+      }
+      .fc {
+        background: var(--c);
+        border: 1px solid var(--bd);
+        border-radius: var(--r);
+        padding: 32px 24px;
+        transition: all 0.3s;
+      }
+      .fc:hover {
+        border-color: var(--bh);
+        background: var(--ch);
+        transform: translateY(-2px);
+      }
+      .fc .fi {
+        font-size: 28px;
+        margin-bottom: 16px;
+        display: block;
+      }
+      .fc h3 {
+        font-size: 17px;
+        font-weight: 700;
+        margin-bottom: 8px;
+      }
+      .fc p {
+        font-size: 14px;
+        color: var(--t2);
+        line-height: 1.6;
+      }
+      .steps {
+        display: flex;
+        gap: 32px;
+        justify-content: center;
+        flex-wrap: wrap;
+      }
+      .step {
+        flex: 1;
+        min-width: 260px;
+        max-width: 340px;
+        text-align: center;
+      }
+      .sn {
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, var(--ac), var(--al));
+        color: #fff;
+        font-size: 20px;
+        font-weight: 800;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin: 0 auto 20px;
+      }
+      .step h3 {
+        font-size: 18px;
+        font-weight: 700;
+        margin-bottom: 10px;
+      }
+      .step p {
+        font-size: 14px;
+        color: var(--t2);
+      }
+      .sc {
+        margin-top: 16px;
+        background: var(--bg2);
+        border: 1px solid var(--bd);
+        border-radius: var(--rs);
+        padding: 12px 16px;
+        font-family: "SF Mono", "Fira Code", monospace;
+        font-size: 13px;
+        color: var(--gr);
+        text-align: left;
+      }
+      .ctw {
+        overflow-x: auto;
+        border: 1px solid var(--bd);
+        border-radius: var(--r);
+      }
+      .ct {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+      }
+      .ct th {
+        text-align: left;
+        padding: 16px 20px;
+        background: rgba(255, 255, 255, 0.03);
+        font-weight: 600;
+        color: var(--t2);
+        border-bottom: 1px solid var(--bd);
+        white-space: nowrap;
+      }
+      .ct td {
+        padding: 14px 20px;
+        border-bottom: 1px solid var(--bd);
+        color: var(--t2);
+      }
+      .ct tr:last-child td {
+        border-bottom: none;
+      }
+      .ct .hl td {
+        color: var(--t1);
+        background: rgba(99, 102, 241, 0.05);
+      }
+      .ck {
+        color: var(--gr);
+        font-weight: bold;
+      }
+      .cx {
+        color: var(--t3);
+      }
+      .cc {
+        background: var(--c);
+        border: 1px solid var(--bd);
+        border-radius: var(--r);
+        padding: 36px 28px;
+        text-align: center;
+        transition: all 0.3s;
+      }
+      .cc:hover {
+        border-color: var(--bh);
+        transform: translateY(-2px);
+      }
+      .cc h3 {
+        font-size: 18px;
+        font-weight: 700;
+        margin-bottom: 8px;
+      }
+      .cc p {
+        font-size: 14px;
+        color: var(--t2);
+        margin-bottom: 16px;
+      }
+      footer {
+        padding: 48px 0;
+        border-top: 1px solid var(--bd);
+        text-align: center;
+      }
+      .fl {
+        display: flex;
+        justify-content: center;
+        gap: 32px;
+        margin-bottom: 24px;
+        flex-wrap: wrap;
+      }
+      .fl a {
+        color: var(--t2);
+        font-size: 14px;
+      }
+      .fl a:hover {
+        color: var(--t1);
+      }
+      .fcopy {
+        font-size: 13px;
+        color: var(--t3);
+      }
+      .fin {
+        opacity: 0;
+        transform: translateY(30px);
+        transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+      }
+      .fin.vis {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      .copy-wrap {
+        position: relative;
+      }
+      .copy-btn {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        padding: 4px 10px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid var(--bd);
+        border-radius: 6px;
+        color: var(--t2);
+        font-size: 12px;
+        cursor: pointer;
+        transition: all 0.2s;
+        font-family: inherit;
+        z-index: 1;
+      }
+      .copy-btn:hover {
+        background: rgba(255, 255, 255, 0.18);
+        color: var(--t1);
+      }
+      .copy-btn.copied {
+        background: rgba(52, 211, 153, 0.15);
+        color: var(--gr);
+        border-color: rgba(52, 211, 153, 0.3);
+      }
+      .nk-mobile a {
+        display: block;
+        padding: 14px 16px;
+        color: var(--t2);
+        font-size: 16px;
+        font-weight: 500;
+        border-bottom: 1px solid var(--bd);
+        min-height: 48px;
+        line-height: 1.3;
+        transition:
+          color 0.2s,
+          background 0.2s;
+      }
+      .nk-mobile a:hover {
+        color: var(--t1);
+        background: var(--c);
+      }
+      .nk-mobile .nc-mobile {
+        display: block;
+        margin-top: 20px;
+        padding: 14px 20px;
+        background: var(--ac);
+        color: #fff;
+        border-radius: 8px;
+        font-size: 16px;
+        font-weight: 600;
+        text-align: center;
+        border-bottom: none;
+      }
+      .nk-mobile .nc-mobile:hover {
+        background: var(--al);
+        color: #fff;
+      }
+      @media (max-width: 900px) {
+        .g3 {
+          grid-template-columns: 1fr;
+        }
+        .steps {
+          flex-direction: column;
+          align-items: center;
+        }
+        .nk {
+          display: none;
+        }
+        .nm {
+          display: block;
+        }
+        .nc {
+          display: none;
+        }
+        .hero {
+          padding: 120px 0 60px;
+        }
+        section {
+          padding: 60px 0;
+        }
+      }
+      @media (max-width: 600px) {
+        .hbs {
+          flex-direction: column;
+          align-items: center;
+        }
+        .term {
+          margin: 0 -12px;
+          border-radius: 12px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <nav>
+      <div class="ctn">
+        <a href="#" class="nl"
+          ><img src="haijunbot.png" alt="HaijunBot" /><span>HaijunBot AI</span></a
+        >
+        <ul class="nk">
+          <li><a href="#modes">Product Forms</a></li>
+          <li><a href="#features">Core Capabilities</a></li>
+          <li><a href="#quickstart">Quick Start</a></li>
+          <li>
+            <a href="https://github.com/takebox/HaijunBot" target="_blank"
+              >Docs</a
+            >
+          </li>
+        </ul>
+        <a
+          href="https://github.com/takebox/HaijunBot"
+          target="_blank"
+          class="nc"
+          >&#11088; GitHub</a
+        >
+        <button class="nm" onclick="toggleMobileMenu()">&#9776;</button>
+      </div>
+    </nav>
+    <div class="nk-mobile-overlay" onclick="toggleMobileMenu()"></div>
+    <div class="nk-mobile">
+      <a href="#modes" onclick="toggleMobileMenu()">Product Forms</a>
+      <a href="#features" onclick="toggleMobileMenu()">Core Capabilities</a>
+      <a href="#quickstart" onclick="toggleMobileMenu()">Quick Start</a>
+      <a
+        href="https://github.com/takebox/HaijunBot"
+        target="_blank"
+        onclick="toggleMobileMenu()"
+        >Docs</a
+      >
+      <a
+        href="https://github.com/takebox/HaijunBot"
+        target="_blank"
+        class="nc-mobile"
+        onclick="toggleMobileMenu()"
+        >&#11088; GitHub</a
+      >
+    </div>
+
+    <section class="hero">
+      <div class="ctn">
+        <div class="hb">
+          <span class="dot"></span><span>Open Source · MIT License · Active Development</span>
+        </div>
+        <h1>HaijunBot<br />Supercharge Your Development Efficiency</h1>
+        <p>
+          Locally hosted, ready out-of-the-box, deeply customizable AI development assistant.<br />Write code, review, run automation, perform security analysis — all with one command.
+        </p>
+        <div class="hbs">
+<a
+              href="https://github.com/takebox/HaijunBot#-quick-start"
+              target="_blank"
+              class="bp"
+              >&#128640; Quick Start</a
+            >
+          <a
+            href="https://github.com/takebox/HaijunBot"
+            target="_blank"
+            class="bs"
+            ><svg
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="currentColor"
+            >
+              <path
+                d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.385-1.335-1.755-1.335-1.755-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.605-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12 24 5.37 18.63 0 12 0z"
+              />
+            </svg>
+            GitHub</a
+          >
+        </div>
+        <div class="term">
+          <div class="term-h">
+            <span class="td r"></span><span class="td y"></span
+            ><span class="td g"></span
+            ><span class="term-t">Terminal — haijunbot</span>
+          </div>
+          <div class="term-b copy-wrap">
+            <button
+              class="copy-btn"
+              data-cmd='bash -c "$(curl -fsSL https://raw.githubusercontent.com/takebox/HaijunBot/main/scripts/install.sh)"'
+              onclick="copyCmd(this)"
+            >
+              Copy
+            </button>
+            <div class="tl">
+              <span class="tp">$ </span
+              ><span class="tc"
+                >bash -c "$(curl -fsSL
+                https://raw.githubusercontent.com/takebox/HaijunBot/main/scripts/install.sh)"</span
+              >
+            </div>
+            <div class="tl">
+              <span class="to">✓ Installation complete · haijunbot-ai-assistant ready</span>
+            </div>
+            <div class="tl"><br /></div>
+            <div class="tl">
+              <span class="tp">$ </span><span class="tc">hqc</span
+              ><span class="tt"> # Interactive model configuration</span>
+            </div>
+            <div class="tl">
+              <span class="to">✓ Model configuration complete</span>
+            </div>
+            <div class="tl"><br /></div>
+            <div class="tl">
+              <span class="tp">$ </span><span class="tc">hca</span
+              ><span class="tt"> # Start Code Agent</span>
+            </div>
+            <div class="tl"><br /></div>
+            <div class="tl">
+              <img
+                src="screenshot-cli.png"
+                alt="HaijunBot CLI"
+                style="
+                  width: 100%;
+                  max-width: 900px;
+                  display: block;
+                  margin: 0 auto;
+                  border-radius: 6px;
+                "
+              />
+            </div>
+            <div class="tl"><br /></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="modes">
+      <div class="ctn">
+        <div class="fin">
+          <span class="sl">Product Forms</span>
+          <h2 class="st">Three Forms, One Consistent Experience</h2>
+          <p class="sd">
+            Whether you prefer the efficiency of CLI, the intuitiveness of Web, or the integrated experience of IDE,
+            HaijunBot seamlessly fits into your workflow.
+          </p>
+        </div>
+        <div class="g3 fin">
+          <div class="mc">
+            <div class="mi c1">⌨️</div>
+            <h3>CLI</h3>
+            <p>
+              The geek's choice. Launch with a single command, supports interactive dialogue, pipe composition, and script integration — built for efficiency-driven developers.
+            </p>
+<img
+                class="mc-img"
+                src="./screenshot-cli.png"
+                alt="CLI screenshot"
+              />
+            <div class="cb">
+              <div>
+                <span style="color: var(--al)">hqc</span>
+                <span style="color: var(--t3)">haijunbot-quick-config</span>
+                <span style="color: var(--t2)">— Quick LLM platform configuration</span>
+              </div>
+              <div>
+                <span style="color: var(--al)">hca</span>
+                <span style="color: var(--t3)">haijunbot-code-agent</span>
+                <span style="color: var(--t2)">— Code analysis and generation</span>
+              </div>
+              <div>
+                <span style="color: var(--al)">hcad</span>
+                <span style="color: var(--t3)"
+                  >haijunbot-code-agent-dispatcher</span
+                >
+                <span style="color: var(--t2)">— Code agent (dispatcher mode)</span>
+              </div>
+              <div>
+                <span style="color: var(--al)">hjb</span>
+                <span style="color: var(--t3)">haijunbot</span>
+                <span style="color: var(--t2)">— General AI agent</span>
+              </div>
+              <div>
+                <span style="color: var(--al)">hjbd</span>
+                <span style="color: var(--t3)">haijunbot-agent-dispatcher</span>
+                <span style="color: var(--t2)">— General agent (dispatcher mode)</span>
+              </div>
+              <div>
+                <span style="color: var(--al)">hgc</span>
+                <span style="color: var(--t3)">haijunbot-git-commit</span>
+                <span style="color: var(--t2)">— Auto-generate commit messages</span>
+              </div>
+              <div>
+                <span style="color: var(--al)">hgs</span>
+                <span style="color: var(--t3)">haijunbot-git-squash</span>
+                <span style="color: var(--t2)">— Commit history reorganization</span>
+              </div>
+              <div>
+                <span style="color: var(--al)">hpm</span>
+                <span style="color: var(--t3)">haijunbot-platform-manager</span>
+                <span style="color: var(--t2)">— LLM platform management</span>
+              </div>
+              <div>
+                <span style="color: var(--al)">hc2r</span>
+                <span style="color: var(--t3)">haijunbot-c2rust</span>
+                <span style="color: var(--t2)">— C-to-Rust migration suite</span>
+              </div>
+            </div>
+          </div>
+          <div class="mc">
+            <div class="mi c2">🌐</div>
+            <h3>Web UI</h3>
+            <p>
+              Visual operation. Open in browser with no setup, multi-session management, real-time terminal, file browsing, supporting multi-node distributed collaboration.
+            </p>
+            <img class="mc-img" src="./screenshot-web.png" alt="Web UI screenshot" />
+            <div class="cb">
+              <div>
+                <span style="color: var(--t3)"># Master mode (main node)</span>
+              </div>
+              <div>
+                <span style="color: var(--al)">haijunbot-service</span> start
+                <span style="color: var(--t2)">--node-mode master</span>
+              </div>
+              <div><br /></div>
+              <div>
+                <span style="color: var(--t3)"
+                  ># Child mode (connects to main node)</span
+                >
+              </div>
+              <div>
+                <span style="color: var(--al)">haijunbot-service</span> start
+                <span style="color: var(--t2)"
+                  >--node-mode child --master-url ws://master:8000 --node-secret
+                  YOUR_SECRET</span
+                >
+              </div>
+              <div><br /></div>
+              <div><span style="color: var(--t3)"># Common environment variables</span></div>
+              <div>
+                <span style="color: var(--t2)">HAIJUNBOT_GATEWAY_HOST</span>
+                <span style="color: var(--t3)">=127.0.0.1</span>
+              </div>
+              <div>
+                <span style="color: var(--t2)">HAIJUNBOT_GATEWAY_PORT</span>
+                <span style="color: var(--t3)">=8000</span>
+              </div>
+              <div>
+                <span style="color: var(--t2)">HAIJUNBOT_FRONTEND_HOST</span>
+                <span style="color: var(--t3)">=127.0.0.1</span>
+              </div>
+              <div>
+                <span style="color: var(--t2)">HAIJUNBOT_FRONTEND_PORT</span>
+                <span style="color: var(--t3)">=5173</span>
+              </div>
+              <div>
+                <span style="color: var(--t2)">HAIJUNBOT_NODE_MODE</span>
+                <span style="color: var(--t3)">=master/child</span>
+              </div>
+              <div>
+                <span style="color: var(--t2)">HAIJUNBOT_MASTER_URL</span>
+                <span style="color: var(--t3)">=ws://master:8000</span>
+              </div>
+              <div>
+                <span style="color: var(--t2)">HAIJUNBOT_NODE_SECRET</span>
+                <span style="color: var(--t3)">=your_secret</span>
+              </div>
+              <div style="color: var(--t3)">
+                → Gateway http://localhost:8000 | Frontend http://localhost:5173
+              </div>
+            </div>
+          </div>
+          <div class="mc">
+            <div class="mi c3">💎</div>
+            <h3>VS Code Extension</h3>
+            <p>
+              Deep integration. Chat with AI directly in the editor, automatic code context awareness, no window switching needed.
+            </p>
+<img
+                class="mc-img"
+                src="./screenshot-vscode.png"
+                alt="VS Code extension screenshot"
+              />
+            <div class="cb">
+              <div>
+                <span style="color: var(--t3)">Extension name: </span
+                ><span style="color: var(--al)"
+                  >HaijunBot AI Assistant - VS Code Extension</span
+                >
+              </div>
+              <div>
+                <span style="color: var(--t3)">Extension ID: </span
+                ><span style="color: var(--t2)"
+                  >haijunbot-ai-assistant.haijunbot-ai-assistant</span
+                >
+              </div>
+              <div><br /></div>
+              <div style="color: var(--t3)">
+                VS Code sidebar → HaijunBot panel → Connect to gateway → Create agent to start collaborating
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="features" style="background: var(--bg2)">
+      <div class="ctn">
+        <div class="fin">
+          <span class="sl">Core Capabilities</span>
+          <h2 class="st">Not Just Chat — Real Action</h2>
+          <p class="sd">
+            From code analysis to automated verification, from memory management to tool bootstrapping, covering the full development lifecycle.
+          </p>
+        </div>
+        <div class="g3 fin">
+          <div class="fc">
+            <span class="fi">💻</span>
+            <h3>Code-First</h3>
+            <p>
+              Automated Git, build verification, static analysis, impact analysis, cross-referencing — designed for code development.
+            </p>
+          </div>
+          <div class="fc">
+            <span class="fi">🧠</span>
+            <h3>Smarter Over Time</h3>
+            <p>
+              Methodology auto-capture, layered memory management (short-term/project/global), rules loaded on demand, reusable experience.
+            </p>
+          </div>
+          <div class="fc">
+            <span class="fi">🔒</span>
+            <h3>Local Control</h3>
+            <p>
+              Data stays on your machine, supports multiple LLM backends, no vendor lock-in — your code, your rules.
+            </p>
+          </div>
+          <div class="fc">
+            <span class="fi">🔌</span>
+            <h3>Highly Extensible</h3>
+            <p>Custom tools, MCP integration, meta-agent bootstrapping, new platform adaptation — add what you want.</p>
+          </div>
+          <div class="fc">
+            <span class="fi">👥</span>
+            <h3>Human-AI Collaboration</h3>
+            <p>Pre-execution confirmation, virtual terminal, intervention at key points — ensuring a transparent and controllable process.</p>
+          </div>
+          <div class="fc">
+            <span class="fi">⛈️</span>
+            <h3>Multi-Platform Support</h3>
+            <p>
+              Linux / Windows / macOS, Docker deployment support, CLI / Web / VSCode coverage.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="quickstart">
+      <div class="ctn">
+        <div class="fin" style="text-align: center">
+          <span class="sl">Quick Start</span>
+          <h2 class="st">Get Started in 30 Seconds</h2>
+          <p class="sd" style="margin: 0 auto 48px">
+            Run one command after installation to start AI-assisted development.
+          </p>
+        </div>
+        <div class="steps fin">
+          <div class="step">
+            <div class="sn">1</div>
+            <h3>Install</h3>
+            <p>One-click install, automatic environment setup</p>
+            <div class="sc copy-wrap">
+              <button
+                class="copy-btn"
+                data-cmd='bash -c "$(curl -fsSL https://raw.githubusercontent.com/takebox/HaijunBot/main/scripts/install.sh)"'
+                onclick="copyCmd(this)"
+              >
+                Copy</button
+              ><span style="color: var(--t3)"># Linux/macOS</span>
+              bash -c "$(curl -fsSL https://...install.sh)"
+              <span style="color: var(--t3)"># Windows PowerShell</span>
+              iex (New-Object Net.WebClient).DownloadString(...)
+            </div>
+          </div>
+          <div class="step">
+            <div class="sn">2</div>
+            <h3>Quick Config</h3>
+            <p>Run the configuration wizard, select LLM platform and enter API Key</p>
+            <div class="sc copy-wrap">
+              <button class="copy-btn" data-cmd="hqc" onclick="copyCmd(this)">
+                Copy</button
+              >hqc <span style="color: var(--t3)"># Quick config</span>
+            </div>
+          </div>
+          <div class="step">
+            <div class="sn">3</div>
+            <h3>Start Collaborating</h3>
+            <p>Select Agent mode and start development</p>
+            <div class="sc">
+              hca <span style="color: var(--t3)"># Code Agent</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="community">
+      <div class="ctn">
+        <div class="fin" style="text-align: center">
+          <span class="sl">Community</span>
+          <h2 class="st">Join Us</h2>
+          <p class="sd" style="margin: 0 auto 48px">
+            HaijunBot is an open-source project. Contributions and discussions are welcome.
+          </p>
+        </div>
+        <div class="g3 fin">
+          <div class="cc">
+            <span style="font-size: 36px; display: block; margin-bottom: 16px"
+              >⭐</span
+            >
+            <h3>GitHub</h3>
+            <p>View source, submit issues, join discussions</p>
+            <a
+              href="https://github.com/takebox/HaijunBot"
+              target="_blank"
+              class="bp"
+              style="font-size: 14px; padding: 10px 24px"
+              >Visit Repository</a
+            >
+          </div>
+          <div class="cc">
+            <span style="font-size: 36px; display: block; margin-bottom: 16px"
+              >📖</span
+            >
+            <h3>Documentation Center</h3>
+            <p>Complete user manual and best practices</p>
+            <a
+              href="https://github.com/takebox/HaijunBot/tree/main/docs"
+              target="_blank"
+              class="bp"
+              style="font-size: 14px; padding: 10px 24px"
+              >View Docs</a
+            >
+          </div>
+          <div class="cc">
+            <span style="font-size: 36px; display: block; margin-bottom: 16px"
+              >💬</span
+            >
+            <h3>SimpleX Group</h3>
+            <p>Scan to join the developer community</p>
+            <a
+              href="SimpleX.png"
+              target="_blank"
+              class="bp"
+              style="font-size: 14px; padding: 10px 24px"
+              >Scan to Join</a
+            >
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <div class="ctn">
+        <div class="fl">
+          <a href="https://github.com/takebox/HaijunBot">GitHub</a>
+          <a href="https://github.com/takebox/HaijunBot/tree/main/docs"
+            >Docs</a
+          >
+          <a href="https://github.com/takebox/HaijunBot/issues">Feedback</a>
+          <a href="https://github.com/takebox/HaijunBot/blob/main/LICENSE"
+            >MIT License</a
+          >
+        </div>
+        <p class="fcopy">© 2024 HaijunBot AI. Built with ❤️ for developers.</p>
+      </div>
+    </footer>
+
+    <script>
+      const obs = new IntersectionObserver(
+        (es) => {
+          es.forEach((e) => {
+            if (e.isIntersecting) {
+              e.target.classList.add("vis");
+              obs.unobserve(e.target);
+            }
+          });
+        },
+        { threshold: 0.1 },
+      );
+      document.querySelectorAll(".fin").forEach((el) => obs.observe(el));
+
+      function toggleMobileMenu() {
+        const menu = document.querySelector(".nk-mobile");
+        const overlay = document.querySelector(".nk-mobile-overlay");
+        const isActive = menu.classList.contains("active");
+        menu.classList.toggle("active");
+        overlay.classList.toggle("active");
+        document.body.style.overflow = isActive ? "" : "hidden";
+      }
+
+      function copyCmd(btn) {
+        var txt = btn.getAttribute("data-cmd");
+        navigator.clipboard
+          .writeText(txt)
+          .then(() => {
+            btn.textContent = "Copied ✓";
+            btn.classList.add("copied");
+            setTimeout(() => {
+              btn.textContent = "Copy";
+              btn.classList.remove("copied");
+            }, 2000);
+          })
+          .catch(() => {
+            var t = document.createElement("textarea");
+            t.value = txt;
+            document.body.appendChild(t);
+            t.select();
+            document.execCommand("copy");
+            document.body.removeChild(t);
+            btn.textContent = "Copied ✓";
+            btn.classList.add("copied");
+            setTimeout(() => {
+              btn.textContent = "Copy";
+              btn.classList.remove("copied");
+            }, 2000);
+          });
+      }
+    </script>
+  </body>
+</html>

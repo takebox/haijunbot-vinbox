@@ -1,0 +1,1183 @@
+<template>
+  <aside
+    v-show="visible"
+    class="chat-panel"
+    :class="{ 'chat-panel-dragging': interaction.active, 'chat-panel-embedded': embedded }"
+    :style="panelStyle"
+    @mousedown="$emit('focus', 'chat')"
+  >
+    <div class="chat-panel-header" @mousedown="!embedded && $emit('startMove', $event)">
+      <div class="chat-panel-title-group">
+        <h3>Chat Rooms</h3>
+        <span v-if="unreadCount > 0" class="chat-unread-badge">{{ unreadCount }}</span>
+      </div>
+      <span class="chat-username">{{ myName }}</span>
+      <div class="chat-panel-actions">
+        <button class="icon-btn small" tabindex="-1" @mousedown.prevent @click="$emit('close')" title="Close panel">✕</button>
+      </div>
+    </div>
+
+    <!-- Main area: sidebar + message area laid out horizontally -->
+    <div class="chat-body">
+      <!-- Left sidebar: chat room list + online user list -->
+      <div v-show="!sidebarCollapsed" class="chat-sidebar" :style="{ width: sidebarWidth + 'px' }">
+        <div class="chat-sidebar-header">
+          <span>Chat Rooms</span>
+          <div class="chat-sidebar-actions">
+            <button class="icon-btn small" tabindex="-1" @mousedown.prevent @click="showCreateRoomInput" title="Create chat room">➕</button>
+            <button class="icon-btn small" tabindex="-1" @mousedown.prevent @click="$emit('clearMessages', 'all')" title="Clear all history"><span v-html="CHAT_ICONS.trash"></span></button>
+            <button class="icon-btn small" tabindex="-1" @mousedown.prevent @click="sidebarCollapsed = true" title="Collapse sidebar">◀</button>
+          </div>
+        </div>
+
+        <!-- Inline input for creating a chat room -->
+        <div v-if="creatingRoom" class="chat-create-room-inline">
+          <input
+            v-model="newRoomName"
+            class="chat-create-room-input"
+            placeholder="Enter a chat room name..."
+            @keydown.enter.exact="confirmCreateRoom"
+            @keydown.escape="cancelCreateRoom"
+            ref="createRoomInputRef"
+          />
+          <div class="chat-create-room-actions">
+            <button class="icon-btn small chat-create-confirm" @click="confirmCreateRoom" title="Confirm">✓</button>
+            <button class="icon-btn small chat-create-cancel" @click="cancelCreateRoom" title="Cancel">✕</button>
+          </div>
+        </div>
+        <div class="chat-room-list">
+          <div
+            v-for="room in rooms"
+            :key="room.room_id"
+            class="chat-room-item"
+            :class="{ active: activeRoomId === room.room_id, joined: joinedRooms?.includes?.(room.room_id) }"
+            @click="$emit('joinRoom', room.room_id)"
+          >
+            <template v-if="renamingRoomId === room.room_id">
+              <input
+                v-model="renameRoomName"
+                class="chat-create-room-input chat-rename-room-input"
+                placeholder="Enter a new chat room name..."
+                @keydown.enter.exact="confirmRenameRoom"
+                @keydown.escape="cancelRenameRoom"
+                @click.stop
+                ref="renameRoomInputRef"
+              />
+              <div class="chat-create-room-actions">
+                <button class="icon-btn small chat-create-confirm" @click.stop="confirmRenameRoom" title="Confirm">✓</button>
+                <button class="icon-btn small chat-create-cancel" @click.stop="cancelRenameRoom" title="Cancel">✕</button>
+              </div>
+            </template>
+            <template v-else>
+              <span class="chat-room-name">{{ room.name }}</span>
+              <span v-if="unreadMap[room.room_id]" class="chat-unread-badge chat-room-unread">{{ unreadMap[room.room_id] }}</span>
+            </template>
+            <div v-if="renamingRoomId !== room.room_id" class="chat-room-actions">
+              <span class="chat-room-count">{{ room.member_count }}</span>
+              <button v-if="activeRoomId === room.room_id" class="icon-btn small chat-room-action-btn" @click.stop="$emit('leaveRoom', room.room_id)" title="Leave chat room"><span v-html="CHAT_ICONS.exit"></span></button>
+              <button v-if="room.created_by === currentUserId || isAdmin" class="icon-btn small chat-room-action-btn" @click.stop="handleRenameRoom(room)" title="Rename chat room"><span v-html="CHAT_ICONS.edit"></span></button>
+              <button v-if="room.created_by === currentUserId || isAdmin" class="icon-btn small chat-room-action-btn" @click.stop="$emit('deleteRoom', room.room_id)" title="Delete chat room"><span v-html="CHAT_ICONS.trash"></span></button>
+            </div>
+          </div>
+          <div v-if="rooms.length === 0" class="chat-empty">No chat rooms</div>
+        </div>
+
+        <!-- Chat room members (shown only when in a room) -->
+        <div v-if="activeRoomId && roomMembers.length > 0" class="chat-members-panel">
+          <div class="chat-sidebar-header">
+            <span>Chat Room Members</span>
+          </div>
+          <div class="chat-client-list">
+            <div
+              v-for="member in roomMembers"
+              :key="member.client_id"
+              class="chat-client-item"
+              :class="{ active: activePrivateId === (member.user_id || member.client_id) }"
+              @click="$emit('selectPrivate', member.user_id || member.client_id)"
+            >
+              <span class="chat-status-dot" :class="member.online ? 'online' : 'offline'"></span>
+              <span class="chat-client-name">{{ member.display_name && member.display_name !== member.name ? member.display_name + ' (' + member.name + ')' : member.name }}</span>
+              <span v-if="unreadMap['private_' + (member.user_id || member.client_id)]" class="chat-unread-badge chat-client-unread">{{ unreadMap['private_' + (member.user_id || member.client_id)] }}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Online user list (always shown) -->
+        <div class="chat-users-panel">
+          <div class="chat-sidebar-header">
+            <span>Online Users</span>
+          </div>
+          <div class="chat-client-list">
+            <div
+              v-for="client in clients"
+              :key="client.client_id"
+              class="chat-client-item"
+              :class="{ active: activePrivateId === (client.user_id || client.client_id) }"
+              @click="$emit('selectPrivate', client.user_id || client.client_id)"
+            >
+              <span class="chat-status-dot online"></span>
+              <span class="chat-client-name">{{ client.display_name && client.display_name !== client.name ? client.display_name + ' (' + client.name + ')' : client.name }}</span>
+              <span v-if="unreadMap['private_' + (client.user_id || client.client_id)]" class="chat-unread-badge chat-client-unread">{{ unreadMap['private_' + (client.user_id || client.client_id)] }}</span>
+            </div>
+            <div v-if="clients.length === 0" class="chat-empty">No users online</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Drag the sidebar to resize its width -->
+      <div v-show="!sidebarCollapsed" class="chat-sidebar-resize" @mousedown="$emit('startSidebarResize', $event)"></div>
+
+      <!-- Expand button shown when the sidebar is collapsed -->
+      <div v-if="sidebarCollapsed" class="chat-sidebar-expand" @click="sidebarCollapsed = false" title="Expand sidebar">
+        <span>▶</span>
+      </div>
+
+      <!-- Message area -->
+      <div class="chat-main">
+        <div class="chat-main-header">
+          <span class="chat-main-title">{{ activeRoomId ? 'Room Messages' : (activePrivateId ? 'Private Messages' : 'Messages') }}</span>
+          <button v-if="activeRoomId || activePrivateId" class="icon-btn small" @click="$emit('clearMessages', 'current')" title="Clear current history"><span v-html="CHAT_ICONS.trash"></span></button>
+        </div>
+        <div class="chat-messages" ref="messagesRef">
+          <div
+            v-for="(msg, idx) in messages"
+            :key="idx"
+            class="chat-message"
+            :class="{ mine: msg.client_id === myClientId, 'chat-message-new': idx === messages.length - 1 && msg.client_id !== myClientId }"
+          >
+            <span class="chat-message-sender">{{ msg.sender_display_name || msg.sender_name }}</span>
+            <div class="chat-message-bubble">
+              <img v-if="msg.image_url" :src="msg.image_url" class="chat-message-image" @click="openImage(msg.image_url)" />
+              <span v-if="msg.content" class="chat-message-content">{{ msg.content }}</span>
+            </div>
+            <span class="chat-message-time">{{ formatTime(msg.timestamp) }}</span>
+          </div>
+          <div v-if="messages.length === 0" class="chat-empty">No messages</div>
+        </div>
+
+        <!-- Input area -->
+        <div class="chat-input-area">
+          <textarea
+            v-model="draftMessage"
+            class="chat-input"
+            placeholder="Type a message... (Ctrl+Enter / Ctrl+D to send)"
+            rows="1"
+            @input="autoResizeInput"
+            @keydown="handleInputKeydown"
+            @paste="handleChatPaste"
+            ref="chatInputRef"
+          ></textarea>
+          <div v-if="pendingImageUrl" class="chat-pending-image-wrapper">
+            <img :src="pendingImageUrl" class="chat-pending-image" />
+            <button class="chat-pending-image-remove" @click="pendingImageUrl = ''" title="Remove image">✕</button>
+          </div>
+          <button class="icon-btn chat-image-btn" @click="triggerImageUpload" title="Send image"><span v-html="CHAT_ICONS.image"></span></button>
+          <input type="file" ref="imageInputRef" accept="image/*" style="display:none" @change="handleImageSelect" />
+          <button class="icon-btn chat-send-btn" @click="sendMessage" :disabled="!socket || (!draftMessage.trim() && !pendingImageUrl)" title="Send">➤</button>
+        </div>
+      </div>
+    </div>
+
+    <div
+      v-for="direction in resizeDirections"
+      v-show="true"
+      :key="direction"
+      :class="['chat-resize-handle', `chat-resize-${direction}`]"
+      @mousedown="$emit('startResize', $event, direction)"
+    ></div>
+
+    <!-- Image lightbox preview -->
+    <div v-if="previewImageUrl" class="chat-image-preview-overlay" @click.self="closeImagePreview">
+      <div class="chat-image-preview-content">
+        <button class="chat-image-preview-close" @click="closeImagePreview" title="Close">✕</button>
+        <img :src="previewImageUrl" class="chat-image-preview-img" alt="Image preview" />
+      </div>
+    </div>
+  </aside>
+</template>
+
+<script setup>
+import { ref, computed, watch, nextTick } from 'vue'
+
+// Hand-drawn 16x16 stroke linear SVG icons (currentColor inherits the theme color), consistent with the global style
+const CHAT_ICONS = {
+  trash: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.5 9.5h7L12 4M6.5 7v4M9.5 7v4"/></svg>',
+  exit: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2.5H3.5a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1H6M10 5l3 3-3 3M13 8H6"/></svg>',
+  edit: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11.5 2.5a1.5 1.5 0 0 1 2 2L5 13l-3 1 1-3z"/><path d="M9.5 4.5l2 2"/></svg>',
+  image: '<svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><circle cx="5.5" cy="6" r="1.2"/><path d="m3 12.5 3.5-3.5 2.5 2.5 2-2 2 2"/></svg>',
+}
+const props = defineProps({
+  visible: Boolean,
+  embedded: Boolean,
+  interaction: Object,
+  panelStyle: Object,
+  socket: [Object, null],
+  rooms: Array,
+  messages: Array,
+  clients: Array,
+  roomMembers: Array,
+  myClientId: String,
+  isAdmin: Boolean,
+  currentUserId: String,
+  activeRoomId: String,
+  activePrivateId: String,
+  resizeDirections: Array,
+  unreadCount: Number,
+  unreadMap: Object,
+  joinedRooms: Object,
+  myName: String,
+  collapsed: Boolean,
+  sidebarWidth: { type: Number, default: 160 },
+})
+
+const emit = defineEmits([
+  'focus',
+  'startMove',
+  'close',
+  'createRoom',
+  'joinRoom',
+  'sendMessage',
+  'selectPrivate',
+  'startResize',
+  'toggleCollapse',
+  'leaveRoom',
+  'deleteRoom',
+  'renameRoom',
+  'startSidebarResize',
+  'clearMessages',
+])
+
+const draftMessage = ref('')
+const messagesRef = ref(null)
+const chatInputRef = ref(null)
+const imageInputRef = ref(null)
+const createRoomInputRef = ref(null)
+const myName = computed(() => props.myName || '')
+const sidebarCollapsed = ref(false)
+const creatingRoom = ref(false)
+const newRoomName = ref('')
+const pendingImageUrl = ref('')
+const renamingRoomId = ref('')
+const renameRoomName = ref('')
+const renameRoomInputRef = ref(null)
+
+function handleRenameRoom(room) {
+  renamingRoomId.value = room.room_id
+  renameRoomName.value = room.name
+  nextTick(() => {
+    if (renameRoomInputRef.value) {
+      renameRoomInputRef.value.focus()
+      renameRoomInputRef.value.select()
+    }
+  })
+}
+
+function confirmRenameRoom() {
+  const newName = renameRoomName.value.trim()
+  if (!newName) return
+  // Need to find the name of the room being renamed for comparison
+  const room = props.rooms.find(r => r.room_id === renamingRoomId.value)
+  if (room && newName === room.name) {
+    cancelRenameRoom()
+    return
+  }
+  emit('renameRoom', renamingRoomId.value, newName)
+  cancelRenameRoom()
+}
+
+function cancelRenameRoom() {
+  renamingRoomId.value = ''
+  renameRoomName.value = ''
+}
+
+function sendMessage() {
+  if (!draftMessage.value.trim() && !pendingImageUrl.value) return
+  emit('sendMessage', draftMessage.value, pendingImageUrl.value)
+  draftMessage.value = ''
+  pendingImageUrl.value = ''
+  // Reset the input height
+  nextTick(() => {
+    if (chatInputRef.value) {
+      chatInputRef.value.style.height = 'auto'
+    }
+  })
+}
+
+function triggerImageUpload() {
+  imageInputRef.value?.click()
+}
+
+async function handleImageSelect(event) {
+  const file = event.target.files?.[0]
+  if (!file) return
+  await uploadChatImage(file)
+  event.target.value = ''
+}
+
+async function handleChatPaste(event) {
+  const items = event.clipboardData?.items
+  if (!items) return
+  for (const item of items) {
+    if (item.type.startsWith('image/')) {
+      event.preventDefault()
+      const file = item.getAsFile()
+      if (file) {
+        await uploadChatImage(file)
+      }
+      return
+    }
+  }
+}
+
+async function uploadChatImage(file) {
+  if (file.size > 20 * 1024 * 1024) {
+    alert('Image size cannot exceed 20MB')
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = async (e) => {
+    const base64Data = e.target.result
+    try {
+      const { host, port } = getGatewayAddress()
+      const protocol = window.location.protocol === 'https:' ? 'https' : 'http'
+      const url = `${protocol}://${host}:${port}/api/node/master/upload`
+      const token = localStorage.getItem('haijunbot_auth_token') || ''
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': token ? `Bearer ${token}` : '',
+        },
+        body: JSON.stringify({
+          file_name: file.name,
+          file_data: base64Data,
+        }),
+      })
+      const result = await response.json()
+      if (result.success && result.data?.file_url) {
+        // Convert the relative path into a full URL (uploads are mounted on the backend gateway)
+        const fileUrl = result.data.file_url
+        pendingImageUrl.value = fileUrl.startsWith('/uploads/')
+          ? `${protocol}://${host}:${port}${fileUrl}`
+          : fileUrl
+      } else {
+        alert('Upload failed: ' + (result.error || 'Unknown error'))
+      }
+    } catch (error) {
+      console.error('Failed to upload image:', error)
+      alert('Failed to upload image: ' + error.message)
+    }
+  }
+  reader.readAsDataURL(file)
+}
+
+function getGatewayAddress() {
+  const saved = localStorage.getItem('haijunbot_gateway_url') || '127.0.0.1:8000'
+  const address = saved.trim()
+  if (address.includes('://')) {
+    try {
+      const u = new URL(address)
+      return { host: u.hostname, port: u.port || (u.protocol === 'https:' ? '443' : '80') }
+    } catch { return { host: '127.0.0.1', port: '8000' } }
+  }
+  if (address.includes(':')) {
+    const parts = address.split(':')
+    return { host: parts[0], port: parts[1] }
+  }
+  return { host: address, port: '8000' }
+}
+
+const previewImageUrl = ref('')
+
+function openImage(url) {
+  previewImageUrl.value = url
+}
+
+function closeImagePreview() {
+  previewImageUrl.value = ''
+}
+
+// Auto-resize the input height
+function autoResizeInput() {
+  const el = chatInputRef.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px'
+}
+
+// Handle input keyboard events
+function handleInputKeydown(event) {
+  // Ctrl+Enter / Ctrl+D to send
+  if (event.ctrlKey && (event.key === 'Enter' || event.key.toLowerCase() === 'd')) {
+    event.preventDefault()
+    sendMessage()
+    return
+  }
+}
+
+// Show the create-chat-room input
+function showCreateRoomInput() {
+  creatingRoom.value = true
+  newRoomName.value = ''
+  nextTick(() => {
+    if (createRoomInputRef.value) {
+      createRoomInputRef.value.focus()
+    }
+  })
+}
+
+// Confirm chat room creation
+function confirmCreateRoom() {
+  const name = newRoomName.value.trim()
+  if (!name) return
+  emit('createRoom', name)
+  creatingRoom.value = false
+  newRoomName.value = ''
+}
+
+// Cancel chat room creation
+function cancelCreateRoom() {
+  creatingRoom.value = false
+  newRoomName.value = ''
+}
+
+// Format the message time
+function formatTime(timestamp) {
+  if (!timestamp) return ''
+  // Support both second and millisecond timestamp units
+  const ts = timestamp > 1e12 ? timestamp : timestamp * 1000
+  const date = new Date(ts)
+  const now = new Date()
+  const isToday = date.toDateString() === now.toDateString()
+  const hh = String(date.getHours()).padStart(2, '0')
+  const mm = String(date.getMinutes()).padStart(2, '0')
+  if (isToday) {
+    return `${hh}:${mm}`
+  }
+  const MM = String(date.getMonth() + 1).padStart(2, '0')
+  const DD = String(date.getDate()).padStart(2, '0')
+  return `${MM}-${DD} ${hh}:${mm}`
+}
+
+// Auto-scroll to the bottom
+watch(
+  () => props.messages?.length,
+  async () => {
+    await nextTick()
+    if (messagesRef.value) {
+      messagesRef.value.scrollTop = messagesRef.value.scrollHeight
+    }
+  }
+)
+</script>
+
+<style scoped>
+.icon-btn {
+  background: var(--color-bg-tertiary);
+  border: none;
+  border-radius: var(--tile-radius);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0;
+  color: var(--color-text-secondary);
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+  transform: translateY(-1px);
+}
+
+.icon-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.icon-btn.small {
+  width: 24px;
+  height: 24px;
+  font-size: 14px;
+}
+
+.chat-send-btn {
+  width: 44px;
+  height: 36px;
+  font-size: 18px;
+  background: var(--color-accent, #20c8ff);
+  color: #fff;
+  border-radius: 8px;
+}
+
+.chat-send-btn:hover:not(:disabled) {
+  background: var(--color-accent-hover, #1ab0e0);
+  color: #fff;
+}
+
+.chat-send-btn:disabled {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-secondary);
+}
+
+@media (max-width: 768px) {
+  .chat-send-btn {
+    width: 52px;
+    height: 42px;
+    font-size: 20px;
+  }
+}
+
+.chat-panel {
+  position: fixed;
+  background: rgba(9, 16, 28, 0.86);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 14px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(32, 200, 255, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.chat-panel-dragging {
+  user-select: none;
+}
+
+.chat-panel-embedded {
+  position: relative !important;
+  width: 100% !important;
+  height: 100% !important;
+  top: auto !important;
+  left: auto !important;
+  border-radius: 4px;
+}
+
+/* Sidebar expand button */
+.chat-sidebar-expand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 100%;
+  cursor: pointer;
+  background: var(--color-bg-secondary);
+  border-right: 1px solid var(--color-border);
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  transition: background 0.2s;
+}
+
+.chat-sidebar-expand:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+}
+
+.chat-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 10px;
+  background:
+    linear-gradient(160deg, rgba(32, 200, 255, 0.10) 0%, transparent 46%),
+    var(--color-bg-tertiary);
+  border-bottom: 1px solid var(--color-border-subtle);
+  border-left: 2px solid var(--color-accent);
+  cursor: move;
+  flex-shrink: 0;
+}
+
+.chat-panel-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-panel-title-group h3 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--color-text-primary);
+}
+
+.chat-unread-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: #ff3c48;
+  color: #d6e4f0;
+  font-size: 11px;
+  font-weight: bold;
+  line-height: 1;
+  animation: chat-badge-pulse 1s ease-in-out infinite;
+}
+
+@keyframes chat-badge-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.15); }
+}
+
+.chat-message-new {
+  animation: chat-message-slide-in 0.4s ease-out;
+  background: rgba(32, 200, 255, 0.08);
+  border-radius: 6px;
+}
+
+@keyframes chat-message-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+    background: rgba(32, 200, 255, 0.25);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    background: rgba(32, 200, 255, 0.08);
+  }
+}
+
+.chat-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.chat-username {
+  flex: 1;
+  margin: 0 8px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-body {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+}
+
+.chat-sidebar {
+  border-right: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.chat-sidebar-resize {
+  width: 4px;
+  cursor: col-resize;
+  background: transparent;
+  flex-shrink: 0;
+  transition: background 0.2s;
+}
+
+.chat-sidebar-resize:hover {
+  background: var(--color-accent);
+}
+
+.chat-users-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  border-top: 1px solid var(--color-border);
+}
+
+.chat-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.chat-sidebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* Inline input for creating a chat room */
+.chat-create-room-inline {
+  padding: 8px;
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chat-create-room-input {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  color: var(--color-text-primary);
+  font-size: 13px;
+  outline: none;
+  font-family: inherit;
+  box-sizing: border-box;
+  transition: border-color 0.2s;
+}
+
+.chat-create-room-input:focus {
+  border-color: var(--color-accent, #20c8ff);
+}
+
+.chat-create-room-input::placeholder {
+  color: var(--color-text-secondary);
+}
+
+.chat-create-room-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.chat-create-confirm {
+  color: var(--color-accent, #20c8ff) !important;
+}
+
+.chat-create-cancel {
+  color: var(--color-text-secondary) !important;
+}
+
+/* Inline input for renaming a chat room */
+.chat-rename-room-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.chat-room-list,
+.chat-client-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.chat-room-item,
+.chat-client-item {
+  padding: 6px 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--color-text-primary);
+  transition: all 0.15s ease;
+  border-left: 3px solid transparent;
+}
+
+.chat-room-item:hover,
+.chat-client-item:hover {
+  background: var(--color-bg-hover);
+}
+
+.chat-room-item.active {
+  background: var(--color-bg-active);
+  border-left: 3px solid var(--color-accent, #20c8ff);
+  font-weight: 600;
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(32, 200, 255, 0.2);
+}
+
+.chat-client-item.active {
+  background: var(--color-bg-active);
+  border-left: 3px solid var(--color-accent, #20c8ff);
+  border-radius: 6px;
+  box-shadow: 0 1px 4px rgba(32, 200, 255, 0.2);
+}
+
+/* Online/offline status dot */
+.chat-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-right: 6px;
+  display: inline-block;
+}
+
+.chat-status-dot.online {
+  background: #36ff7c;
+  box-shadow: 0 0 3px rgba(54, 255, 124, 0.5);
+}
+
+.chat-status-dot.offline {
+  background: #ff3c48;
+  box-shadow: 0 0 3px rgba(255, 60, 72, 0.5);
+}
+
+.chat-room-item.joined:not(.active) {
+  background: var(--color-bg-secondary);
+  border-left: 3px solid var(--color-primary, #20c8ff);
+}
+
+.chat-room-item:not(.joined) {
+  opacity: 0.6;
+}
+
+.chat-room-name,
+.chat-client-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-room-unread,
+.chat-client-unread {
+  flex-shrink: 0;
+  margin-left: 4px;
+  font-size: 10px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+}
+
+.chat-room-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.chat-room-action-btn {
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.chat-room-item:hover .chat-room-action-btn,
+.chat-room-item.active .chat-room-action-btn {
+  opacity: 1;
+}
+
+.chat-room-count {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  background: var(--color-bg-tertiary);
+  border-radius: 8px;
+  padding: 1px 6px;
+}
+
+.chat-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.chat-main-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-color, #1a2a3a);
+  flex-shrink: 0;
+}
+
+.chat-main-title {
+  font-size: 12px;
+  color: var(--text-secondary, #8ba3b8);
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.chat-message {
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.chat-message.mine {
+  align-items: flex-end;
+}
+
+.chat-message.mine .chat-message-sender {
+  color: var(--color-accent);
+}
+
+.chat-message-sender {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  margin-bottom: 2px;
+  padding: 0 4px;
+}
+
+.chat-message-bubble {
+  max-width: 80%;
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+}
+
+.chat-message.mine .chat-message-bubble {
+  background: var(--color-bg-tertiary);
+  color: #d6e4f0;
+  border-color: var(--color-accent);
+  border-width: 1px;
+}
+
+.chat-message-content {
+  font-size: 13px;
+  color: inherit;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.chat-message-time {
+  font-size: 10px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+  padding: 0 4px;
+}
+
+.chat-input-area {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px;
+  border-top: 1px solid var(--color-border);
+}
+
+.chat-input {
+  flex: 1;
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--color-text-primary);
+  outline: none;
+  resize: none;
+  overflow-y: auto;
+  min-height: 36px;
+  max-height: 120px;
+  line-height: 1.5;
+  font-family: inherit;
+  box-sizing: border-box;
+  transition: border-color 0.2s;
+}
+
+.chat-input:focus {
+  border-color: var(--color-accent, #20c8ff);
+}
+
+.chat-input::placeholder {
+  color: var(--color-text-secondary);
+}
+
+
+
+.chat-empty {
+  padding: 12px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
+.chat-resize-handle {
+  position: absolute;
+  z-index: 10;
+}
+
+.chat-resize-n {
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: n-resize;
+}
+
+.chat-resize-s {
+  bottom: -3px;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: s-resize;
+}
+
+.chat-resize-e {
+  right: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: e-resize;
+}
+
+.chat-resize-w {
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: w-resize;
+}
+
+.chat-resize-ne {
+  top: -3px;
+  right: -3px;
+  width: 6px;
+  height: 6px;
+  cursor: ne-resize;
+}
+
+.chat-resize-nw {
+  top: -3px;
+  left: -3px;
+  width: 6px;
+  height: 6px;
+  cursor: nw-resize;
+}
+
+.chat-resize-se {
+  bottom: -3px;
+  right: -3px;
+  width: 6px;
+  height: 6px;
+  cursor: se-resize;
+}
+
+.chat-resize-sw {
+  bottom: -3px;
+  left: -3px;
+  width: 6px;
+  height: 6px;
+  cursor: sw-resize;
+}
+.chat-image-btn {
+  color: var(--text-secondary, #8ba3b8);
+  font-size: 1.1em;
+  padding: 4px 6px;
+}
+.chat-image-btn:hover {
+  color: var(--accent-color, #20c8ff);
+}
+
+.chat-message-image {
+  max-width: 280px;
+  max-height: 280px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: block;
+  margin-bottom: 4px;
+  object-fit: contain;
+}
+.chat-message-image:hover {
+  opacity: 0.85;
+}
+.chat-pending-image-wrapper {
+  position: relative;
+  display: inline-block;
+  margin: 4px 0;
+}
+.chat-pending-image {
+  max-width: 120px;
+  max-height: 80px;
+  border-radius: 6px;
+  object-fit: contain;
+  border: 2px solid var(--accent-color, #20c8ff);
+}
+.chat-pending-image-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #ff3c48;
+  color: #d6e4f0;
+  border: none;
+  font-size: 11px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  line-height: 1;
+}
+.chat-pending-image-remove:hover {
+  background: #ff3c48;
+}
+
+/* Image lightbox preview */
+.chat-image-preview-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(8, 12, 22, 0.8);
+  z-index: 99999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+
+.chat-image-preview-content {
+  position: relative;
+  max-width: 90vw;
+  max-height: 90vh;
+}
+
+.chat-image-preview-img {
+  max-width: 90vw;
+  max-height: 90vh;
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+
+.chat-image-preview-close {
+  position: absolute;
+  top: -36px;
+  right: -36px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+  color: #d6e4f0;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+
+.chat-image-preview-close:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+</style>

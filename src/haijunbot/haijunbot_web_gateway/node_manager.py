@@ -1,0 +1,2984 @@
+# -*- coding: utf-8 -*-
+"""Node master-child connection and basic state management."""
+
+from __future__ import annotations
+
+
+from haijunbot import __version__ as HAIJUNBOT_VERSION
+from haijunbot.haijunbot_utils.exception_utils import save_exception
+from haijunbot.haijunbot_utils import vinbox_runtime
+import asyncio
+import ipaddress
+import json
+import logging
+import os
+import pathlib
+import random
+import shutil
+import uuid
+from typing import Any, AsyncGenerator, Dict, Optional
+from urllib.parse import urlparse
+
+import httpx
+
+import yaml  # type: ignore[import-untyped]
+
+import websockets
+from fastapi import WebSocket
+from websockets.asyncio.connection import State
+
+from .agent_manager import AgentManager
+from .node_protocol import (
+    AGENT_CREATE_REQUEST,
+    AGENT_CREATE_RESPONSE,
+    AGENT_HTTP_REQUEST,
+    AGENT_HTTP_RESPONSE,
+    NODE_HTTP_PROXY_REQUEST,
+    NODE_HTTP_PROXY_RESPONSE,
+    AGENT_LIST_REQUEST,
+    AGENT_LIST_RESPONSE,
+    AGENT_STOP_REQUEST,
+    AGENT_STOP_RESPONSE,
+    AGENT_DELETE_REQUEST,
+    AGENT_DELETE_RESPONSE,
+    AGENT_REGENERATE_REQUEST,
+    AGENT_REGENERATE_RESPONSE,
+    AGENT_WS_CLOSE_REQUEST,
+    AGENT_WS_CLOSE_RESPONSE,
+    AGENT_WS_OPEN_REQUEST,
+    AGENT_WS_OPEN_RESPONSE,
+    AGENT_WS_RECV_REQUEST,
+    AGENT_WS_RECV_RESPONSE,
+    AGENT_WS_REQUEST,
+    AGENT_WS_RESPONSE,
+    AGENT_WS_SEND_REQUEST,
+    AGENT_WS_SEND_RESPONSE,
+    DIRECTORY_LIST_REQUEST,
+    DIRECTORY_LIST_RESPONSE,
+    NODE_TERMINAL_REQUEST,
+    NODE_TERMINAL_RESPONSE,
+    NODE_TERMINAL_OUTPUT,
+    SERVICE_RESTART_REQUEST,
+    SERVICE_RESTART_RESPONSE,
+    CONFIG_SYNC_REQUEST,
+    CONFIG_SYNC_RESPONSE,
+    CONFIG_GET_REQUEST,
+    CONFIG_GET_RESPONSE,
+    CONFIG_SET_REQUEST,
+    CONFIG_SET_RESPONSE,
+    CODE_UPDATE_TO_MAIN_REQUEST,
+    CODE_UPDATE_TO_MAIN_RESPONSE,
+    PLUGIN_MANAGE_REQUEST,
+    PLUGIN_MANAGE_RESPONSE,
+    NODE_AUTH,
+    NODE_AUTH_RESULT,
+    NODE_HEARTBEAT,
+    build_error_message,
+    build_node_message,
+)
+from .node_runtime import AgentRouteInfo, NodeInfo, NodeRuntime
+from .system_info import get_node_description, get_system_info
+
+# Windows restart command TCP port (kept consistent with _RESTART_COMMAND_TCP_PORT in app.py)
+_RESTART_COMMAND_TCP_PORT = 18766
+
+logger = logging.getLogger(__name__)
+
+CHILD_HEARTBEAT_INTERVAL_SECONDS = 10
+CHILD_RECONNECT_MIN_SECONDS = 5
+CHILD_RECONNECT_MAX_SECONDS = 10
+
+
+class NodeConnectionManager:
+    def __init__(
+        self,
+        node_runtime: NodeRuntime,
+        agent_manager: AgentManager,
+        agent_proxy_manager: Any,
+        node_http_dispatcher: Optional[Any] = None,
+        router: Optional[Any] = None,
+        terminal_session_manager: Optional[Any] = None,
+    ) -> None:
+        self._node_runtime = node_runtime
+        self._agent_manager = agent_manager
+        self._agent_proxy_manager = agent_proxy_manager
+        self._node_http_dispatcher = node_http_dispatcher
+        self._router = router
+        self._terminal_session_manager = terminal_session_manager
+        self._connections: Dict[str, WebSocket] = {}
+        self._connection_to_node: Dict[str, str] = {}
+        self._pending_requests: Dict[str, asyncio.Future] = {}
+        self._streaming_queues: Dict[str, asyncio.Queue] = {}
+        self._agent_ws_sessions: Dict[str, Any] = {}
+
+    async def handle_node_websocket(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        connection_id = str(uuid.uuid4())
+        try:
+            message = await asyncio.wait_for(websocket.receive_json(), timeout=10)
+        except Exception:
+            await websocket.send_json(
+                build_error_message(
+                    "NODE_AUTH_REQUIRED",
+                    "first message must be node_auth",
+                )
+            )
+            await websocket.close(code=4401)
+            return
+
+        if not isinstance(message, dict) or message.get("type") != NODE_AUTH:
+            await websocket.send_json(
+                build_error_message(
+                    "INVALID_NODE_MESSAGE", "first message must be node_auth"
+                )
+            )
+            await websocket.close(code=4401)
+            return
+
+        payload = message.get("payload") or {}
+        node_id = str(payload.get("node_id") or "").strip()
+        secret = str(payload.get("secret") or "").strip()
+        if not node_id or not secret:
+            await websocket.send_json(
+                build_error_message(
+                    "NODE_AUTH_FAILED", "node_id and secret are required"
+                )
+            )
+            await websocket.close(code=4401)
+            return
+
+        expected_secret = (self._node_runtime.config.node_secret or "").strip()
+        if not expected_secret or secret != expected_secret:
+            await websocket.send_json(
+                build_error_message("NODE_AUTH_FAILED", "invalid node credentials")
+            )
+            await websocket.close(code=4401)
+            return
+
+        # Check whether a node with the same name already exists
+        if node_id in self._connections:
+            await websocket.send_json(
+                build_error_message(
+                    "NODE_ALREADY_CONNECTED", f"node {node_id} is already connected"
+                )
+            )
+            await websocket.close(code=4403)
+            return
+
+        self._connections[node_id] = websocket
+        self._connection_to_node[connection_id] = node_id
+        self._node_runtime.node_registry.upsert(
+            NodeInfo(
+                node_id=node_id,
+                status="online",
+                connection_id=connection_id,
+                capabilities=payload.get("capabilities") or {},
+                metadata={},
+            )
+        )
+        await websocket.send_json(
+            build_node_message(
+                "node_auth_result",
+                {
+                    "success": True,
+                    "node_id": node_id,
+                    "token": os.environ.get("HAIJUNBOT_AUTH_TOKEN"),
+                    "heartbeat_interval": 10,
+                },
+                request_id=message.get("request_id"),
+            )
+        )
+
+        try:
+            while True:
+                next_message = await websocket.receive_json()
+                if not isinstance(next_message, dict):
+                    continue
+                message_type = next_message.get("type")
+                request_id = next_message.get("request_id")
+                if message_type == NODE_HEARTBEAT:
+                    payload = next_message.get("payload") or {}
+                    system_info = payload.get("system_info") or {}
+                    description = payload.get("description") or ""
+                    version = payload.get("version") or None
+                    self._node_runtime.node_registry.mark_heartbeat(
+                        node_id,
+                        system_info=system_info,
+                        description=description,
+                        version=version,
+                    )
+                    continue
+                # Response message handling: if there is a request_id, try to match a pending request or streaming queue
+                if request_id:
+                    # Streaming request: put the message into the Queue
+                    streaming_queue = self._streaming_queues.get(request_id)
+                    if streaming_queue is not None:
+                        await streaming_queue.put(next_message)
+                        continue
+                    # Non-streaming request: pass it via a Future
+                    future = self._pending_requests.get(request_id)
+                    if future is not None:
+                        if not future.done():
+                            future.set_result(next_message)
+                        continue
+                if message_type == NODE_TERMINAL_OUTPUT:
+                    terminal_payload = next_message.get("payload") or {}
+                    output_session_id = terminal_payload.get("session_id") or "default"
+                    output_message = terminal_payload.get("message")
+                    if output_message and self._router:
+                        self._router.publish(
+                            output_message, session_id=output_session_id
+                        )
+                        # Real-time terminal sharing: ACL decisions are all made on the master; the child node only relays raw output.
+                        # Here we additionally broadcast to all admin users so that other devices (administrators) can also
+                        # see the child node terminal's output in real time.
+                        self._publish_terminal_output_to_admins(
+                            output_message, output_session_id
+                        )
+                    continue
+                if message_type == AGENT_CREATE_REQUEST:
+                    response = self._handle_agent_create_request(next_message, node_id)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_HTTP_REQUEST:
+                    response = await self._handle_agent_http_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == NODE_HTTP_PROXY_REQUEST:
+                    response = await self._handle_node_http_proxy_request(
+                        websocket, next_message
+                    )
+                    if response is not None:
+                        await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_LIST_REQUEST:
+                    response = self._handle_agent_list_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_STOP_REQUEST:
+                    response = self._handle_agent_stop_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_DELETE_REQUEST:
+                    response = self._handle_agent_delete_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_REGENERATE_REQUEST:
+                    response = self._handle_agent_regenerate_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_WS_REQUEST:
+                    response = await self._handle_agent_ws_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_WS_OPEN_REQUEST:
+                    response = await self._handle_agent_ws_open_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_WS_SEND_REQUEST:
+                    response = await self._handle_agent_ws_send_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_WS_RECV_REQUEST:
+                    response = await self._handle_agent_ws_recv_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == AGENT_WS_CLOSE_REQUEST:
+                    response = await self._handle_agent_ws_close_request(next_message)
+                    await websocket.send_json(response)
+                    continue
+                if message_type == DIRECTORY_LIST_REQUEST:
+                    logger.info(
+                        "[NODE] handling directory list request node_id=%s request_id=%s",
+                        node_id,
+                        request_id,
+                    )
+                    response = self._handle_directory_list_request(next_message)
+                    await websocket.send_json(response)
+                    logger.info(
+                        "[NODE] sent directory list response node_id=%s request_id=%s",
+                        node_id,
+                        request_id,
+                    )
+                    continue
+                if message_type == CONFIG_SYNC_REQUEST:
+                    logger.info(
+                        "[NODE] handling config sync request node_id=%s request_id=%s",
+                        node_id,
+                        request_id,
+                    )
+                    response = await self._handle_config_sync_request(next_message)
+                    await websocket.send_json(response)
+                    logger.info(
+                        "[NODE] sent config sync response node_id=%s request_id=%s",
+                        node_id,
+                        request_id,
+                    )
+                    continue
+                if message_type == PLUGIN_MANAGE_REQUEST:
+                    logger.info(
+                        "[NODE] handling plugin manage request node_id=%s request_id=%s",
+                        node_id,
+                        request_id,
+                    )
+                    response = self._handle_plugin_manage_request(next_message)
+                    await websocket.send_json(response)
+                    logger.info(
+                        "[NODE] sent plugin manage response node_id=%s request_id=%s",
+                        node_id,
+                        request_id,
+                    )
+                    continue
+                logger.warning(
+                    "[NODE] unhandled message node_id=%s type=%s request_id=%s",
+                    node_id,
+                    message_type,
+                    request_id,
+                )
+        except Exception:
+            logger.info("[NODE] node disconnected: %s", node_id)
+        finally:
+            self._node_runtime.node_registry.mark_offline(node_id)
+            self._connections.pop(node_id, None)
+            self._connection_to_node.pop(connection_id, None)
+
+    def _publish_terminal_output_to_admins(
+        self, message: Dict[str, Any], exclude_session_id: Optional[str] = None
+    ) -> None:
+        """Broadcast the child node terminal's output to all admin users (ACL decisions are all made on the master).
+
+        The child node is only responsible for relaying raw output back to the master, which decides which users receive it.
+        Admin users are allowed by _access_level (treated as owner) and can view all terminals, so
+        the child node terminal's output should also be pushed in real time to all online admin users. Offline users have no connection,
+        and publishing to their session_id has no side effects.
+        """
+        try:
+            tsm = self._terminal_session_manager
+            if tsm is None or self._router is None:
+                return
+            for admin_sid in tsm.get_all_admin_session_ids():
+                if admin_sid != exclude_session_id:
+                    self._router.publish(message, session_id=admin_sid)
+        except Exception as e:
+            logger.warning(
+                "[NODE TERMINAL] Failed to broadcast output to admins: %s", e
+            )
+
+    def get_node_connection(self, node_id: str) -> Optional[WebSocket]:
+        return self._connections.get(node_id)
+
+    async def send_request_to_node(
+        self,
+        node_id: str,
+        message_type: str,
+        payload: Dict[str, Any],
+        timeout: float = 60.0,
+    ) -> Dict[str, Any]:
+        websocket = self._connections.get(node_id)
+        if websocket is None:
+            raise RuntimeError(f"node connection not found: {node_id}")
+        request_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        self._pending_requests[request_id] = future
+        try:
+            logger.info(
+                "[NODE] send request node_id=%s type=%s request_id=%s",
+                node_id,
+                message_type,
+                request_id,
+            )
+            await websocket.send_json(
+                build_node_message(message_type, payload, request_id=request_id)
+            )
+            try:
+                response = await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"node request timed out: node_id={node_id}, type={message_type}, request_id={request_id}, timeout={timeout}s"
+                ) from exc
+            logger.info(
+                "[NODE] received response node_id=%s type=%s request_id=%s",
+                node_id,
+                response.get("type") if isinstance(response, dict) else None,
+                request_id,
+            )
+            if not isinstance(response, dict):
+                raise RuntimeError(
+                    f"invalid node response: node_id={node_id}, type={message_type}, request_id={request_id}"
+                )
+            return response
+        finally:
+            self._pending_requests.pop(request_id, None)
+
+    async def send_request_to_node_streaming(
+        self,
+        node_id: str,
+        message_type: str,
+        payload: Dict[str, Any],
+        timeout: float = 300.0,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Stream a request to the node, yielding each received message.
+
+        Uses an asyncio.Queue to receive streaming responses, avoiding the race conditions
+        and message loss caused by a Future being able to set its result only once.
+
+        Args:
+            node_id: Node ID
+            message_type: Message type
+            payload: Payload
+            timeout: Timeout in seconds
+
+        Yields:
+            Each received message
+        """
+        websocket = self._connections.get(node_id)
+        if websocket is None:
+            raise RuntimeError(f"node connection not found: {node_id}")
+        request_id = str(uuid.uuid4())
+        queue: asyncio.Queue = asyncio.Queue()
+        self._streaming_queues[request_id] = queue
+        try:
+            await websocket.send_json(
+                build_node_message(message_type, payload, request_id=request_id)
+            )
+
+            # Wait for and yield each response message one by one
+            while True:
+                try:
+                    response = await asyncio.wait_for(queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    break
+
+                if not isinstance(response, dict):
+                    break
+
+                # Check whether it is done (via the done marker in the payload)
+                response_payload = response.get("payload", {})
+                is_done = response_payload.get("done")
+
+                yield response
+
+                if is_done:
+                    break
+
+        finally:
+            self._streaming_queues.pop(request_id, None)
+
+    def _handle_agent_create_request(
+        self, message: Dict[str, Any], source_node_id: str
+    ) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        try:
+            auth_token = os.environ.get("HAIJUNBOT_AUTH_TOKEN")
+            agent_info = self._agent_manager.create_agent(
+                auth_token=auth_token,
+                agent_type=str(payload.get("agent_type", "default")),
+                working_dir=str(payload.get("working_dir", ".")),
+                name=payload.get("name"),
+                llm_group=payload.get("llm_group", "default"),
+                tool_group=payload.get("tool_group", "default"),
+                config_file=payload.get("config_file"),
+                task=payload.get("task"),
+                additional_args=payload.get("additional_args"),
+                worktree=bool(payload.get("worktree", False)),
+                node_id=self._node_runtime.local_node_id,
+                quick_mode=bool(payload.get("quick_mode", False)),
+                restore_session=payload.get("restore_session"),
+                no_interaction_mode=bool(payload.get("no_interaction_mode", False)),
+                proxy_node=payload.get("proxy_node"),
+                owner_id=payload.get("owner_id"),
+                access_acl=payload.get("access_acl"),
+            )
+            self._node_runtime.agent_route_registry.register(
+                AgentRouteInfo(
+                    agent_id=agent_info["agent_id"],
+                    node_id=agent_info.get("node_id", self._node_runtime.local_node_id),
+                    status=agent_info.get("status", "running"),
+                    working_dir=agent_info.get("working_dir"),
+                    port=agent_info.get("port"),
+                )
+            )
+            return build_node_message(
+                AGENT_CREATE_RESPONSE,
+                {
+                    "success": True,
+                    "agent_info": agent_info,
+                    "source_node_id": source_node_id,
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            return build_node_message(
+                AGENT_CREATE_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "AGENT_CREATE_FAILED",
+                        "message": str(exc),
+                    },
+                },
+                request_id=request_id,
+            )
+
+    def _handle_agent_list_request(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        request_id = message.get("request_id")
+        try:
+            agents = self._agent_manager.get_agent_list()
+            for agent in agents:
+                agent["node_id"] = self._node_runtime.local_node_id
+            return build_node_message(
+                AGENT_LIST_RESPONSE,
+                {"success": True, "agents": agents},
+                request_id=request_id,
+            )
+        except Exception as exc:
+            return build_node_message(
+                AGENT_LIST_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "AGENT_LIST_FAILED", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    def _handle_plugin_manage_request(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle plugin management requests (list/install/uninstall/upgrade/serve_frontend).
+
+        Calls the plugin management functions of haijunbot_agent.utils locally on the child node and returns structured JSON.
+        Uses PrettyOutput's Sink mechanism to capture internal function output and return it to the master for display.
+        """
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        action = str(payload.get("action") or "")
+        try:
+            from haijunbot.haijunbot_agent.utils import (
+                install_plugin,
+                list_plugins_info,
+                uninstall_plugin,
+                upgrade_plugin,
+            )
+            from haijunbot.haijunbot_utils.output import OutputSink, PrettyOutput
+
+            captured: list[str] = []
+
+            class _CaptureSink(OutputSink):
+                def emit(self, event: Any) -> None:  # pragma: no cover - simple collection
+                    if event.text:
+                        captured.append(event.text)
+
+            sink = _CaptureSink()
+            PrettyOutput.add_sink(sink)
+            try:
+                if action == "list":
+                    plugins = list_plugins_info()
+                    return build_node_message(
+                        PLUGIN_MANAGE_RESPONSE,
+                        {
+                            "success": True,
+                            "action": action,
+                            "plugins": plugins,
+                            "output": captured,
+                        },
+                        request_id=request_id,
+                    )
+                if action == "install":
+                    source = str(payload.get("source") or "")
+                    force = bool(payload.get("force", False))
+                    ok = install_plugin(source, force=force)
+                    return build_node_message(
+                        PLUGIN_MANAGE_RESPONSE,
+                        {
+                            "success": ok,
+                            "action": action,
+                            "output": captured,
+                        },
+                        request_id=request_id,
+                    )
+                if action == "uninstall":
+                    name = str(payload.get("name") or "")
+                    ok = uninstall_plugin(name)
+                    return build_node_message(
+                        PLUGIN_MANAGE_RESPONSE,
+                        {
+                            "success": ok,
+                            "action": action,
+                            "output": captured,
+                        },
+                        request_id=request_id,
+                    )
+                if action == "upgrade":
+                    name = str(payload.get("name") or "")
+                    ok = upgrade_plugin(name)
+                    return build_node_message(
+                        PLUGIN_MANAGE_RESPONSE,
+                        {
+                            "success": ok,
+                            "action": action,
+                            "output": captured,
+                        },
+                        request_id=request_id,
+                    )
+                if action == "serve_frontend":
+                    name = str(payload.get("name") or "")
+                    rel_path = str(payload.get("path") or "")
+                    content, content_type = self._read_plugin_frontend_file(
+                        name, rel_path
+                    )
+                    return build_node_message(
+                        PLUGIN_MANAGE_RESPONSE,
+                        {
+                            "success": True,
+                            "action": action,
+                            "content": content,
+                            "content_type": content_type,
+                        },
+                        request_id=request_id,
+                    )
+                if action == "list_functions":
+                    name = str(payload.get("name") or "")
+                    api = self._load_plugin_api(name)
+                    functions = []
+                    if api is not None:
+                        whitelist = getattr(api, "PUBLIC_FUNCTIONS", []) or []
+                        for fn in whitelist:
+                            if callable(getattr(api, fn, None)):
+                                functions.append(fn)
+                    return build_node_message(
+                        PLUGIN_MANAGE_RESPONSE,
+                        {
+                            "success": True,
+                            "action": action,
+                            "functions": functions,
+                        },
+                        request_id=request_id,
+                    )
+                if action == "call_function":
+                    name = str(payload.get("name") or "")
+                    function = str(payload.get("function") or "")
+                    arguments = payload.get("arguments") or {}
+                    api = self._load_plugin_api(name)
+                    if api is None:
+                        return build_node_message(
+                            PLUGIN_MANAGE_RESPONSE,
+                            {
+                                "success": False,
+                                "action": action,
+                                "error": {
+                                    "code": "FUNCTION_API_NOT_FOUND",
+                                    "message": f"Plugin {name} has no private functions layer (plugin/api.py)",
+                                },
+                            },
+                            request_id=request_id,
+                        )
+                    whitelist = getattr(api, "PUBLIC_FUNCTIONS", []) or []
+                    if function not in whitelist or not callable(getattr(api, function, None)):
+                        return build_node_message(
+                            PLUGIN_MANAGE_RESPONSE,
+                            {
+                                "success": False,
+                                "action": action,
+                                "error": {
+                                    "code": "FUNCTION_NOT_ALLOWED",
+                                    "message": f"Function {function} is not in the whitelist of plugin {name}",
+                                },
+                            },
+                            request_id=request_id,
+                        )
+                    try:
+                        result = getattr(api, function)(**dict(arguments or {}))
+                    except TypeError as te:
+                        result = {"success": False, "error": f"Argument error: {te}"}
+                    except Exception as exc:
+                        result = {"success": False, "error": str(exc)}
+                    return build_node_message(
+                        PLUGIN_MANAGE_RESPONSE,
+                        {
+                            "success": True,
+                            "action": action,
+                            "result": result,
+                        },
+                        request_id=request_id,
+                    )
+                return build_node_message(
+                    PLUGIN_MANAGE_RESPONSE,
+                    {
+                        "success": False,
+                        "action": action,
+                        "error": {
+                            "code": "INVALID_ACTION",
+                            "message": f"unknown action: {action}",
+                        },
+                    },
+                    request_id=request_id,
+                )
+            finally:
+                PrettyOutput.remove_sink(sink)
+        except Exception as exc:
+            return build_node_message(
+                PLUGIN_MANAGE_RESPONSE,
+                {
+                    "success": False,
+                    "action": action,
+                    "error": {
+                        "code": "PLUGIN_MANAGE_FAILED",
+                        "message": str(exc),
+                    },
+                },
+                request_id=request_id,
+            )
+
+    @staticmethod
+    def _read_plugin_frontend_file(plugin_name: str, rel_path: str) -> tuple[str, str]:
+        """Read the content of a frontend resource file under the plugin directory.
+
+        Returns (file content, Content-Type). rel_path must be a relative path and must reside
+        inside the plugin directory (to prevent directory traversal).
+        """
+        from haijunbot.haijunbot_utils.config import get_data_dir
+
+        plugin_name = pathlib.Path(plugin_name).name
+        # The plugin may reside in the external plugin directory (data_dir/plugins/) or the builtin plugin directory (builtin/plugins/)
+        candidate_dirs = []
+        candidate_dirs.append(pathlib.Path(get_data_dir()) / "plugins" / plugin_name)
+        try:
+            from haijunbot.haijunbot_utils.template_utils import _get_builtin_dir
+
+            builtin_dir = _get_builtin_dir()
+            if builtin_dir is not None:
+                candidate_dirs.append(builtin_dir / "plugins" / plugin_name)
+        except Exception:
+            pass
+
+        safe_rel = str(rel_path or "").lstrip("/")
+        target = None
+        for plugin_dir in candidate_dirs:
+            plugin_root = plugin_dir.resolve()
+            # rel_path may be relative to the plugin directory or to the plugin's frontend subdirectory
+            for base in (plugin_root, plugin_root / "frontend"):
+                candidate = (base / safe_rel).resolve()
+                if not str(candidate).startswith(str(plugin_root)):
+                    raise ValueError("invalid frontend path")
+                if candidate.is_file():
+                    target = candidate
+                    break
+            if target is not None:
+                break
+        if target is None:
+            raise FileNotFoundError(f"frontend file not found: {rel_path}")
+        content = target.read_text(encoding="utf-8")
+        if target.suffix in (".js", ".mjs"):
+            content_type = "application/javascript"
+        elif target.suffix == ".css":
+            content_type = "text/css"
+        elif target.suffix == ".json":
+            content_type = "application/json"
+        else:
+            content_type = "text/plain"
+        return content, content_type
+
+    @staticmethod
+    def _load_plugin_api(plugin_name: str):
+        """Load the plugin's plugin/api.py private functions module (shared by master and child nodes).
+
+        Returns the module object; returns None when the plugin does not exist or has no plugin/api.py.
+        api.py is the plugin's private functions layer (not exposed to the Agent), called by the gateway frontend proxy.
+        """
+        import importlib.util
+        import sys as _sys
+        from haijunbot.haijunbot_utils.config import get_data_dir
+
+        plugin_name = pathlib.Path(plugin_name).name
+        # The plugin may reside in the external plugin directory (data_dir/plugins/) or the builtin plugin directory (builtin/plugins/)
+        candidate_dirs = []
+        candidate_dirs.append(pathlib.Path(get_data_dir()) / "plugins" / plugin_name)
+        try:
+            from haijunbot.haijunbot_utils.template_utils import _get_builtin_dir
+
+            builtin_dir = _get_builtin_dir()
+            if builtin_dir is not None:
+                candidate_dirs.append(builtin_dir / "plugins" / plugin_name)
+        except Exception:
+            pass
+        for plugin_dir in candidate_dirs:
+            api_path = plugin_dir / "plugin" / "api.py"
+            if api_path.is_file():
+                spec = importlib.util.spec_from_file_location(
+                    f"plugin_api_{plugin_name}", api_path
+                )
+                if spec is None or spec.loader is None:
+                    return None
+                module = importlib.util.module_from_spec(spec)
+                _sys.modules[f"plugin_api_{plugin_name}"] = module
+                spec.loader.exec_module(module)
+                return module
+        return None
+
+    async def _handle_node_http_proxy_request(
+        self,
+        websocket: Any,
+        message: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Handle a node HTTP proxy request.
+
+        If it is a streaming request, data chunks are sent over the WebSocket multiple times and None is returned at the end.
+        If it is a non-streaming request, a single response message is returned.
+        """
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        try:
+            if self._node_http_dispatcher is None:
+                raise RuntimeError("node http dispatcher is not configured")
+
+            # Detect whether it is a streaming request
+            is_streaming = payload.get("streaming", False)
+            if not is_streaming:
+                headers = payload.get("headers") or {}
+                accept_header = headers.get("accept", "")
+                if "text/event-stream" in accept_header:
+                    is_streaming = True
+                elif not is_streaming and payload.get("body"):
+                    try:
+                        body_str = payload.get("body")
+                        if not body_str:
+                            body_json = None
+                        else:
+                            body_json = json.loads(str(body_str))
+                        if (
+                            isinstance(body_json, dict)
+                            and body_json.get("stream") is True
+                        ):
+                            is_streaming = True
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+            if is_streaming:
+                await self._handle_streaming_http_proxy(websocket, request_id, payload)
+                return None
+            else:
+                result = await self._node_http_dispatcher(
+                    method=str(payload.get("method") or "GET"),
+                    path=str(payload.get("path") or ""),
+                    query=str(payload.get("query") or ""),
+                    headers=payload.get("headers") or {},
+                    body=str(payload.get("body") or ""),
+                    user_info=payload.get("user_info"),
+                    trusted_proxy=True,
+                )
+                return build_node_message(
+                    NODE_HTTP_PROXY_RESPONSE,
+                    result,
+                    request_id=request_id,
+                )
+        except Exception as exc:
+            logger.exception(f"[NODE HTTP PROXY] error: {exc}")
+            return build_node_message(
+                NODE_HTTP_PROXY_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "NODE_HTTP_PROXY_FAILED", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_streaming_http_proxy(
+        self,
+        websocket: Any,
+        request_id: Optional[str],
+        payload: Dict[str, Any],
+    ) -> None:
+        """Handle a streaming HTTP proxy request, sending response data chunk by chunk over the WebSocket."""
+        target_url = str(payload.get("path") or "")
+        if target_url.startswith("http_proxy/"):
+            target_url = target_url[len("http_proxy/") :]
+        elif target_url.startswith("/http_proxy/"):
+            target_url = target_url[len("/http_proxy/") :]
+
+        query = str(payload.get("query") or "")
+        if query:
+            target_url = f"{target_url}?{query}"
+
+        if not target_url.startswith(("http://", "https://")):
+            await websocket.send(
+                json.dumps(
+                    build_node_message(
+                        NODE_HTTP_PROXY_RESPONSE,
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "INVALID_URL",
+                                "message": "URL must start with http:// or https://",
+                            },
+                            "done": True,
+                        },
+                        request_id=request_id,
+                    )
+                )
+            )
+            return
+
+        logger.info(
+            f"[STREAMING HTTP PROXY] starting streaming proxy: target_url={target_url}, request_id={request_id}"
+        )
+        chunk_count = 0
+
+        proxy_headers = {
+            k: str(v)
+            for k, v in (payload.get("headers") or {}).items()
+            if k.lower() != "host"
+        }
+        if (
+            "accept" not in proxy_headers
+            or "text/event-stream" not in proxy_headers.get("accept", "")
+        ):
+            proxy_headers["accept"] = "text/event-stream"
+
+        body = str(payload.get("body") or "")
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+                async with client.stream(
+                    method=str(payload.get("method") or "POST"),
+                    url=target_url,
+                    headers=proxy_headers,
+                    content=body,
+                ) as response:
+                    async for chunk in response.aiter_text():
+                        chunk_count += 1
+                        msg = build_node_message(
+                            NODE_HTTP_PROXY_RESPONSE,
+                            {"chunk": chunk},
+                            request_id=request_id,
+                        )
+                        await websocket.send(json.dumps(msg))
+
+            await websocket.send(
+                json.dumps(
+                    build_node_message(
+                        NODE_HTTP_PROXY_RESPONSE,
+                        {"done": True},
+                        request_id=request_id,
+                    )
+                )
+            )
+        except httpx.TimeoutException:
+            await websocket.send(
+                json.dumps(
+                    build_node_message(
+                        NODE_HTTP_PROXY_RESPONSE,
+                        {
+                            "success": False,
+                            "error": {"code": "TIMEOUT", "message": "Request timeout"},
+                            "done": True,
+                        },
+                        request_id=request_id,
+                    )
+                )
+            )
+        except httpx.RequestError as e:
+            logger.exception(f"[STREAMING HTTP PROXY] Request error: {e}")
+            await websocket.send(
+                json.dumps(
+                    build_node_message(
+                        NODE_HTTP_PROXY_RESPONSE,
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "REQUEST_ERROR",
+                                "message": f"Request failed: {str(e)}",
+                            },
+                            "done": True,
+                        },
+                        request_id=request_id,
+                    )
+                )
+            )
+        except Exception as e:
+            logger.exception(f"[STREAMING HTTP PROXY] Unexpected error: {e}")
+            await websocket.send(
+                json.dumps(
+                    build_node_message(
+                        NODE_HTTP_PROXY_RESPONSE,
+                        {
+                            "success": False,
+                            "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+                            "done": True,
+                        },
+                        request_id=request_id,
+                    )
+                )
+            )
+
+    def _handle_agent_stop_request(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        agent_id = str(payload.get("agent_id") or "").strip()
+        try:
+            result = self._agent_manager.stop_agent(agent_id)
+            return build_node_message(
+                AGENT_STOP_RESPONSE,
+                {"success": True, "result": result},
+                request_id=request_id,
+            )
+        except KeyError as exc:
+            return build_node_message(
+                AGENT_STOP_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "AGENT_NOT_FOUND", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            return build_node_message(
+                AGENT_STOP_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "AGENT_STOP_FAILED", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    def _handle_agent_delete_request(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        agent_id = str(payload.get("agent_id") or "").strip()
+        try:
+            result = self._agent_manager.delete_agent(agent_id)
+            return build_node_message(
+                AGENT_DELETE_RESPONSE,
+                {"success": True, "result": result},
+                request_id=request_id,
+            )
+        except KeyError as exc:
+            return build_node_message(
+                AGENT_DELETE_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "AGENT_NOT_FOUND", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            return build_node_message(
+                AGENT_DELETE_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "AGENT_DELETE_FAILED", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    def _handle_agent_regenerate_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Handle an Agent lossless regeneration request (save session -> delete -> rebuild).
+
+        The agent_id stays the same after regeneration; only the port may change. The entire flow is handled on the gateway side,
+        allowing an Agent to regenerate itself losslessly without interrupting the process.
+        """
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        agent_id = str(payload.get("agent_id") or "").strip()
+        try:
+            result = self._agent_manager.regenerate_agent(agent_id)
+            return build_node_message(
+                AGENT_REGENERATE_RESPONSE,
+                {"success": True, "result": result},
+                request_id=request_id,
+            )
+        except KeyError as exc:
+            return build_node_message(
+                AGENT_REGENERATE_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "AGENT_NOT_FOUND", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            return build_node_message(
+                AGENT_REGENERATE_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "AGENT_REGENERATE_FAILED", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_agent_http_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        try:
+            from starlette.requests import Request as StarletteRequest
+
+            scope = {
+                "type": "http",
+                "method": payload.get("method", "GET"),
+                "path": "/" + str(payload.get("path") or "").lstrip("/"),
+                "query_string": str(payload.get("query") or "").encode("utf-8"),
+                "headers": [
+                    (str(k).lower().encode("utf-8"), str(v).encode("utf-8"))
+                    for k, v in (payload.get("headers") or {}).items()
+                ],
+                "client": ("127.0.0.1", 0),
+                "server": ("127.0.0.1", 0),
+                "scheme": "http",
+            }
+            body = str(payload.get("body") or "").encode("utf-8")
+
+            async def receive() -> Dict[str, Any]:
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            request = StarletteRequest(scope, receive)
+            response = await self._agent_proxy_manager.proxy_http_request(
+                request,
+                str(payload.get("agent_id") or ""),
+                str(payload.get("path") or ""),
+            )
+            response_body = (
+                response.body.decode("utf-8", errors="replace") if response.body else ""
+            )
+            headers = {k: v for k, v in response.headers.items()}
+            return build_node_message(
+                AGENT_HTTP_RESPONSE,
+                {
+                    "success": True,
+                    "status_code": response.status_code,
+                    "headers": headers,
+                    "body": response_body,
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            return build_node_message(
+                AGENT_HTTP_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "HTTP_PROXY_FAILED",
+                        "message": str(exc),
+                    },
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_agent_ws_request(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        try:
+            agent_id = str(payload.get("agent_id") or "")
+            ws_path = str(payload.get("path") or "ws")
+            port = await self._agent_proxy_manager.get_agent_port(agent_id)
+            agent_url = f"ws://127.0.0.1:{port}/ws"
+            auth_token = os.environ.get("HAIJUNBOT_AUTH_TOKEN")
+            subprotocols: list[str] = ["haijunbot-ws"]
+            if auth_token:
+                subprotocols.append(f"haijunbot-token.{auth_token}")
+            async with websockets.connect(
+                agent_url,
+                close_timeout=30,
+                proxy=None,
+                subprotocols=subprotocols,  # ty: ignore[invalid-argument-type]
+            ) as agent_ws:
+                for item in payload.get("messages") or []:
+                    await agent_ws.send(str(item))
+                collected: list[str] = []
+                while True:
+                    try:
+                        reply = await asyncio.wait_for(agent_ws.recv(), timeout=0.5)
+                        collected.append(
+                            reply if isinstance(reply, str) else reply.decode()
+                        )
+                    except asyncio.TimeoutError:
+                        break
+            return build_node_message(
+                AGENT_WS_RESPONSE,
+                {
+                    "success": True,
+                    "messages": collected,
+                    "path": ws_path,
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            return build_node_message(
+                AGENT_WS_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "WS_PROXY_FAILED",
+                        "message": str(exc),
+                    },
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_agent_ws_open_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        session_id = str(payload.get("session_id") or "").strip()
+        agent_id = str(payload.get("agent_id") or "").strip()
+        logger.info(
+            "[NODE AGENT WS OPEN] request_id=%s agent_id=%s session_id=%s",
+            request_id,
+            agent_id,
+            session_id,
+        )
+        try:
+            if not session_id:
+                raise ValueError("session_id is required")
+            if not agent_id:
+                raise ValueError("agent_id is required")
+            port = await self._agent_proxy_manager.get_agent_port(agent_id)
+            agent_url = f"ws://127.0.0.1:{port}/ws"
+            auth_token = os.environ.get("HAIJUNBOT_AUTH_TOKEN")
+            subprotocols: list[str] = ["haijunbot-ws"]
+            if auth_token:
+                subprotocols.append(f"haijunbot-token.{auth_token}")
+            logger.info(
+                "[NODE AGENT WS OPEN] connecting agent_id=%s session_id=%s agent_url=%s subprotocol_count=%s",
+                agent_id,
+                session_id,
+                agent_url,
+                len(subprotocols),
+            )
+            agent_ws = await websockets.connect(
+                agent_url,
+                close_timeout=30,
+                proxy=None,
+                subprotocols=subprotocols,  # ty: ignore[invalid-argument-type]
+            )
+            self._agent_ws_sessions[session_id] = agent_ws
+            logger.info(
+                "[NODE AGENT WS OPEN] success agent_id=%s session_id=%s",
+                agent_id,
+                session_id,
+            )
+            return build_node_message(
+                AGENT_WS_OPEN_RESPONSE,
+                {"success": True, "session_id": session_id},
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[NODE AGENT WS OPEN] failed request_id=%s agent_id=%s session_id=%s error=%s",
+                request_id,
+                agent_id,
+                session_id,
+                exc,
+            )
+            return build_node_message(
+                AGENT_WS_OPEN_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "WS_OPEN_FAILED", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_agent_ws_send_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        session_id = str(payload.get("session_id") or "").strip()
+        logger.info(
+            "[NODE AGENT WS SEND] request_id=%s session_id=%s message_count=%s",
+            request_id,
+            session_id,
+            len(payload.get("messages") or []),
+        )
+        try:
+            # Heartbeat interception: if the message is ping, reply pong directly without forwarding to the Agent
+            messages = payload.get("messages") or []
+            if len(messages) == 1:
+                try:
+                    msg_data = (
+                        json.loads(messages[0])
+                        if isinstance(messages[0], str)
+                        else messages[0]
+                    )
+                    if isinstance(msg_data, dict) and msg_data.get("type") == "ping":
+                        logger.debug("[HEARTBEAT] Ping received, sending pong directly")
+                        return build_node_message(
+                            AGENT_WS_SEND_RESPONSE,
+                            {"success": True, "session_id": session_id, "pong": True},
+                            request_id=request_id,
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    pass  # Non-JSON message, continue normal forwarding
+
+            agent_ws = self._agent_ws_sessions.get(session_id)
+            if agent_ws is None:
+                raise RuntimeError(f"ws session not found: {session_id}")
+            # Clean up closed sessions
+            if agent_ws.state != State.OPEN:
+                self._agent_ws_sessions.pop(session_id, None)
+                raise RuntimeError(f"ws session already closed: {session_id}")
+            for item in messages:
+                await agent_ws.send(str(item))
+            return build_node_message(
+                AGENT_WS_SEND_RESPONSE,
+                {"success": True, "session_id": session_id},
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[NODE AGENT WS SEND] failed request_id=%s session_id=%s error=%s",
+                request_id,
+                session_id,
+                exc,
+            )
+            return build_node_message(
+                AGENT_WS_SEND_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "WS_SEND_FAILED", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_agent_ws_recv_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        session_id = str(payload.get("session_id") or "").strip()
+        timeout = float(payload.get("timeout") or 0.5)
+        try:
+            agent_ws = self._agent_ws_sessions.get(session_id)
+            if agent_ws is None:
+                raise RuntimeError(f"ws session not found: {session_id}")
+            # Clean up closed sessions
+            if agent_ws.state != State.OPEN:
+                self._agent_ws_sessions.pop(session_id, None)
+                raise RuntimeError(f"ws session already closed: {session_id}")
+            messages: list[str] = []
+            while True:
+                try:
+                    reply = await asyncio.wait_for(agent_ws.recv(), timeout=timeout)
+                    messages.append(reply if isinstance(reply, str) else reply.decode())
+                    timeout = 0.05
+                except asyncio.TimeoutError:
+                    break
+            logger.info(
+                "[NODE AGENT WS RECV] request_id=%s session_id=%s message_count=%s",
+                request_id,
+                session_id,
+                len(messages),
+            )
+            return build_node_message(
+                AGENT_WS_RECV_RESPONSE,
+                {"success": True, "session_id": session_id, "messages": messages},
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[NODE AGENT WS RECV] failed request_id=%s session_id=%s error=%s",
+                request_id,
+                session_id,
+                exc,
+            )
+            return build_node_message(
+                AGENT_WS_RECV_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "WS_RECV_FAILED", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_agent_ws_close_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        session_id = str(payload.get("session_id") or "").strip()
+        logger.info(
+            "[NODE AGENT WS CLOSE] request_id=%s session_id=%s",
+            request_id,
+            session_id,
+        )
+        agent_ws = self._agent_ws_sessions.pop(session_id, None)
+        try:
+            if agent_ws is not None:
+                await agent_ws.close()
+            return build_node_message(
+                AGENT_WS_CLOSE_RESPONSE,
+                {"success": True, "session_id": session_id},
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[NODE AGENT WS CLOSE] failed request_id=%s session_id=%s error=%s",
+                request_id,
+                session_id,
+                exc,
+            )
+            return build_node_message(
+                AGENT_WS_CLOSE_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "WS_CLOSE_FAILED", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    def _handle_parse_orchestration_request(
+        self, raw_path: str, request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """Read and parse the orchestration YAML file (child side), returning the agents list."""
+        try:
+            if not raw_path or raw_path == "~":
+                target_path = pathlib.Path.home()
+            else:
+                target_path = pathlib.Path(raw_path).expanduser()
+            target_path = target_path.resolve()
+
+            if not target_path.exists():
+                return build_node_message(
+                    DIRECTORY_LIST_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "NOT_FOUND",
+                            "message": f"File does not exist: {raw_path}",
+                        },
+                    },
+                    request_id=request_id,
+                )
+            if not target_path.is_file():
+                return build_node_message(
+                    DIRECTORY_LIST_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "NOT_A_FILE",
+                            "message": f"Path is not a file: {raw_path}",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            max_size = 5 * 1024 * 1024
+            if target_path.stat().st_size > max_size:
+                return build_node_message(
+                    DIRECTORY_LIST_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "FILE_TOO_LARGE",
+                            "message": f"File exceeds {max_size} bytes",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            try:
+                from haijunbot.haijunbot_tools.orchestration_loader import load_orchestration
+
+                config = load_orchestration(target_path)
+            except Exception as e:  # pylint: disable=broad-except
+                return build_node_message(
+                    DIRECTORY_LIST_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "ORCHESTRATION_PARSE_ERROR",
+                            "message": f"Invalid orchestration file: {e}",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            if not isinstance(config, dict):
+                return build_node_message(
+                    DIRECTORY_LIST_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "INVALID_ORCHESTRATION",
+                            "message": "Orchestration file must be a mapping",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            agents = config.get("agents")
+            if agents is None:
+                return build_node_message(
+                    DIRECTORY_LIST_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "INVALID_ORCHESTRATION",
+                            "message": "Missing 'agents' field in orchestration file",
+                        },
+                    },
+                    request_id=request_id,
+                )
+            if not isinstance(agents, list):
+                return build_node_message(
+                    DIRECTORY_LIST_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "INVALID_ORCHESTRATION",
+                            "message": "'agents' field must be a list",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            # has_flow: whether the orchestration file has a non-empty flow field (lets the frontend decide between "run pipeline" and "create Agent")
+            flow = config.get("flow")
+            has_flow = isinstance(flow, list) and len(flow) > 0
+
+            # Preview DAG nodes: reuse the pipeline_runner DAG building logic to stay consistent with actual execution.
+            # Return an empty array when there is no flow or building fails (the frontend shows a hint based on this without blocking agent parsing).
+            nodes: list = []
+            if has_flow:
+                try:
+                    from haijunbot.haijunbot_tools.pipeline_runner import PipelineRunnerTool
+
+                    agents_by_name = {a.get("name"): a for a in agents if a.get("name")}
+                    default_on_error = str(config.get("default_on_error") or "abort").strip()
+                    dag = PipelineRunnerTool()._build_dag(flow, agents_by_name, default_on_error)
+                    if dag.get("success"):
+                        nodes = dag.get("nodes", [])
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception("[ORCHESTRATION] build dag for preview failed")
+                    nodes = []
+
+            return build_node_message(
+                DIRECTORY_LIST_RESPONSE,
+                {
+                    "success": True,
+                    "data": {
+                        "path": str(target_path),
+                        "agents": agents,
+                        "has_flow": has_flow,
+                        "nodes": nodes,
+                    },
+                },
+                request_id=request_id,
+            )
+        except PermissionError:
+            return build_node_message(
+                DIRECTORY_LIST_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied",
+                    },
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[NODE] parse orchestration failed path=%s error=%r", raw_path, exc
+            )
+            return build_node_message(
+                DIRECTORY_LIST_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "INTERNAL_ERROR", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    def _handle_run_orchestration_request(
+        self, payload: Dict[str, Any], request_id: Optional[str]
+    ) -> Dict[str, Any]:
+        """Run an orchestration pipeline on the child node (child side).
+
+        Directly calls the built-in tool PipelineRunnerTool (the same path an Agent uses); because
+        execute blocks, it runs in a background thread and returns immediately; the real pipeline_id is
+        generated inside execute and broadcast with the pipeline_start event.
+        """
+        import threading
+
+        orchestration_file = str(payload.get("orchestration_file") or "").strip()
+        working_dir = str(payload.get("working_dir") or "").strip() or "."
+        if not orchestration_file:
+            return build_node_message(
+                DIRECTORY_LIST_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_ARGUMENT",
+                        "message": "orchestration_file is required",
+                    },
+                },
+                request_id=request_id,
+            )
+        try:
+            from haijunbot.haijunbot_tools.pipeline_runner import PipelineRunnerTool
+
+            tool = PipelineRunnerTool()
+            args: Dict[str, Any] = {
+                "orchestration_file": orchestration_file,
+                "working_dir": working_dir,
+                "approve": bool(payload.get("approve", False)),
+                "dry_run": bool(payload.get("dry_run", False)),
+            }
+            if payload.get("max_workers") is not None:
+                args["max_workers"] = int(payload.get("max_workers"))
+        except Exception as exc:
+            logger.exception(
+                "[NODE] prepare run orchestration failed error=%r", exc
+            )
+            return build_node_message(
+                DIRECTORY_LIST_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "INTERNAL_ERROR", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+        def _run() -> None:
+            try:
+                result = tool.execute(args)
+                if isinstance(result, dict) and not result.get("success", True):
+                    logger.warning(
+                        "[NODE] pipeline run finished with error: %r",
+                        result.get("error"),
+                    )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("[NODE] pipeline run failed error=%r", exc)
+
+        threading.Thread(
+            target=_run,
+            name="pipeline-run",
+            daemon=True,
+        ).start()
+        return build_node_message(
+            DIRECTORY_LIST_RESPONSE,
+            {"success": True, "data": {"started": True}},
+            request_id=request_id,
+        )
+
+    def _handle_directory_list_request(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        raw_path = str(payload.get("path") or "").strip()
+        if payload.get("parse_orchestration"):
+            return self._handle_parse_orchestration_request(raw_path, request_id)
+        # Orchestration pipeline run requests reuse this message type: call the pipeline_runner tool directly
+        if payload.get("run_orchestration"):
+            return self._handle_run_orchestration_request(payload, request_id)
+        logger.info(
+            "[NODE] _handle_directory_list_request path=%s request_id=%s",
+            raw_path,
+            request_id,
+        )
+        try:
+            if not raw_path or raw_path == "~":
+                target_path = pathlib.Path.home()
+            else:
+                target_path = pathlib.Path(raw_path).expanduser()
+
+            target_path = target_path.resolve()
+
+            if not target_path.exists():
+                return build_node_message(
+                    DIRECTORY_LIST_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "NOT_FOUND",
+                            "message": f"Path does not exist: {raw_path}",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            if not target_path.is_dir():
+                return build_node_message(
+                    DIRECTORY_LIST_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "NOT_A_DIRECTORY",
+                            "message": f"Path is not a directory: {raw_path}",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            parent_path = None
+            if target_path.parent != target_path:
+                parent_path = str(target_path.parent)
+
+            items = []
+            try:
+                for entry in target_path.iterdir():
+                    if not entry.name.startswith("."):
+                        entry_type = "directory" if entry.is_dir() else "file"
+                        items.append(
+                            {
+                                "name": entry.name,
+                                "path": str(entry),
+                                "type": entry_type,
+                            }
+                        )
+                items.sort(key=lambda item: (item["type"] != "directory", item["name"]))
+            except PermissionError:
+                pass
+
+            logger.info(
+                "[NODE] directory list success path=%s resolved=%s item_count=%s request_id=%s",
+                raw_path,
+                target_path,
+                len(items),
+                request_id,
+            )
+            return build_node_message(
+                DIRECTORY_LIST_RESPONSE,
+                {
+                    "success": True,
+                    "data": {
+                        "current_path": str(target_path),
+                        "parent_path": parent_path,
+                        "items": items,
+                    },
+                },
+                request_id=request_id,
+            )
+        except PermissionError:
+            logger.warning(
+                "[NODE] directory list permission denied path=%s request_id=%s",
+                raw_path,
+                request_id,
+            )
+            return build_node_message(
+                DIRECTORY_LIST_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied",
+                    },
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[NODE] directory list failed path=%s request_id=%s error=%r",
+                raw_path,
+                request_id,
+                exc,
+            )
+            return build_node_message(
+                DIRECTORY_LIST_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "DIRECTORY_LIST_FAILED",
+                        "message": str(exc),
+                    },
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_config_sync_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Handle a config sync request (child side)."""
+        request_id = message.get("request_id")
+        payload = message.get("payload") or {}
+        config_sections = payload.get("config_sections", [])
+        config_data = payload.get("config_data", {})
+
+        logger.info(
+            "[NODE CONFIG SYNC] child handling config sync request_id=%s sections=%s",
+            request_id,
+            config_sections,
+        )
+
+        config_file = None
+        backup_file = None
+        try:
+            # Get the config file path
+            config_file = pathlib.Path.home() / ".haijunbot" / "config.yaml"
+
+            # Back up the original config file
+            backup_file = config_file.with_suffix(".yaml.bak")
+            if config_file.exists():
+                shutil.copy2(config_file, backup_file)
+                logger.info("[NODE CONFIG SYNC] backed up config to %s", backup_file)
+            # Read the existing config
+            existing_config: Dict[str, Any] = {}
+            if config_file.exists():
+                with open(config_file, "r", encoding="utf-8") as f:
+                    existing_config = yaml.safe_load(f) or {}
+
+            # Update the config
+            updated_config = existing_config.copy()
+            for section in config_sections:
+                if section in config_data:
+                    updated_config[section] = config_data[section]
+                    logger.info("[NODE CONFIG SYNC] updated section: %s", section)
+
+            # Save the config
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(config_file, "w", encoding="utf-8") as f:
+                yaml.safe_dump(
+                    updated_config, f, allow_unicode=True, default_flow_style=False
+                )
+
+            logger.info(
+                "[NODE CONFIG SYNC] child config sync completed request_id=%s",
+                request_id,
+            )
+            return build_node_message(
+                CONFIG_SYNC_RESPONSE,
+                {
+                    "success": True,
+                    "data": {
+                        "message": "Config sync succeeded",
+                        "backup_file": str(backup_file),
+                    },
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[NODE CONFIG SYNC] child config sync failed request_id=%s error=%s",
+                request_id,
+                exc,
+            )
+            # Try to restore the backup
+            try:
+                if (
+                    backup_file is not None
+                    and config_file is not None
+                    and backup_file.exists()
+                ):
+                    shutil.copy2(backup_file, config_file)
+                    logger.info("[NODE CONFIG SYNC] restored config from backup")
+            except Exception as restore_exc:
+                logger.error(
+                    "[NODE CONFIG SYNC] failed to restore backup: %s", restore_exc
+                )
+
+            return build_node_message(
+                CONFIG_SYNC_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "CONFIG_SYNC_ERROR", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_config_get_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Handle a config get request (child side)."""
+        request_id = message.get("request_id")
+        payload = message.get("payload") or {}
+        config_sections = payload.get("config_sections", [])
+
+        logger.info(
+            "[NODE CONFIG GET] child handling config get request_id=%s sections=%s",
+            request_id,
+            config_sections,
+        )
+
+        try:
+            # Get the config file path
+            config_file = pathlib.Path.home() / ".haijunbot" / "config.yaml"
+
+            # Read the config
+            config_data: Dict[str, Any] = {}
+            if config_file.exists():
+                with open(config_file, "r", encoding="utf-8") as f:
+                    config_data = yaml.safe_load(f) or {}
+
+            # If sections are specified, return only those sections
+            if config_sections:
+                filtered_data = {}
+                for section in config_sections:
+                    if section in config_data:
+                        filtered_data[section] = config_data[section]
+                config_data = filtered_data
+
+            logger.info(
+                "[NODE CONFIG GET] child config get completed request_id=%s",
+                request_id,
+            )
+            return build_node_message(
+                CONFIG_GET_RESPONSE,
+                {
+                    "success": True,
+                    "data": {
+                        "config_data": config_data,
+                    },
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[NODE CONFIG GET] child config get failed request_id=%s error=%s",
+                request_id,
+                exc,
+            )
+            return build_node_message(
+                CONFIG_GET_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "CONFIG_GET_ERROR", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_config_set_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Handle a config set request (child side)."""
+        request_id = message.get("request_id")
+        payload = message.get("payload") or {}
+        config_data = payload.get("config_data", {})
+
+        logger.info(
+            "[NODE CONFIG SET] child handling config set request_id=%s",
+            request_id,
+        )
+
+        config_file = None
+        backup_file = None
+        try:
+            # Get the config file path
+            config_file = pathlib.Path.home() / ".haijunbot" / "config.yaml"
+
+            # Back up the original config file
+            backup_file = config_file.with_suffix(".yaml.bak")
+            if config_file.exists():
+                shutil.copy2(config_file, backup_file)
+                logger.info("[NODE CONFIG SET] backed up config to %s", backup_file)
+            # Read the existing config
+            existing_config: Dict[str, Any] = {}
+            if config_file.exists():
+                with open(config_file, "r", encoding="utf-8") as f:
+                    existing_config = yaml.safe_load(f) or {}
+
+            # Update the config
+            updated_config = existing_config.copy()
+            updated_config.update(config_data)
+
+            # Save the config
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(config_file, "w", encoding="utf-8") as f:
+                yaml.safe_dump(
+                    updated_config, f, allow_unicode=True, default_flow_style=False
+                )
+
+            logger.info(
+                "[NODE CONFIG SET] child config set completed request_id=%s",
+                request_id,
+            )
+            return build_node_message(
+                CONFIG_SET_RESPONSE,
+                {
+                    "success": True,
+                    "data": {
+                        "message": "Config set successfully",
+                        "backup_file": str(backup_file),
+                    },
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[NODE CONFIG SET] child config set failed request_id=%s error=%s",
+                request_id,
+                exc,
+            )
+            # Try to restore the backup
+            try:
+                if (
+                    backup_file is not None
+                    and config_file is not None
+                    and backup_file.exists()
+                ):
+                    shutil.copy2(backup_file, config_file)
+                    logger.info("[NODE CONFIG SET] restored config from backup")
+            except Exception as restore_exc:
+                logger.error(
+                    "[NODE CONFIG SET] failed to restore backup: %s", restore_exc
+                )
+
+            return build_node_message(
+                CONFIG_SET_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "CONFIG_SET_ERROR", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+
+class NodeTerminalOutputProxy:
+    """Proxy Publisher that pushes child-side terminal output to the master via NODE_TERMINAL_OUTPUT.
+
+    TerminalSession._publish_output calls publish() in a synchronous thread,
+    so asyncio.run_coroutine_threadsafe is used to bridge to the event loop.
+    """
+
+    def __init__(self, ws: Any, loop: asyncio.AbstractEventLoop) -> None:
+        self._ws = ws
+        self._loop = loop
+
+    def publish(self, message: Any, session_id: str = "default") -> None:
+        """Send the terminal output message to the master via NODE_TERMINAL_OUTPUT."""
+        try:
+            output_msg = json.dumps(
+                build_node_message(
+                    NODE_TERMINAL_OUTPUT,
+                    {
+                        "session_id": session_id,
+                        "message": message,
+                    },
+                )
+            )
+            future = asyncio.run_coroutine_threadsafe(
+                self._ws.send(output_msg), self._loop
+            )
+            future.result(timeout=5)
+        except Exception as e:
+            logger.warning("[NODE TERMINAL PROXY] failed to send output: %s", e)
+
+
+class ChildNodeClient:
+    def __init__(
+        self,
+        node_runtime: NodeRuntime,
+        agent_manager: AgentManager,
+        agent_proxy_manager: Any,
+        node_connection_manager: NodeConnectionManager,
+    ) -> None:
+        self._node_runtime = node_runtime
+        self._agent_manager = agent_manager
+        self._agent_proxy_manager = agent_proxy_manager
+        self._node_connection_manager = node_connection_manager
+        self._ws: Optional[Any] = None
+        self._task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception as e:
+                save_exception(
+                    e, module="haijunbot_web_gateway.node_manager", function="start"
+                )
+                pass
+            self._ws = None
+
+    async def _run(self) -> None:
+        config = self._node_runtime.config
+        if not config.master_url:
+            self._node_runtime.token_sync_state.mark_failed("master_url is missing")
+            self._node_runtime.mark_degraded()
+            return
+
+        master_url = config.master_url.rstrip("/")
+        if master_url.startswith("https://"):
+            ws_url = "wss://" + master_url[len("https://") :]
+        elif master_url.startswith("http://"):
+            ws_url = "ws://" + master_url[len("http://") :]
+        else:
+            ws_url = master_url
+        ws_url = ws_url.rstrip("/") + "/ws/node"
+
+        while True:
+            try:
+                await self._connect_once(ws_url)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("[NODE] child node connection failed: %s", exc)
+                self._node_runtime.token_sync_state.mark_failed(
+                    str(exc), source_node_id="master"
+                )
+                self._node_runtime.mark_degraded()
+            finally:
+                if self._ws is not None:
+                    try:
+                        await self._ws.close()
+                    except Exception as e:
+                        save_exception(
+                            e,
+                            module="haijunbot_web_gateway.node_manager",
+                            function="start",
+                        )
+                        pass
+                    self._ws = None
+
+            reconnect_delay = random.uniform(
+                CHILD_RECONNECT_MIN_SECONDS,
+                CHILD_RECONNECT_MAX_SECONDS,
+            )
+            logger.info("[NODE] reconnect to master in %.2f seconds", reconnect_delay)
+            await asyncio.sleep(reconnect_delay)
+
+    def _get_proxy_for_url(self, ws_url: str) -> Optional[str]:
+        """
+        Intelligently determine whether a proxy should be used for the URL.
+
+        Rules:
+        1. If the target address is an intranet IP (10.x.x.x, 172.16-31.x.x, 192.168.x.x), return None (no proxy)
+        2. If the target address is in the no_proxy list (CIDR format supported), return None
+        3. Otherwise return the http_proxy environment variable value (may be None)
+        """
+        # Parse the URL to get the hostname and port
+        parsed = urlparse(ws_url)
+        hostname = parsed.hostname
+        if not hostname:
+            return os.environ.get("http_proxy")
+
+        # Try to resolve the hostname to an IP address
+        try:
+            ip_addr = ipaddress.ip_address(hostname)
+        except ValueError:
+            # If it is a domain name, try DNS resolution
+            import socket
+
+            try:
+                ip_str = socket.gethostbyname(hostname)
+                ip_addr = ipaddress.ip_address(ip_str)
+            except (socket.gaierror, OSError):
+                # DNS resolution failed, fall back to the environment variable
+                return os.environ.get("http_proxy")
+
+        # Check whether it is a private IP address (intranet)
+        if ip_addr.is_private:
+            logger.debug("[PROXY] %s is private IP, bypassing proxy", hostname)
+            return None
+
+        # Check the no_proxy environment variable (parsed manually to support CIDR format)
+        no_proxy = os.environ.get("no_proxy", "")
+        if no_proxy:
+            for entry in no_proxy.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                # Handle CIDR format (e.g. 10.0.0.0/8)
+                if "/" in entry:
+                    try:
+                        network = ipaddress.ip_network(entry, strict=False)
+                        if ip_addr in network:
+                            logger.debug(
+                                "[PROXY] %s matches CIDR %s in no_proxy, bypassing proxy",
+                                hostname,
+                                entry,
+                            )
+                            return None
+                    except ValueError:
+                        continue
+                # Handle plain IP or domain name matching
+                elif entry.startswith("."):
+                    # Domain suffix matching (e.g. .example.com)
+                    if hostname.endswith(entry):
+                        logger.debug(
+                            "[PROXY] %s matches domain suffix %s in no_proxy, bypassing proxy",
+                            hostname,
+                            entry,
+                        )
+                        return None
+                elif entry == hostname or entry == "*":
+                    logger.debug(
+                        "[PROXY] %s matches %s in no_proxy, bypassing proxy",
+                        hostname,
+                        entry,
+                    )
+                    return None
+
+        # By default, return the http_proxy configuration
+        proxy_url = os.environ.get("http_proxy")
+        if proxy_url:
+            logger.debug("[PROXY] Using proxy %s for %s", proxy_url, hostname)
+        return proxy_url
+
+    async def _connect_once(self, ws_url: str) -> None:
+        config = self._node_runtime.config
+        # Intelligently determine whether a proxy is needed: check whether the target address is on the intranet or in the no_proxy list
+        proxy_url = self._get_proxy_for_url(ws_url)
+        self._ws = await websockets.connect(ws_url, close_timeout=10, proxy=proxy_url)
+        await self._ws.send(
+            json.dumps(
+                build_node_message(
+                    NODE_AUTH,
+                    {
+                        "node_id": config.effective_node_id,
+                        "secret": config.node_secret,
+                        "capabilities": {
+                            "agent_creation": True,
+                            "agent_proxy": True,
+                        },
+                    },
+                )
+            )
+        )
+        raw_message = await self._ws.recv()
+        message = json.loads(raw_message)
+        if (
+            not isinstance(message, dict)
+            or message.get("type") != NODE_AUTH_RESULT
+            or not (message.get("payload") or {}).get("success")
+        ):
+            raise RuntimeError("node auth failed")
+
+        token = (message.get("payload") or {}).get("token")
+        if not token:
+            raise RuntimeError("missing token from master")
+
+        # Save the old token for authenticating to running Agents
+        old_token = os.environ.get("HAIJUNBOT_AUTH_TOKEN")
+
+        # Update this node's token
+        os.environ["HAIJUNBOT_AUTH_TOKEN"] = token
+        self._node_runtime.token_sync_state.mark_success("master")
+        self._node_runtime.mark_ready()
+
+        # If the token changed, notify all local Agents to update their token
+        if old_token and old_token != token:
+            await self._notify_agents_token_update(old_token, token)
+        logger.info(
+            "[NODE] child connected to master node_id=%s ws_url=%s",
+            config.effective_node_id,
+            ws_url,
+        )
+
+        async def heartbeat_loop() -> None:
+            while True:
+                await asyncio.sleep(CHILD_HEARTBEAT_INTERVAL_SECONDS)
+                if self._ws is None:
+                    raise RuntimeError("node websocket is closed")
+
+                # Get the system info and node description
+                system_info = get_system_info()
+                description = get_node_description()
+
+                await self._ws.send(
+                    json.dumps(
+                        build_node_message(
+                            NODE_HEARTBEAT,
+                            {
+                                "node_id": config.effective_node_id,
+                                "system_info": system_info,
+                                "description": description,
+                                "version": HAIJUNBOT_VERSION,
+                            },
+                        )
+                    )
+                )
+
+        async def recv_loop() -> None:
+            while True:
+                if self._ws is None:
+                    raise RuntimeError("node websocket is closed")
+                raw_next_message = await self._ws.recv()
+                next_message = json.loads(raw_next_message)
+                if not isinstance(next_message, dict):
+                    continue
+                message_type = next_message.get("type")
+                request_id = next_message.get("request_id")
+                logger.info(
+                    "[NODE] child recv message type=%s request_id=%s",
+                    message_type,
+                    request_id,
+                )
+                if message_type == AGENT_CREATE_REQUEST:
+                    response = (
+                        self._node_connection_manager._handle_agent_create_request(
+                            next_message, "master"
+                        )
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_HTTP_REQUEST:
+                    response = (
+                        await self._node_connection_manager._handle_agent_http_request(
+                            next_message
+                        )
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == NODE_HTTP_PROXY_REQUEST:
+                    response = await self._node_connection_manager._handle_node_http_proxy_request(
+                        self._ws, next_message
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_LIST_REQUEST:
+                    response = self._node_connection_manager._handle_agent_list_request(
+                        next_message
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_STOP_REQUEST:
+                    response = self._node_connection_manager._handle_agent_stop_request(
+                        next_message
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_DELETE_REQUEST:
+                    response = (
+                        self._node_connection_manager._handle_agent_delete_request(
+                            next_message
+                        )
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_REGENERATE_REQUEST:
+                    response = (
+                        self._node_connection_manager._handle_agent_regenerate_request(
+                            next_message
+                        )
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_WS_REQUEST:
+                    response = (
+                        await self._node_connection_manager._handle_agent_ws_request(
+                            next_message
+                        )
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_WS_OPEN_REQUEST:
+                    response = await self._node_connection_manager._handle_agent_ws_open_request(
+                        next_message
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_WS_SEND_REQUEST:
+                    response = await self._node_connection_manager._handle_agent_ws_send_request(
+                        next_message
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_WS_RECV_REQUEST:
+                    response = await self._node_connection_manager._handle_agent_ws_recv_request(
+                        next_message
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == AGENT_WS_CLOSE_REQUEST:
+                    response = await self._node_connection_manager._handle_agent_ws_close_request(
+                        next_message
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == DIRECTORY_LIST_REQUEST:
+                    response = (
+                        self._node_connection_manager._handle_directory_list_request(
+                            next_message
+                        )
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == CONFIG_SYNC_REQUEST:
+                    response = (
+                        await self._node_connection_manager._handle_config_sync_request(
+                            next_message
+                        )
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == CONFIG_GET_REQUEST:
+                    response = (
+                        await self._node_connection_manager._handle_config_get_request(
+                            next_message
+                        )
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == CONFIG_SET_REQUEST:
+                    response = (
+                        await self._node_connection_manager._handle_config_set_request(
+                            next_message
+                        )
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == NODE_TERMINAL_REQUEST:
+                    response = await self._handle_node_terminal_request(next_message)
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == SERVICE_RESTART_REQUEST:
+                    response = await self._handle_service_restart_request(next_message)
+                    await self._ws.send(json.dumps(response))
+                    continue
+                if message_type == CODE_UPDATE_TO_MAIN_REQUEST:
+                    response = await self._handle_code_update_to_main_request(
+                        next_message
+                    )
+                    await self._ws.send(json.dumps(response))
+                    continue
+                logger.warning(
+                    "[NODE] child unhandled message type=%s request_id=%s",
+                    message_type,
+                    request_id,
+                )
+
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
+        recv_task = asyncio.create_task(recv_loop())
+        done, pending = await asyncio.wait(
+            {heartbeat_task, recv_task},
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
+        for task in pending:
+            task.cancel()
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                raise exc
+
+    async def _handle_node_terminal_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Handle a terminal request forwarded by the master (child side)."""
+        payload = message.get("payload") or {}
+        request_id = message.get("request_id")
+        action = str(payload.get("action") or "").strip()
+        inner_payload = payload.get("payload") or {}
+        session_id = str(payload.get("session_id") or "default")
+        tsm = self._node_connection_manager._terminal_session_manager
+
+        logger.info(
+            "[NODE TERMINAL] child handling action=%s request_id=%s",
+            action,
+            request_id,
+        )
+
+        # The exec action does not depend on the terminal session manager; permissions are verified uniformly by the master, and the child executes directly
+        if action == "exec":
+            command = str(inner_payload.get("command") or "").strip()
+            if not command:
+                return build_node_message(
+                    NODE_TERMINAL_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "INVALID_COMMAND",
+                            "message": "command is required",
+                        },
+                    },
+                    request_id=request_id,
+                )
+            interpreter = str(
+                inner_payload.get("interpreter") or vinbox_runtime.shell_path()
+            ).strip()
+            raw_working_dir = inner_payload.get("working_dir")
+            working_dir = str(raw_working_dir).strip() if raw_working_dir else ""
+            if not working_dir:
+                working_dir = str(pathlib.Path.home())
+            try:
+                exec_timeout = float(inner_payload.get("timeout") or 60.0)
+            except (TypeError, ValueError):
+                exec_timeout = 60.0
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *vinbox_runtime.command_argv(interpreter, command),
+                    cwd=working_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(), timeout=exec_timeout
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return build_node_message(
+                        NODE_TERMINAL_RESPONSE,
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "TIMEOUT",
+                                "message": f"command timed out after {exec_timeout}s",
+                            },
+                        },
+                        request_id=request_id,
+                    )
+                return build_node_message(
+                    NODE_TERMINAL_RESPONSE,
+                    {
+                        "success": True,
+                        "data": {
+                            "stdout": stdout_bytes.decode("utf-8", "replace"),
+                            "stderr": stderr_bytes.decode("utf-8", "replace"),
+                            "exit_code": proc.returncode,
+                        },
+                    },
+                    request_id=request_id,
+                )
+            except Exception as exc:
+                logger.error("[NODE EXEC] child exec failed: %s", exc)
+                return build_node_message(
+                    NODE_TERMINAL_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {"code": "EXEC_FAILED", "message": str(exc)},
+                    },
+                    request_id=request_id,
+                )
+
+        if tsm is None:
+            return build_node_message(
+                NODE_TERMINAL_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "NO_TERMINAL_MANAGER",
+                        "message": "terminal session manager not available",
+                    },
+                },
+                request_id=request_id,
+            )
+
+        try:
+            if action == "terminal_create":
+                interpreter = inner_payload.get("interpreter") or os.environ.get(
+                    "SHELL", "bash"
+                )
+                raw_working_dir = inner_payload.get("working_dir")
+                working_dir = str(raw_working_dir).strip() if raw_working_dir else ""
+                if not working_dir:
+                    import pathlib as _pathlib
+
+                    working_dir = str(_pathlib.Path.home())
+                # Create a proxy publisher to push terminal output back to the master
+                proxy_publisher = NodeTerminalOutputProxy(
+                    self._ws, asyncio.get_running_loop()
+                )
+                terminal_id, error = tsm.create_session(
+                    interpreter=interpreter,
+                    working_dir=working_dir,
+                    stream_publisher=proxy_publisher,
+                    session_id=session_id,
+                )
+                if terminal_id:
+                    return build_node_message(
+                        NODE_TERMINAL_RESPONSE,
+                        {
+                            "success": True,
+                            "data": {
+                                "terminal_id": terminal_id,
+                                "interpreter": interpreter,
+                                "working_dir": working_dir,
+                            },
+                        },
+                        request_id=request_id,
+                    )
+                else:
+                    return build_node_message(
+                        NODE_TERMINAL_RESPONSE,
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "TERMINAL_CREATE_FAILED",
+                                "message": error or "unknown error",
+                            },
+                        },
+                        request_id=request_id,
+                    )
+
+            elif action == "terminal_close":
+                terminal_id = str(inner_payload.get("terminal_id") or "").strip()
+                if terminal_id:
+                    tsm.close_session(terminal_id)
+                return build_node_message(
+                    NODE_TERMINAL_RESPONSE,
+                    {"success": True},
+                    request_id=request_id,
+                )
+
+            elif action == "terminal_session_input":
+                terminal_id = str(inner_payload.get("terminal_id") or "").strip()
+                data = inner_payload.get("data", "")
+                if terminal_id:
+                    tsm.write_input(terminal_id, data)
+                return build_node_message(
+                    NODE_TERMINAL_RESPONSE,
+                    {"success": True},
+                    request_id=request_id,
+                )
+
+            elif action == "terminal_attach":
+                # Return the terminal output buffer (base64) for the master to forward to the frontend for replay on restore
+                terminal_id = str(inner_payload.get("terminal_id") or "").strip()
+                session = tsm.get_session(terminal_id) if terminal_id else None
+                if session is None:
+                    return build_node_message(
+                        NODE_TERMINAL_RESPONSE,
+                        {
+                            "success": False,
+                            "error": {
+                                "code": "NOT_FOUND",
+                                "message": "terminal not found",
+                            },
+                        },
+                        request_id=request_id,
+                    )
+                import base64 as _base64
+
+                output = [
+                    _base64.b64encode(chunk).decode("utf-8")
+                    for chunk in session.get_output_buffer()
+                ]
+                return build_node_message(
+                    NODE_TERMINAL_RESPONSE,
+                    {
+                        "success": True,
+                        "data": {
+                            "terminal_id": terminal_id,
+                            "interpreter": session.interpreter,
+                            "working_dir": session.working_dir,
+                            "output": output,
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            elif action == "terminal_session_resize":
+                terminal_id = str(inner_payload.get("terminal_id") or "").strip()
+                rows = int(inner_payload.get("rows") or 24)
+                cols = int(inner_payload.get("cols") or 80)
+                if terminal_id:
+                    tsm.resize(terminal_id, rows, cols)
+                return build_node_message(
+                    NODE_TERMINAL_RESPONSE,
+                    {"success": True},
+                    request_id=request_id,
+                )
+
+            else:
+                return build_node_message(
+                    NODE_TERMINAL_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "UNKNOWN_ACTION",
+                            "message": f"unknown terminal action: {action}",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+        except Exception as exc:
+            logger.error("[NODE TERMINAL] child action=%s failed: %s", action, exc)
+            return build_node_message(
+                NODE_TERMINAL_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "TERMINAL_ERROR", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_service_restart_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Handle a service restart request forwarded by the master (child side)."""
+        request_id = message.get("request_id")
+        payload = message.get("payload") or {}
+        restart_frontend = bool(payload.get("restart_frontend", True))
+
+        logger.info(
+            "[NODE RESTART] child handling service restart request_id=%s restart_frontend=%s",
+            request_id,
+            restart_frontend,
+        )
+
+        try:
+            from haijunbot.haijunbot_service.eli import get_single_instance_lock_path
+
+            lock_file_path = get_single_instance_lock_path()
+            if not lock_file_path.exists():
+                return build_node_message(
+                    SERVICE_RESTART_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "UNSUPPORTED",
+                            "message": "Restart is not supported in this environment: no haijunbot-service lock file detected",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            service_pid_text = lock_file_path.read_text(encoding="utf-8").strip()
+            if not service_pid_text:
+                return build_node_message(
+                    SERVICE_RESTART_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "UNSUPPORTED",
+                            "message": "Restart is not supported in this environment: no service PID detected",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            import signal
+            import sys
+
+            service_pid = int(service_pid_text)
+            # Choose the signal based on the restart_frontend parameter
+            if sys.platform != "win32":
+                signal_to_send = signal.SIGUSR1 if restart_frontend else signal.SIGUSR2
+                signal_name = "SIGUSR1" if restart_frontend else "SIGUSR2"
+                os.kill(service_pid, signal_to_send)
+            else:
+                # Windows: send the restart command over the TCP command channel
+                import socket as socket_module
+
+                command = "RESTART_ALL" if restart_frontend else "RESTART_GATEWAY_ONLY"
+                try:
+                    sock = socket_module.socket(
+                        socket_module.AF_INET, socket_module.SOCK_STREAM
+                    )
+                    sock.connect(("127.0.0.1", _RESTART_COMMAND_TCP_PORT))
+                    sock.sendall(command.encode("utf-8") + b"\n")
+                    sock.close()
+                    signal_name = command
+                except Exception as e:
+                    logger.warning(f"Failed to send restart command via TCP: {e}")
+                    signal_name = f"TCP_FAILED: {e}"
+
+            message_text = (
+                "haijunbot-service restart of all services has been requested"
+                if restart_frontend
+                else "haijunbot-service restart of only the gateway service has been requested"
+            )
+            logger.info(
+                "[NODE RESTART] child service restart requested pid=%s signal=%s request_id=%s",
+                service_pid,
+                signal_name,
+                request_id,
+            )
+            return build_node_message(
+                SERVICE_RESTART_RESPONSE,
+                {
+                    "success": True,
+                    "data": {
+                        "pid": service_pid,
+                        "signal": signal_name,
+                        "message": message_text,
+                    },
+                },
+                request_id=request_id,
+            )
+        except (ValueError, ProcessLookupError):
+            return build_node_message(
+                SERVICE_RESTART_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "UNSUPPORTED",
+                        "message": "Restart is not supported in this environment: not started via haijunbot-service",
+                    },
+                },
+                request_id=request_id,
+            )
+        except PermissionError:
+            return build_node_message(
+                SERVICE_RESTART_RESPONSE,
+                {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "No permission to send a restart signal to haijunbot-service",
+                    },
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[NODE RESTART] child restart failed request_id=%s error=%s",
+                request_id,
+                exc,
+            )
+            return build_node_message(
+                SERVICE_RESTART_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "INTERNAL_ERROR", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _handle_code_update_to_main_request(
+        self, message: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Handle a request to switch to the main branch and update the code."""
+        request_id = message.get("request_id")
+        logger.info(
+            "[NODE CODE_UPDATE] handling code update to main request_id=%s",
+            request_id,
+        )
+        try:
+            from haijunbot.haijunbot_utils.template_utils import (
+                checkout_haijunbot_branch,
+                pull_haijunbot_code,
+                get_haijunbot_src_dir,
+            )
+
+            haijunbot_src_dir = get_haijunbot_src_dir()
+            if not haijunbot_src_dir:
+                return build_node_message(
+                    CODE_UPDATE_TO_MAIN_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "INVALID_PATH",
+                            "message": "Unable to get the HaijunBot source path",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            # Switch to the main branch
+            checkout_success, checkout_error = checkout_haijunbot_branch("main")
+            if not checkout_success:
+                return build_node_message(
+                    CODE_UPDATE_TO_MAIN_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "CHECKOUT_FAILED",
+                            "message": f"Failed to switch to the main branch: {checkout_error}",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            # Pull the latest code
+            pull_success, pull_error = pull_haijunbot_code()
+            if not pull_success:
+                return build_node_message(
+                    CODE_UPDATE_TO_MAIN_RESPONSE,
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "PULL_FAILED",
+                            "message": f"Failed to pull the latest code: {pull_error}",
+                        },
+                    },
+                    request_id=request_id,
+                )
+
+            logger.info(
+                "[NODE CODE_UPDATE] code updated successfully request_id=%s",
+                request_id,
+            )
+            return build_node_message(
+                CODE_UPDATE_TO_MAIN_RESPONSE,
+                {
+                    "success": True,
+                    "data": {
+                        "message": "Successfully switched to the main branch and pulled the latest code",
+                        "haijunbot_src_dir": haijunbot_src_dir,
+                    },
+                },
+                request_id=request_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[NODE CODE_UPDATE] code update failed request_id=%s error=%s",
+                request_id,
+                exc,
+            )
+            return build_node_message(
+                CODE_UPDATE_TO_MAIN_RESPONSE,
+                {
+                    "success": False,
+                    "error": {"code": "INTERNAL_ERROR", "message": str(exc)},
+                },
+                request_id=request_id,
+            )
+
+    async def _notify_agents_token_update(self, old_token: str, new_token: str) -> None:
+        """Notify all local Agents to update their authentication token.
+
+        When the token changes after the master gateway restarts, the child gateway authenticates to Agents with the old token
+        and calls the /update_token endpoint to tell Agents to update to the new token.
+        Once all updates complete, the old token is no longer needed (Agents are already using the new token).
+
+        Args:
+            old_token: The old token before the change, used to authenticate to Agents
+            new_token: The new token after the change, passed to Agents for updating
+        """
+        agents = self._agent_manager.get_agent_list()
+        if not agents:
+            return
+
+        logger.info(
+            "[NODE] Token changed, notifying %d local agent(s) to update token",
+            len(agents),
+        )
+
+        for agent_info in agents:
+            agent_id = agent_info.get("agent_id")
+            port = agent_info.get("port")
+            if not port:
+                continue
+
+            try:
+                async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
+                    resp = await client.post(
+                        f"http://127.0.0.1:{port}/update_token",
+                        json={"token": new_token},
+                        headers={"Authorization": f"Bearer {old_token}"},
+                    )
+                    if resp.status_code == 200:
+                        result = resp.json()
+                        if result.get("success"):
+                            logger.info(
+                                "[NODE] Agent %s token updated successfully",
+                                agent_id,
+                            )
+                        else:
+                            logger.warning(
+                                "[NODE] Agent %s token update failed: %s",
+                                agent_id,
+                                result.get("error"),
+                            )
+                    else:
+                        logger.warning(
+                            "[NODE] Agent %s token update request failed: HTTP %d",
+                            agent_id,
+                            resp.status_code,
+                        )
+            except Exception as exc:
+                logger.warning(
+                    "[NODE] Failed to notify agent %s token update: %s",
+                    agent_id,
+                    exc,
+                )
+
+        logger.info("[NODE] All local agents notified of token update")

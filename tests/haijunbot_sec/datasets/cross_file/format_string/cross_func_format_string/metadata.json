@@ -1,0 +1,39 @@
+{
+  "name": "cross_func_format_string",
+  "description": "cross_fileformat string：user inputcross_filepropagate，assyslog/printfformat stringuse。printfformat stringdetectable，syslog/errformat stringmissed detection",
+  "difficulty": "medium",
+  "vulnerability_type": "format_string",
+  "expected_issues": [
+    {
+      "pattern": "format_string",
+      "file": "logger.c",
+      "function": "print_formatted"
+    }
+  ],
+  "known_gaps": [
+    {
+      "pattern": "format_string",
+      "file": "logger.c",
+      "function": "log_message",
+      "reason": "c_checkernot coveredsyslogformat stringparametercheck"
+    },
+    {
+      "pattern": "format_string",
+      "file": "logger.c",
+      "function": "fatal_error",
+      "reason": "c_checkernot coverederr/errxformat stringparametercheck"
+    }
+  ],
+  "files": [
+    "input.c",
+    "logger.c",
+    "main.c"
+  ],
+  "cross_file": true,
+  "tags": [
+    "format-string",
+    "cross-file",
+    "taint",
+    "known-gap"
+  ]
+}

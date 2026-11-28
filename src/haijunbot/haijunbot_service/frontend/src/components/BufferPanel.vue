@@ -1,0 +1,215 @@
+<template>
+  <div class="modal-overlay" v-if="visible && hasBufferedInput" @click.self="$emit('close')">
+    <div class="modal buffer-modal">
+      <div class="buffer-panel-header">
+        <span class="buffer-panel-title"><span v-html="BUFFER_ICONS.buffer"></span> Input buffer</span>
+        <div class="buffer-panel-actions">
+          <button
+            class="buffer-panel-btn"
+            @click="$emit('load')"
+            title="Load into input"
+          >
+            ↳ Load
+          </button>
+          <button
+            class="buffer-panel-btn"
+            @click="$emit('clear')"
+            title="Clear buffer"
+          >
+            <span v-html="BUFFER_ICONS.trash"></span>
+          </button>
+          <button
+            class="buffer-panel-btn close-btn"
+            @click="$emit('close')"
+            title="Close panel"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+      <div class="buffer-panel-content">
+        <textarea
+          :value="editText"
+          @input="$emit('update:editText', $event.target.value)"
+          class="buffer-edit-textarea"
+          placeholder="Buffer content..."
+          @keydown.ctrl.enter="$emit('save')"
+        ></textarea>
+        <div class="buffer-panel-footer">
+          <button
+            class="buffer-save-btn"
+            @click="$emit('save')"
+            :disabled="!editText.trim()"
+          >
+            Save changes (Ctrl+Enter)
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script setup>
+
+// Hand-drawn 16x16 stroke-style linear SVG icons (currentColor inherits the theme color), consistent with the global style
+const BUFFER_ICONS = {
+  buffer: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 1.5h8v13l-1.5-1-1.5 1-1.5-1-1.5 1-1.5-1z"/><path d="M6 5.5h4M6 8h4"/></svg>',
+  trash: '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.5 9.5h7L12 4M6.5 7v4M9.5 7v4"/></svg>',
+}
+
+defineProps({
+  visible: Boolean,
+  hasBufferedInput: Boolean,
+  editText: {
+    type: String,
+    default: ''
+  }
+})
+
+defineEmits(['update:visible', 'update:editText', 'close', 'load', 'clear', 'save'])
+</script>
+
+<style scoped>
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--color-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3000;
+  padding: 20px;
+}
+
+.modal {
+  background: var(--color-bg-secondary);
+  border: none;
+  border-radius: var(--tile-radius-sm);
+  width: 100%;
+}
+
+.buffer-modal {
+  max-width: min(720px, 100%);
+  padding: 0;
+  overflow: hidden;
+  box-shadow: var(--tile-shadow);
+  animation: slideDown 0.2s ease-out;
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.buffer-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: var(--color-accent-subtle);
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+.buffer-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-accent);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.buffer-panel-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.buffer-panel-btn {
+  padding: 6px 12px;
+  background: var(--color-bg-tertiary);
+  border: none;
+  border-radius: var(--tile-radius-xs);
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.buffer-panel-btn:hover {
+  background: var(--color-accent-subtle);
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.buffer-panel-btn.close-btn:hover {
+  background: var(--color-error-subtle);
+  border-color: var(--color-error);
+  color: var(--color-error);
+}
+
+.buffer-panel-content {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.buffer-edit-textarea {
+  width: 100%;
+  min-height: 220px;
+  max-height: min(60vh, 520px);
+  background: var(--color-bg-primary);
+  border: none;
+  padding: 14px 16px;
+  color: var(--color-text-primary);
+  font-size: 14px;
+  font-family: 'Consolas', 'Microsoft YaHei', monospace;
+  resize: vertical;
+  box-sizing: border-box;
+  outline: none;
+}
+
+.buffer-edit-textarea::placeholder {
+  color: var(--color-text-secondary);
+}
+
+.buffer-panel-footer {
+  padding: 12px 16px;
+  background: var(--color-bg-secondary);
+  border-top: 1px solid var(--color-border-subtle);
+  display: flex;
+  justify-content: flex-end;
+}
+
+.buffer-save-btn {
+  padding: 8px 16px;
+  background: var(--color-accent-subtle);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--tile-radius-xs);
+  color: var(--color-accent);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.buffer-save-btn:hover:not(:disabled) {
+  background: var(--color-accent-subtle);
+  border-color: var(--color-accent);
+  transform: translateY(-1px);
+}
+
+.buffer-save-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+</style>

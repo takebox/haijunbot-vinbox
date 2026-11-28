@@ -1,0 +1,528 @@
+# Best Practices for Using Rules
+
+## 1. Overview
+
+This document summarizes the best practices for using the HaijunBot rule system, helping developers use the rule system efficiently and correctly to improve code quality and development efficiency.
+
+---
+
+## 2. Rule Selection Strategy
+
+### 2.1 Selecting Rules by Task Type
+
+Different task types should use different rule combinations:
+
+| Task Type     | Recommended Rules                                    | Description                   |
+| ------------- | ---------------------------------------------------- | ----------------------------- |
+| **Code Generation** | `clean_code`, `security`                    | Ensure code quality and security |
+| **Code Refactoring** | `refactoring`, `clean_code`                 | Follow refactoring principles and code standards |
+| **API Development** | `clean_code`, `security`, `documentation`   | APIs need documentation and security considerations |
+| **Performance Optimization** | `performance`, `rust_performance` (if applicable) | Focus on performance optimization |
+| **Test Writing** | `tdd`, `python_test` (or corresponding language) | Test-driven development and test standards |
+| **Architecture Design** | `clean_architecture`, `solid`               | Architecture design principles |
+| **Security Audit** | `security`, `vulnerability-analysis`        | Security-related tasks |
+
+### 2.2 Rule Combination Principles
+
+1. **Core Rules First**: Select core rules (e.g., `clean_code`) first, then add specific rules
+2. **Avoid Conflicts**: Watch for conflicts between rules; later-loaded rules override earlier-loaded ones
+3. **Moderate Use**: Don't load too many rules at once; 3-5 rules are usually sufficient
+4. **Project Rules First**: Project-specific rules should take priority over generic rules
+
+### 2.3 Understanding Rule Priority
+
+Understand rule loading priority to organize rules properly:
+
+```
+Priority from high to low:
+1. Central rule repository
+2. Project rule directory (.haijunbot/rules/)
+3. Configured rule directory
+4. Global rule directory (~/.haijunbot/rules/)
+5. Built-in rules (builtin/rules/)
+```
+
+---
+
+## 3. Rule Usage Methods
+
+### 3.1 Command-Line Argument Method
+
+**Applicable Scenarios**: Scripts, CI/CD, one-time tasks
+
+```bash
+# Single rule
+hca --rule-names clean_code "Create user module"
+
+# Multiple rules
+hca --rule-names clean_code,security,performance "Create API"
+
+# Project rule + built-in rule
+hca --rule-names my_project_rule,clean_code "Create feature"
+```
+
+**Pros**:
+
+- Explicitly specify rules
+- Suitable for automation scenarios
+- Repeatable execution
+
+**Cons**:
+
+- Need to remember rule names
+- Command line may become long
+
+### 3.2 Project Rule File Method
+
+**Applicable Scenarios**: Project-fixed coding standards
+
+**Recommended Method**: Use `add_rule` rule to auto-create, rather than manual writing.
+
+**Manual Creation** (not recommended):
+Create `.haijunbot/rules/rule.md` file:
+
+```markdown
+# Project Rules
+
+You must follow these principles:
+
+- Code must comply with PEP 8 standards
+- All public functions must have type annotations
+- Must write unit tests
+```
+
+**Pros**:
+
+- Auto-loaded, no need to specify each time
+- Team sharing, unified standards
+- Version control, traceable changes
+
+**Cons**:
+
+- Only applies to current project
+- May affect all tasks
+
+### 3.3 Global Rule File Method
+
+**Applicable Scenarios**: Personal universal coding standards
+
+**Recommended Method**: Use `add_rule` rule to auto-create, rather than manual writing.
+
+**Manual Creation** (not recommended):
+Create `~/.haijunbot/rules/rule.md` file:
+
+```markdown
+# Global Rules
+
+When writing Python code:
+
+- Must use f-strings for string formatting
+- Prohibited from using print() statements (use logging module)
+```
+
+**Pros**:
+
+- Effective for all projects
+- Unified personal preferences
+
+**Cons**:
+
+- May not suit all projects
+- Need to use carefully
+
+### 3.4 @ Interactive Method
+
+**Applicable Scenarios**: Interactive development, temporary needs
+
+Enter `@` in interactive session to trigger rule completion:
+
+```
+> @clean_code @security Create user authentication module
+```
+
+**Pros**:
+
+- Quick selection
+- Supports search
+- Flexible combination
+
+**Cons**:
+
+- Only available in interactive mode
+- Requires manual input
+
+---
+
+## 4. Rule Organization Best Practices
+
+### 4.1 Project Rule Organization
+
+**Recommended Structure**:
+
+```
+Project Root/
+├── .haijunbot/
+│   ├── rule                    # Project rule file (auto-loaded)
+│   └── rules/                  # Project rule directory
+│       ├── api/
+│       │   └── rest_api_standard.md
+│       ├── database/
+│       │   └── db_migration_guide.md
+│       └── testing/
+│           └── test_standards.md
+```
+
+**Organization Principles**:
+
+1. Categorize by functional modules
+2. Use descriptive directory names
+3. Keep structure clear
+4. Update documentation timely
+
+### 4.2 Global Rule Organization
+
+**Recommended Structure**:
+
+```
+~/.haijunbot/
+├── rule                        # Global rule file (auto-loaded)
+└── rules/                      # Global rule directory
+    ├── python/
+    │   └── python_style_guide.md
+    ├── javascript/
+    │   └── js_best_practices.md
+    └── general/
+        └── code_review_checklist.md
+```
+
+### 4.3 Rule Naming Conventions
+
+**File Naming**:
+
+- ✅ Use lowercase: `python_api_standard.md`
+- ✅ Use underscores to separate: `rest_api_guide.md`
+- ❌ Avoid spaces: `python api standard.md`
+- ❌ Avoid hyphens: `python-api-standard.md`
+- ❌ Avoid uppercase: `PythonApiStandard.md`
+
+**Rule Names** (for `--rule-names`):
+
+- Remove `.md` suffix from filename
+- Example: `python_api_standard.md` → `python_api_standard`
+
+---
+
+## 5. Rule Writing Best Practices
+
+**Recommended Method**: Use `add_rule` rule to auto-generate or import rules, rather than manual writing. `add_rule` itself is a rule that guides the Agent to create rule files following best practices, ensuring correct format and clear structure.
+
+**Usage**:
+
+```bash
+# Use add_rule rule to create new rule
+hca --rule-names add_rule "Create Python API development standard rule"
+
+# Or use in interactive session
+hca
+> '<rule:add_rule>' Create Python API development standard rule
+```
+
+### 5.1 Clarity Principle
+
+**Requirement**: Use clear, unambiguous language
+
+**❌ Bad Practice**:
+
+```markdown
+Functions should be as short as possible
+```
+
+**✅ Good Practice**:
+
+```markdown
+**Must**: Function length must not exceed 20 lines
+```
+
+### 5.2 Actionability Principle
+
+**Requirement**: Every rule should be verifiable
+
+**❌ Bad Practice**:
+
+```markdown
+Code should be efficient
+```
+
+**✅ Good Practice**:
+
+```markdown
+**Performance Requirements:**
+
+- Database queries must use indexes
+- Avoid N+1 query problem
+- Batch operations must use batch APIs
+```
+
+### 5.3 Structuring Principle
+
+**Requirement**: Organize content by logical hierarchy
+
+**Recommended Structure**:
+
+1. Introduction/Background
+2. Core Principles (highest priority)
+3. Specific Standards
+4. Code Examples
+5. Checklist
+
+### 5.4 Example-Driven
+
+**Requirement**: Every key standard should have examples
+
+````markdown
+## Code Examples
+
+### ❌ Bad Practice
+
+```python
+def process_data(data):
+    result = []
+    for item in data:
+        result.append(item * 2)
+    return result
+```
+````
+
+### ✅ Good Practice
+
+```python
+def process_data(data: List[int]) -> List[int]:
+    """Process data, multiplying each element by 2"""
+    return [item * 2 for item in data]
+```
+
+````
+
+---
+
+## 6. Rule Usage Scenario Examples
+
+### Scenario 1: New Project Initialization
+
+**Goal**: Establish coding standards for new project
+
+**Recommended Method**: Use `add_rule` rule to auto-create project rules. `add_rule` itself is a rule, used via `hca --rule-names add_rule`.
+
+**Steps**:
+
+1. Use `add_rule` to create project rule file
+2. Create rule directory and add more rule files as needed
+3. Commit to version control
+
+**Example**:
+
+```bash
+# Use add_rule to create project rule file
+hca --rule-names add_rule "Create project coding standards, including:
+- Code must comply with PEP 8 standards
+- All public functions must have type annotations
+- Must write unit tests
+- APIs must return unified format"
+
+# Use add_rule to create rule files in rule directory
+hca --rule-names add_rule "Create REST API specification rule in .haijunbot/rules/api/ directory"
+hca --rule-names add_rule "Create database migration guide rule in .haijunbot/rules/database/ directory"
+
+# Commit to version control
+git add .haijunbot/
+git commit -m "Add project coding standards"
+````
+
+**Manual Creation Method** (not recommended):
+
+```bash
+# Manually create project rules (not recommended)
+cat > .haijunbot/rules/rule.md << 'EOF'
+# Project Coding Standards
+
+- Code must comply with PEP 8 standards
+- All public functions must have type annotations
+- Must write unit tests
+- APIs must return unified format
+EOF
+
+# Create rule directory
+mkdir -p .haijunbot/rules/{api,database,testing}
+
+# Commit to version control
+git add .haijunbot/
+git commit -m "Add project coding standards"
+```
+
+### Scenario 2: Code Review
+
+**Goal**: Use rules to guide code review
+
+**Steps**:
+
+1. Use code review rules
+2. Combine with project-specific rules
+3. Generate review report
+
+**Example**:
+
+```bash
+hca --rule-names code_review,my_project_rule "
+Review the following code files:
+- src/api/users.py
+- src/models/user.py
+- src/services/user_service.py
+
+Focus on:
+1. Code style consistency
+2. Security vulnerabilities
+3. Performance issues
+4. Test coverage
+"
+```
+
+### Scenario 3: Refactoring Task
+
+**Goal**: Use rules to guide refactoring
+
+**Steps**:
+
+1. Use refactoring rules
+2. Combine with code quality rules
+3. Refactor incrementally
+
+**Example**:
+
+```bash
+hca --rule-names refactoring,clean_code "
+Refactor user authentication module:
+1. Extract authentication logic to independent service class
+2. Implement dependency injection
+3. Add unit tests
+4. Update documentation
+"
+```
+
+### Scenario 4: Performance Optimization
+
+**Goal**: Use rules to guide performance optimization
+
+**Steps**:
+
+1. Use performance optimization rules
+2. Analyze performance bottlenecks
+3. Apply optimization strategies
+
+**Example**:
+
+```bash
+hca --rule-names performance,rust_performance "
+Optimize order query performance:
+1. Analyze current query performance
+2. Add necessary database indexes
+3. Optimize query logic
+4. Add performance tests
+ "
+```
+
+---
+
+## 7. Rule Maintenance Best Practices
+
+### 7.1 Regular Review
+
+**Recommendation**: Review rules quarterly
+
+**Review Content**:
+
+1. Whether rules are still applicable
+2. Whether new best practices need to be added
+3. Whether outdated rules need to be removed
+4. Whether there are conflicts between rules
+
+### 7.2 Version Control
+
+**Recommendation**: Include rule files in version control
+
+**Project Rules**:
+
+```bash
+# Commit project rules
+git add .haijunbot/rules/
+git commit -m "Update project rules: add API specification"
+```
+
+**Global Rules**:
+
+```bash
+# Can manage global rules separately
+cd ~/.haijunbot
+git init
+git add rules/
+git commit -m "Update global rules"
+```
+
+### 7.3 Team Collaboration
+
+**Recommendation**: Establish rule management process
+
+1. **Rule Proposal**: Team members can propose new rules
+2. **Rule Review**: Team reviews rule proposals
+3. **Rule Release**: Release rules after review approval
+4. **Rule Update**: Regularly update rules
+
+### 7.4 Documentation Sync
+
+**Recommendation**: Keep rule documentation synchronized
+
+1. Update documentation when rules change
+2. Provide rule usage examples
+3. Record rule change history
+
+---
+
+## 8. Performance Optimization Suggestions
+
+### 8.1 Rule File Size
+
+**Recommendation**:
+
+- Single rule file should not exceed 10KB
+- Avoid including large amounts of code examples in rules
+- Use links to reference external resources
+
+### 8.2 Rule Loading Optimization
+
+**Recommendation**:
+
+1. Only load necessary rules
+2. Avoid loading too many rules (recommend 3-5)
+3. Use project rule files instead of specifying each time
+
+### 8.3 Rule Caching
+
+**Note**: HaijunBot automatically caches rule content, but requires HaijunBot restart after rule file changes.
+
+---
+
+## 9. Summary
+
+### 9.1 Core Principles
+
+1. **Clear Goals**: Select appropriate rules based on task type
+2. **Moderate Use**: Don't load too many rules at once
+3. **Clear Organization**: Organize rule files by functional modules
+4. **Regular Maintenance**: Regularly review and update rules
+5. **Team Sharing**: Include rules in version control for team sharing
+
+### 9.2 Recommended Practices
+
+1. **Project Rules**: Create dedicated rule files for projects
+2. **Rule Combination**: Combine multiple rules based on task type
+3. **Rule Priority**: Understand rule loading priority to avoid conflicts
+4. **Rule Maintenance**: Regularly review and update rules to maintain best practices

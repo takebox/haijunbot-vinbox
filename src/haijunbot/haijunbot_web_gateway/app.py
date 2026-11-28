@@ -1,0 +1,12609 @@
+# -*- coding: utf-8 -*-
+"""Web Gateway FastAPI application.
+
+Standalone service: interfaces with Gateway input/output/execution events via WebSocket.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from contextlib import asynccontextmanager
+import io
+import ipaddress
+import json
+from queue import Empty
+from queue import Queue
+import logging
+import os
+import pathlib
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import zipfile
+
+import yaml  # type: ignore[import-untyped]
+from datetime import datetime
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, cast
+from urllib.parse import parse_qsl
+from urllib.parse import unquote
+from urllib.parse import urlencode
+
+from fastapi import Depends, FastAPI, Request, Response, WebSocket
+from starlette.staticfiles import StaticFiles
+from fastapi import WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+import httpx
+
+from haijunbot.haijunbot_gateway.events import GatewayConfirmRequest
+from haijunbot.haijunbot_gateway.events import GatewayConfirmResult
+from haijunbot.haijunbot_gateway.events import GatewayExecutionEvent
+from haijunbot.haijunbot_gateway.events import GatewayInputRequest
+from haijunbot.haijunbot_gateway.events import GatewayInputResult
+from haijunbot.haijunbot_gateway.events import GatewayOutputEvent
+from haijunbot.haijunbot_gateway.gateway import BaseGateway
+from haijunbot.haijunbot_gateway.input_bridge import InputSessionRegistry
+from haijunbot.haijunbot_gateway.manager import set_current_gateway
+from haijunbot.haijunbot_gateway.output_bridge import SessionOutputRouter
+from haijunbot.haijunbot_web_gateway.agent_manager import AgentManager
+from haijunbot.haijunbot_web_gateway.browser_extension_manager import (
+    BrowserExtensionManager,
+    browser_extension_manager,
+)
+from haijunbot.haijunbot_web_gateway.chat_manager import ChatManager
+from haijunbot.haijunbot_web_gateway.daemon_capability_manager import (
+    DAEMON_SUBPROTOCOL,
+    DaemonCapabilityManager,
+    daemon_capability_manager,
+)
+from haijunbot.haijunbot_web_gateway.agent_proxy_manager import (
+    AgentProxyManager,
+    AgentNotFoundError,
+    AgentNotRunningError,
+    ProxyConnectionError,
+)
+from haijunbot.haijunbot_web_gateway.token_manager import (
+    generate_gateway_token,
+    validate_gateway_token,
+    extract_token_from_authorization_header,
+)
+from haijunbot.haijunbot_web_gateway.user_manager import UserManager
+from haijunbot.haijunbot_web_gateway.permission_manager import PermissionManager
+from haijunbot.haijunbot_web_gateway.jwt_utils import (
+    generate_jwt_token,
+    revoke_token,
+)
+from haijunbot.haijunbot_web_gateway.node_config import (
+    NodeRuntimeConfig,
+    build_node_runtime_config,
+)
+from haijunbot.haijunbot_web_gateway.node_manager import (
+    ChildNodeClient,
+    NodeConnectionManager,
+)
+from haijunbot.haijunbot_web_gateway.node_protocol import (
+    AGENT_CREATE_REQUEST,
+    AGENT_HTTP_REQUEST,
+    AGENT_LIST_REQUEST,
+    AGENT_STOP_REQUEST,
+    AGENT_DELETE_REQUEST,
+    AGENT_REGENERATE_REQUEST,
+    NODE_HTTP_PROXY_REQUEST,
+    AGENT_WS_OPEN_REQUEST,
+    AGENT_WS_SEND_REQUEST,
+    AGENT_WS_RECV_REQUEST,
+    AGENT_WS_CLOSE_REQUEST,
+    DIRECTORY_LIST_REQUEST,
+    NODE_TERMINAL_REQUEST,
+    SERVICE_RESTART_REQUEST,
+    CONFIG_GET_REQUEST,
+    CONFIG_SET_REQUEST,
+    CODE_UPDATE_TO_MAIN_REQUEST,
+    PLUGIN_MANAGE_REQUEST,
+)
+from haijunbot import __version__ as HAIJUNBOT_VERSION
+from haijunbot.haijunbot_web_gateway.node_runtime import AgentRouteInfo, NodeRuntime
+from haijunbot.haijunbot_web_gateway.terminal_input_registry import TerminalInputRegistry
+from haijunbot.haijunbot_web_gateway.terminal_session_manager import TerminalSessionManager
+from haijunbot.haijunbot_web_gateway.timer_manager import TimerManager
+from haijunbot.haijunbot_web_gateway.cron import CronParseError
+from haijunbot.haijunbot_web_gateway.cron import parse_cron
+from haijunbot.haijunbot_service.eli import get_single_instance_lock_path
+from haijunbot.haijunbot_utils.globals import set_interrupt, get_script_pid
+import haijunbot.haijunbot_utils.globals as jglobals
+from haijunbot.haijunbot_utils.utils import _find_all_config_files, _merge_configs
+from haijunbot.haijunbot_utils import vinbox_runtime
+from haijunbot.haijunbot_utils.config import (
+    save_exception,
+)
+
+logger = logging.getLogger(__name__)
+
+# Group storage (in-memory storage, lost after service restart)
+# Key: group_id, Value: {"name": str, "members": set()}
+groups: Dict[str, Dict[str, Any]] = {}
+
+# Import agent status manager (used to handle get_status messages)
+try:
+    from haijunbot.haijunbot_agent.haijunbot import get_agent_status_manager
+except ImportError:
+    # If haijunbot_agent is unavailable, use None
+    get_agent_status_manager = None  # type: ignore
+
+
+# Global AgentManager, used for status change callbacks
+_global_agent_manager: Optional[AgentManager] = None
+
+# Node Secret server (used to provide node_secret to child nodes)
+# Linux: Unix Domain Socket, Windows: TCP Socket
+_node_secret_socket_server: Optional[asyncio.Server] = None
+_NODE_SECRET_SOCKET_PATH = os.path.expanduser("~/.haijunbot/gateway/node_secret.sock")
+_NODE_SECRET_TCP_PORT = 18765  # Windows uses TCP port
+_RESTART_COMMAND_TCP_PORT = 18766  # Windows restart command TCP port
+
+# Status update callback function
+_status_update_callback: Optional[Callable[[str], None]] = None
+
+
+async def _handle_node_secret_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    """Handle Unix Domain Socket client requests, returning node_secret.
+
+    Protocol format:
+    - Client sends: "GET_NODE_SECRET\n"
+    - Server returns: "{\"node_secret\": \"<secret>\"}\n" or "{\"error\": \"<message>\"}\n"
+    """
+    try:
+        # Read request
+        data = await reader.readline()
+        request = data.decode("utf-8").strip()
+
+        if request != "GET_NODE_SECRET":
+            response = json.dumps({"error": "Invalid request. Use: GET_NODE_SECRET"})
+        else:
+            # Get node_secret from environment variable
+            node_secret = os.environ.get("HAIJUNBOT_NODE_SECRET")
+            if not node_secret:
+                response = json.dumps({"error": "Node secret not configured"})
+            else:
+                response = json.dumps({"node_secret": node_secret})
+
+        writer.write(response.encode("utf-8") + b"\n")
+        await writer.drain()
+    except Exception as e:
+        logger.error(f"Error handling node secret client: {e}")
+        try:
+            error_response = json.dumps({"error": str(e)})
+            writer.write(error_response.encode("utf-8") + b"\n")
+            await writer.drain()
+        except Exception as e:
+            save_exception(e, module="haijunbot_web_gateway.app", function="")
+            pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception as e:
+            save_exception(e, module="haijunbot_web_gateway.app", function="")
+            pass
+
+
+async def _start_node_secret_socket_server(node_config: NodeRuntimeConfig) -> None:
+    """Start the Node Secret server (only in master mode).
+
+    Linux: Unix Domain Socket
+    Windows: TCP Socket (localhost only)
+
+    Args:
+        node_config: Node runtime configuration
+    """
+    global _node_secret_socket_server
+
+    # Start only in master mode
+    if not node_config.is_master:
+        return
+
+    if sys.platform == "win32":
+        # Windows: use TCP Socket
+        try:
+            _node_secret_socket_server = await asyncio.start_server(
+                _handle_node_secret_client,
+                host="127.0.0.1",
+                port=_NODE_SECRET_TCP_PORT,
+            )
+            logger.info(
+                f"Node secret TCP server started at 127.0.0.1:{_NODE_SECRET_TCP_PORT}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to start node secret TCP server: {e}")
+            raise
+    else:
+        # Linux: use Unix Domain Socket
+        # Ensure directory exists
+        socket_dir = os.path.dirname(_NODE_SECRET_SOCKET_PATH)
+        os.makedirs(socket_dir, exist_ok=True)
+
+        # Delete old socket file (if it exists)
+        if os.path.exists(_NODE_SECRET_SOCKET_PATH):
+            try:
+                os.unlink(_NODE_SECRET_SOCKET_PATH)
+                logger.info(f"Removed old socket file: {_NODE_SECRET_SOCKET_PATH}")
+            except Exception as e:
+                logger.warning(f"Failed to remove old socket file: {e}")
+
+        # Start Unix Domain Socket server
+        try:
+            _node_secret_socket_server = await asyncio.start_unix_server(
+                _handle_node_secret_client, path=_NODE_SECRET_SOCKET_PATH
+            )
+
+            # Set strict file permissions (read/write only by current user)
+            os.chmod(_NODE_SECRET_SOCKET_PATH, 0o600)
+
+            logger.info(
+                f"Node secret socket server started at {_NODE_SECRET_SOCKET_PATH} (mode: 0600)"
+            )
+        except Exception as e:
+            logger.error(f"Failed to start node secret socket server: {e}")
+            raise
+
+
+async def _stop_node_secret_socket_server() -> None:
+    """Stop the Node Secret server and clean up resources.
+
+    Linux: clean up the Unix Domain Socket file
+    Windows: no file cleanup needed
+    """
+    global _node_secret_socket_server
+
+    if _node_secret_socket_server is not None:
+        _node_secret_socket_server.close()
+        await _node_secret_socket_server.wait_closed()
+        _node_secret_socket_server = None
+        logger.info("Node secret server stopped")
+
+    # Linux: clean up socket file
+    if sys.platform != "win32":
+        if os.path.exists(_NODE_SECRET_SOCKET_PATH):
+            try:
+                os.unlink(_NODE_SECRET_SOCKET_PATH)
+                logger.info(f"Removed socket file: {_NODE_SECRET_SOCKET_PATH}")
+            except Exception as e:
+                logger.warning(f"Failed to remove socket file: {e}")
+
+
+# Global current execution status (used for /status endpoint)
+_current_execution_status: str = "running"
+
+
+def get_current_execution_status() -> str:
+    """Get the current execution status.
+
+    Returns:
+        str: current execution status (running/waiting_multi/waiting_single)
+    """
+    global _current_execution_status
+    return _current_execution_status
+
+
+# Global SessionOutputRouter, used to push status updates
+_router: Optional[SessionOutputRouter] = None
+
+# Global TerminalSessionManager, used for standalone terminal session management
+_terminal_session_manager: Optional[TerminalSessionManager] = None
+_node_connection_manager: Optional["NodeConnectionManager"] = None
+_node_runtime: Optional["NodeRuntime"] = None
+
+
+def get_browser_extension_manager() -> "BrowserExtensionManager":
+    """Get the global browser extension connection manager (for use by the tool layer)."""
+    return browser_extension_manager
+
+
+def get_daemon_capability_manager() -> "DaemonCapabilityManager":
+    """Get the global daemon capability manager (for use by the tool layer)."""
+    return daemon_capability_manager
+
+
+# Browser extension source directory name (located at the repository root, distributed with the gateway)
+BROWSER_EXTENSION_DIR_NAME = "browser_extension"
+# Directory/file names to exclude when packaging (cache and system junk files)
+BROWSER_EXTENSION_EXCLUDE_NAMES = {"__pycache__", ".DS_Store", ".git"}
+
+
+def resolve_browser_extension_dir() -> Optional[str]:
+    """Locate the browser extension source directory (the browser_extension directory containing manifest.json).
+
+    Search upward level by level from the location of this file, compatible with both source/editable installs and packaged installs.
+
+    Returns:
+        Absolute path of the extension directory; returns None if not found
+    """
+    current = pathlib.Path(__file__).resolve()
+    for candidate_root in (current.parent, *current.parents):
+        candidate = candidate_root / BROWSER_EXTENSION_DIR_NAME
+        if (candidate / "manifest.json").is_file():
+            return str(candidate)
+    return None
+
+
+def read_browser_extension_version(extension_dir: str) -> str:
+    """Read the version number from the browser extension's manifest.json.
+
+    Args:
+        extension_dir: absolute path of the extension directory
+
+    Returns:
+        Version number string; falls back to "unknown" if reading fails
+    """
+    try:
+        manifest_path = os.path.join(extension_dir, "manifest.json")
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        version = str(manifest.get("version") or "").strip()
+        return version or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def build_browser_extension_zip(extension_dir: str) -> bytes:
+    """Package the browser extension source directory into a zip byte stream.
+
+    Entries within the zip are all relative paths to the extension root directory, excluding cache/system junk files,
+    to avoid path traversal and inclusion of irrelevant files.
+
+    Args:
+        extension_dir: absolute path of the extension directory
+
+    Returns:
+        Byte content of the zip file
+    """
+    root = pathlib.Path(extension_dir).resolve()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in sorted(root.rglob("*")):
+            if not file_path.is_file():
+                continue
+            relative = file_path.relative_to(root)
+            if any(part in BROWSER_EXTENSION_EXCLUDE_NAMES for part in relative.parts):
+                continue
+            # Secondary validation: ensure the final path is still within the extension root directory (prevent path traversal)
+            resolved = file_path.resolve()
+            if root != resolved and root not in resolved.parents:
+                continue
+            zf.write(resolved, arcname=relative.as_posix())
+    return buffer.getvalue()
+
+
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+BINARY_FILE_SAMPLE_SIZE = 4096
+GLOBAL_SEARCH_MAX_QUERY_LENGTH = 200
+GLOBAL_SEARCH_DEFAULT_MAX_RESULTS = 100
+GLOBAL_SEARCH_MAX_RESULTS_LIMIT = 500
+GLOBAL_SEARCH_COMMAND_TIMEOUT_SECONDS = 30
+GLOBAL_SEARCH_MAX_LINE_LENGTH = 2000
+GLOBAL_SEARCH_MAX_GLOB_LENGTH = 500
+FILE_SEARCH_DEFAULT_MAX_RESULTS = 200
+FILE_SEARCH_MAX_RESULTS_LIMIT = 1000
+
+
+def _is_safe_proxy_url(target_url: str) -> Tuple[bool, str]:
+    """Validate whether the http_proxy target URL is safe (prevent SSRF).
+
+    Prohibit proxying to internal/loopback/link-local/reserved addresses; only allow external public addresses.
+    Returns (is_safe, error_message).
+    """
+    from urllib.parse import urlparse
+
+    def _check_ip(ip_str: str) -> Tuple[bool, str]:
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False, f"Unable to resolve IP: {ip_str}"
+        if ip.is_loopback:
+            return False, f"Proxying to loopback address is prohibited: {ip_str}"
+        if ip.is_link_local:
+            return False, f"Proxying to link-local address is prohibited: {ip_str}"
+        if ip.is_private:
+            return False, f"Proxying to internal address is prohibited: {ip_str}"
+        if ip.is_reserved or ip.is_multicast:
+            return False, f"Proxying to reserved/multicast address is prohibited: {ip_str}"
+        return True, ""
+
+    try:
+        parsed = urlparse(target_url)
+        host = parsed.hostname
+        if not host:
+            return False, "URL is missing hostname"
+        # Loopback / local machine
+        if host.lower() in ("localhost", "localhost.localdomain"):
+            return False, f"Proxying to local machine address is prohibited: {host}"
+        # Directly an IP
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            # Not an IP, try resolving DNS and validate each resolution result individually
+            try:
+                infos = socket.getaddrinfo(host, None)
+            except socket.gaierror:
+                return False, f"Unable to resolve host: {host}"
+            resolved = {str(info[4][0]) for info in infos}
+            for addr in resolved:
+                ok, msg = _check_ip(addr)
+                if not ok:
+                    return False, f"Target resolves to internal address {addr}: {msg}"
+            return True, ""
+        return _check_ip(host)
+    except Exception as e:  # noqa: BLE001
+        return False, f"URL validation failed: {str(e)}"
+
+
+def _fuzzy_match_score(query: str, target: str) -> Optional[int]:
+    """Perform fuzzy matching against target: characters of query must appear in target in order.
+
+    Returns a match score (smaller is better); returns None if no match.
+    Scoring rules: prefer consecutive matches, prefer earlier starting positions, prefer shorter overall targets.
+    """
+    if not query:
+        return None
+    query_lower = query.lower()
+    target_lower = target.lower()
+    score = 0
+    target_index = 0
+    previous_match_index = -1
+    for char in query_lower:
+        found = target_lower.find(char, target_index)
+        if found == -1:
+            return None
+        if previous_match_index != -1 and found == previous_match_index + 1:
+            score -= 2  # Bonus for consecutive match
+        score += found - target_index  # More skipped characters means more penalty
+        previous_match_index = found
+        target_index = found + 1
+    score += previous_match_index + 1  # Later match end position is worse
+    score += len(target_lower) // 4  # Longer target is slightly worse
+    return score
+
+
+def set_status_update_callback(callback: Optional[Callable[[str], None]]) -> None:
+    """Set the status update callback function.
+
+    Args:
+        callback: callback function that receives a status string ("running"/"waiting_multi"/"waiting_single")
+    """
+    global _status_update_callback
+    _status_update_callback = callback
+
+
+def _update_status(status: str) -> None:
+    """Update status.
+
+    Args:
+        status: status string
+    """
+
+    global _status_update_callback, _router, _current_execution_status  # Add _router to global
+    _current_execution_status = status  # Update global status
+
+    # 1. Call the callback function to update local status
+    if _status_update_callback:
+        try:
+            _status_update_callback(status)
+        except Exception:
+            # Silently ignore status update failure, does not affect the main flow
+            pass
+
+    # 2. Push status changes to the frontend via WebSocket
+    if _router:
+        try:
+            # Multi-user mode: broadcast to all active sessions
+            session_id = None  # None triggers the router to broadcast to all sessions
+            # Push status change message
+            message = {"type": "status_update", "payload": {"execution_status": status}}
+            _router.publish(message, session_id=session_id)
+        except Exception as e:
+            save_exception(
+                e, module="haijunbot_web_gateway.app", function="_update_status"
+            )
+            pass
+
+
+def _on_agent_status_change(agent_id: str, status: str, data: Any) -> None:
+    """Agent status change callback, sends WebSocket notifications.
+
+    Called by AgentManager when the Agent lifecycle status changes (e.g. stopped/deleted/error),
+    broadcasts status_update messages to all connected frontends via the global _router, so the frontend can in real time
+    synchronize the Agent's execution status (e.g. mark a stopped Agent as stopped).
+
+    Args:
+        agent_id: Agent ID
+        status: new status ("running", "stopped", "deleted", "error")
+        data: additional data (Agent info dictionary)
+    """
+    if not _router:
+        return
+    try:
+        # Map the Agent lifecycle status to a frontend-recognizable execution_status:
+        # running → running; stopped/error → stopped (frontend uses this to mark the Agent as exited);
+        # deleted means the Agent has been deleted, the frontend does not need to update execution_status,
+        # but the event is still broadcast (including the original status) for the frontend to refresh the Agent list.
+        execution_status: Optional[str] = None
+        if status == "running":
+            execution_status = "running"
+        elif status in ("stopped", "error"):
+            execution_status = "stopped"
+
+        payload: Dict[str, Any] = {"agent_id": agent_id, "status": status}
+        if execution_status:
+            payload["execution_status"] = execution_status
+        # session_id=None triggers the router to broadcast to all sessions
+        _router.publish({"type": "status_update", "payload": payload}, session_id=None)
+    except Exception as e:
+        save_exception(
+            e, module="haijunbot_web_gateway.app", function="_on_agent_status_change"
+        )
+
+
+# Stop flag for the pipeline event bridge thread (set when lifespan shuts down)
+_pipeline_pump_stop = threading.Event()
+
+
+def _pipeline_event_pump() -> None:
+    """Background thread: broadcast pipeline_runner progress events to all frontend connections.
+
+    pipeline_runner runs in a separate thread/subprocess and, via the global event bus (a pure in-memory queue),
+    writes progress events; this thread periodically drains and broadcasts them one by one via the global _router as
+    {"type": "pipeline_event", "payload": <event>}. When there are no frontend connections, publish
+    returns directly and the event is discarded (progress can tolerate dropped frames; the final state is determined by pipeline_done).
+    """
+    from haijunbot.haijunbot_tools.pipeline_events import get_event_bus
+
+    bus = get_event_bus()
+    while not _pipeline_pump_stop.is_set():
+        try:
+            if _router and bus.has_events():
+                for event in bus.drain():
+                    _router.publish(
+                        {"type": "pipeline_event", "payload": event},
+                        session_id=None,
+                    )
+        except Exception as e:  # pylint: disable=broad-except
+            save_exception(
+                e, module="haijunbot_web_gateway.app", function="_pipeline_event_pump"
+            )
+        # Use wait instead of sleep, so shutdown can wake and exit immediately
+        _pipeline_pump_stop.wait(0.2)
+
+
+class WebGateway(BaseGateway):
+    """Web Gateway implementation: bridges output, input, and execution events to WebSocket."""
+
+    def __init__(
+        self,
+        router: SessionOutputRouter,
+        input_registry: InputSessionRegistry,
+        auth_store: Dict[str, Optional[Dict[str, Any]]],
+        terminal_input_registry: TerminalInputRegistry,
+    ) -> None:
+        self._router = router
+        self._input_registry = input_registry
+        self._auth_store = auth_store
+        self._terminal_input_registry = terminal_input_registry
+
+        # Message cache: continuously cache all messages (output + input, up to 100 million), used to restore the full conversation after reconnection
+        self._message_cache: deque = deque(maxlen=100_000_000)
+
+        # Message sequence number: maintain an independent sequence per agent_id
+        self._agent_message_sequences: Dict[str, int] = {}  # agent_id -> next_seq
+        self._global_message_sequence: int = 0  # Sequence number for global messages (no agent_id)
+
+        # Input cache: distinguish sent/unsent
+        self._pending_inputs: List[Dict[str, Any]] = []  # Unsent input requests
+        self._sent_inputs: Dict[
+            str, Dict[str, Any]
+        ] = {}  # Sent but no reply received: {session_id: message}
+
+        # Frontend JS execution wait queue: call_id -> Queue
+        self._js_eval_waiters: Dict[str, Queue] = {}
+        self._js_eval_lock = threading.Lock()
+        # client_id -> (WS connection_id, session_id), used by eval_js to precisely deliver to a frontend connection
+        self._client_connection_map: Dict[str, tuple[str, str]] = {}
+
+    def emit_output(self, event: GatewayOutputEvent) -> None:
+        # Multi-user mode: broadcast to all active sessions, check whether any session is authorized
+        session_id = None  # None triggers the router to broadcast to all sessions
+        authorized = any(
+            self._check_auth(auth)[0] for auth in self._auth_store.values() if auth
+        )
+
+        context = dict(event.context) if event.context else {}
+
+        # Agent process automatically fills in agent_id
+        if os.environ.get("IS_AGENT_PROCESS") == "1":
+            if not context.get("agent_id"):
+                from haijunbot.haijunbot_utils import globals as jglobals
+
+                if jglobals.agent_id:
+                    context["agent_id"] = jglobals.agent_id
+
+        payload = {
+            "text": event.text,
+            "output_type": event.output_type,
+            "timestamp": event.timestamp,
+            "lang": event.lang,
+            "traceback": event.traceback,
+            "section": event.section,
+            "context": context,
+        }
+        if context.get("agent_id"):
+            payload["agent_id"] = context["agent_id"]
+
+        # Assign a sequence number to the message (by agent_id or global)
+        agent_id = context.get("agent_id")
+        if agent_id:
+            seq = self._agent_message_sequences.get(agent_id, 0)
+            self._agent_message_sequences[agent_id] = seq + 1
+        else:
+            seq = self._global_message_sequence
+            self._global_message_sequence += 1
+
+        message = {"type": "output", "payload": payload, "seq": seq}
+
+        # Continuously cache all messages (regardless of authorization)
+        self._message_cache.append(message)
+
+        # If authorized, send in real time
+        if authorized:
+            self._router.publish(message, session_id=session_id)
+
+    def request_input(self, request: GatewayInputRequest) -> GatewayInputResult:
+        # Multi-user mode: use the first authorized session_id to wait for input
+        metadata = dict(request.metadata) if request.metadata else {}
+
+        # Wait for the WebSocket connection to be established (check whether any session in auth_store is authorized)
+        import time
+
+        wait_interval = 0.5  # seconds
+        waited = 0.0
+        session_id: Optional[str] = None
+
+        while True:
+            # Dynamically get the first authorized session_id
+            session_id = next(
+                (
+                    sid
+                    for sid, auth in self._auth_store.items()
+                    if auth and self._check_auth(auth)[0]
+                ),
+                None,
+            )
+            auth_payload = metadata.get("auth") or (
+                next(
+                    (
+                        a
+                        for a in self._auth_store.values()
+                        if a and self._check_auth(a)[0]
+                    ),
+                    None,
+                )
+            )
+            authorized, reason = self._check_auth(auth_payload)
+            if authorized and session_id:
+                break
+
+            time.sleep(wait_interval)
+            waited += wait_interval
+
+        metadata["session_id"] = session_id
+
+        payload = {
+            "tip": request.tip,
+            "mode": request.mode or "multi",  # Default multiline mode
+            "preset": request.preset,
+            "preset_cursor": request.preset_cursor,
+            "metadata": metadata,
+        }
+        message = {"type": "input_request", "payload": payload}
+        self._router.publish(message, session_id=session_id)
+        # Save the input request, used to restore after reconnection
+        self._input_registry.save_input_request(session_id, message)
+        # Track sent input requests
+        self._sent_inputs[session_id] = message
+
+        # Update status to waiting for input
+        if request.mode == "single":
+            _update_status("waiting_single")
+        else:
+            _update_status("waiting_multi")
+
+        session = self._input_registry.get_or_create(session_id)
+
+        # Set the input injection callback, allowing the /message endpoint to inject messages directly into the input stream
+        jglobals.input_inject_callback = session.submit_input
+
+        try:
+            # Single-line input does not use the global buffer, only multiline input uses it
+            text = session.wait_for_input(use_global_buffer=(request.mode != "single"))
+        finally:
+            # Clear the callback to avoid later misuse
+            jglobals.input_inject_callback = None
+
+        # Input complete, restore to running status
+        _update_status("running")
+
+        # Clear the completed input request
+        self._sent_inputs.pop(session_id, None)
+
+        return GatewayInputResult(text=text, metadata=metadata)
+
+    def request_confirm(self, request: GatewayConfirmRequest) -> GatewayConfirmResult:
+        # Multi-user mode: use the first authorized session_id
+        metadata = dict(request.metadata) if request.metadata else {}
+        session_id: Optional[str] = None
+        # Wait for at least one authorized session
+        import time
+
+        wait_interval = 0.5
+        while True:
+            session_id = next(
+                (
+                    sid
+                    for sid, auth in self._auth_store.items()
+                    if auth and self._check_auth(auth)[0]
+                ),
+                None,
+            )
+            auth_payload = metadata.get("auth") or (
+                next(
+                    (
+                        a
+                        for a in self._auth_store.values()
+                        if a and self._check_auth(a)[0]
+                    ),
+                    None,
+                )
+            )
+            authorized, reason = self._check_auth(auth_payload)
+            if authorized and session_id:
+                break
+            time.sleep(wait_interval)
+
+        metadata["session_id"] = session_id
+        payload = {
+            "message": request.message,
+            "default": request.default,
+            "metadata": metadata,
+        }
+        message = {"type": "confirm", "payload": payload}
+        self._router.publish(message, session_id=session_id)
+        # Save the confirmation request, used to restore after reconnection
+        self._input_registry.save_confirm_request(session_id, message)
+        # Track sent confirmation requests (use a special key to distinguish input from confirm)
+        confirm_key = f"{session_id}_confirm"
+        self._sent_inputs[confirm_key] = message
+
+        # Update status to waiting for confirmation
+        _update_status("waiting_confirm")
+
+        session = self._input_registry.get_or_create_confirm_session(session_id)
+        confirmed = session.wait_for_confirm()
+
+        # Confirmation complete, restore to running status
+        _update_status("running")
+
+        # Clear the completed confirmation request
+        self._sent_inputs.pop(confirm_key, None)
+
+        return GatewayConfirmResult(confirmed=confirmed, metadata=metadata)
+
+    def request_frontend_js(
+        self, code: str, timeout: float = 30.0, target: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Deliver JS to the frontend and wait for the execution result.
+
+        Args:
+            code: JavaScript code to execute
+            timeout: wait timeout (seconds)
+            target: target frontend; None/"current" takes the first authorized session, "all" broadcasts,
+                a registered client_id is precisely delivered to that frontend connection, other values are treated as a specific session_id
+
+        Returns:
+            dict: result returned by the frontend (containing success/result or success/error)
+        """
+        connection_id: Optional[str] = None
+        if target in (None, "", "current"):
+            session_id: Optional[str] = next(
+                (
+                    sid
+                    for sid, auth in self._auth_store.items()
+                    if auth and self._check_auth(auth)[0]
+                ),
+                None,
+            )
+            if session_id is None:
+                return {"success": False, "error": "No available frontend connection"}
+        elif target == "all":
+            session_id = None  # Broadcast
+        else:
+            # Prefer precise delivery to a specific frontend connection by client_id
+            mapped = self._client_connection_map.get(str(target))
+            if mapped is not None:
+                connection_id, session_id = mapped
+                if not self._router.has_connection(
+                    connection_id, session_id=session_id
+                ):
+                    return {
+                        "success": False,
+                        "error": f"Frontend connection is closed: {target}",
+                    }
+            else:
+                session_id = target
+
+        call_id = uuid.uuid4().hex
+        waiter: Queue = Queue()
+        with self._js_eval_lock:
+            self._js_eval_waiters[call_id] = waiter
+
+        message = {
+            "type": "eval_js_request",
+            "payload": {"call_id": call_id, "code": code, "timeout": timeout},
+        }
+        self._router.publish(
+            message, session_id=session_id, connection_id=connection_id
+        )
+
+        try:
+            return cast(Dict[str, Any], waiter.get(timeout=timeout))
+        except Empty:
+            return {"success": False, "error": f"Frontend execution timed out ({timeout}s)"}
+        finally:
+            with self._js_eval_lock:
+                self._js_eval_waiters.pop(call_id, None)
+
+    def submit_js_eval_result(self, payload: Dict[str, Any]) -> None:
+        """Receive the JS execution result returned by the frontend, wake up the corresponding waiter."""
+        call_id = payload.get("call_id")
+        if not call_id:
+            return
+        with self._js_eval_lock:
+            waiter = self._js_eval_waiters.get(call_id)
+        if waiter is not None:
+            waiter.put(payload)
+
+    def publish_editor_command(
+        self, agent_id: str, command: str, payload: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Broadcast an editor command to all frontends (e.g. open file/go to line/show diff).
+
+        command determines the message type: e.g. command='open_file' → type='editor_open_file'.
+        payload will be merged into the message payload (agent_id is automatically included); the frontend uses this to locate the Agent's
+        working_dir and node_id. session_id=None triggers the router to broadcast to all active sessions.
+        """
+        message = {
+            "type": f"editor_{command}",
+            "payload": {"agent_id": agent_id, **(payload or {})},
+        }
+        self._router.publish(message, session_id=None)
+
+    def publish_execution_event(
+        self,
+        event: GatewayExecutionEvent,
+        session_id: Optional[str] = None,
+    ) -> None:
+        # Multi-user mode: broadcast to all active sessions
+        session_id = None  # None triggers the router to broadcast to all sessions
+        payload = dict(event.payload) if event.payload else {}
+        auth_payload = payload.get("auth") or (
+            next(
+                (a for a in self._auth_store.values() if a and self._check_auth(a)[0]),
+                None,
+            )
+        )
+        authorized, _ = self._check_auth(auth_payload)
+        if not authorized:
+            return
+
+        # 🔧 Adapt to the message structure expected by the frontend
+        # Frontend expects: { event_type: 'stdout'|'stderr', data: '...', encoded: true/false }
+        # Backend raw: { stream: 'stdout', chunk: '...', encoded: true }
+        stream = payload.get("stream", "stdout")  # "stdout" or "stderr" or "tty"
+        chunk = payload.get("chunk", "")  # actual output content (may be a base64-encoded string)
+        encoded = payload.get("encoded", False)  # whether base64-encoded
+        # 🔧 map 'tty' to 'stdout' so the frontend can handle it correctly
+        if stream == "tty":
+            stream = "stdout"
+
+        message_payload = {
+            "event_type": stream,  # use stream as event_type
+            "data": chunk,  # use chunk as data (may be base64)
+            "encoded": encoded,  # pass the encoding flag
+            "tool": payload.get("tool"),
+            "sequence": payload.get("sequence"),
+            "execution_id": payload.get("execution_id"),
+        }
+        if event.timestamp:
+            message_payload["timestamp"] = event.timestamp
+        if "message_type" in payload:
+            message_payload["message_type"] = payload["message_type"]
+
+        message = {"type": "execution", "payload": message_payload}
+        self._router.publish(message, session_id=session_id)
+
+    def get_execution_input_callback(
+        self,
+        execution_id: str,
+    ) -> Optional[Callable[[float], Optional[str]]]:
+        return self._terminal_input_registry.get_input_callback(execution_id)
+
+    def get_execution_resize_callback(
+        self,
+        execution_id: str,
+    ) -> Optional[Callable[[], Optional[Tuple[int, int]]]]:
+        return self._terminal_input_registry.get_resize_callback(execution_id)
+
+
+class WebSocketConnectionManager:
+    """WebSocket connection management."""
+
+    def __init__(
+        self,
+        router: SessionOutputRouter,
+        input_registry: InputSessionRegistry,
+        terminal_input_registry: TerminalInputRegistry,
+        gateway: WebGateway,
+        auth_store: Dict[str, Optional[Dict[str, Any]]],
+        user_manager: Optional[Any] = None,
+        permission_manager: Optional[Any] = None,
+        data_dir: Optional[str] = None,
+    ) -> None:
+        self._router = router
+        self._input_registry = input_registry
+        self._terminal_input_registry = terminal_input_registry
+        self._gateway = gateway
+        self._auth_store = auth_store
+        self._user_manager = user_manager
+        self._permission_manager = permission_manager
+
+        self._active_connections: Dict[str, Dict[str, tuple[str, WebSocket]]] = {}
+        self._connection_state_lock = asyncio.Lock()
+
+        # chat room management
+        self._chat_manager = ChatManager(data_dir, user_manager=self._user_manager)
+
+    async def handle(self, websocket: WebSocket) -> None:
+        await websocket.accept(subprotocol="haijunbot-ws")
+        connection_id = str(uuid.uuid4())
+        loop = asyncio.get_running_loop()
+
+        # perform the authentication check first; only allow replacing the old connection after authentication passes
+        auth_payload = _extract_auth_from_headers(websocket)
+        authorized, reason = self._gateway._check_auth(auth_payload)
+        if not authorized:
+            await _send_error(websocket, "AUTH_FAILED", reason or "auth failed")
+            await websocket.close()
+            return
+
+        # extract user_id from auth info, generate per-user session_id to achieve user-level auth isolation
+        user_id = "unknown"
+        if auth_payload and isinstance(auth_payload, dict):
+            user_info = auth_payload.get("user_info")
+            if user_info and isinstance(user_info, dict):
+                user_id = user_info.get("user_id", "unknown")
+        session_id = f"session_{user_id}"
+
+        async with self._connection_state_lock:
+            existing_connections = self._active_connections.get(session_id)
+            if existing_connections:
+                print(
+                    f"[WS CONNECTION] New connection added (existing={len(existing_connections)})"
+                )
+
+        self._auth_store[session_id] = auth_payload
+        print(
+            "[WS AUTH] authenticated "
+            f"session_id={session_id} connection_id={connection_id} "
+            f"has_token={bool((auth_payload or {}).get('token'))} "
+            f"auth_store_keys={list(self._auth_store.keys())}"
+        )
+        self._router.register(
+            connection_id,
+            _build_sender(websocket, loop),
+            session_id=session_id,
+        )
+        async with self._connection_state_lock:
+            connections = self._active_connections.setdefault(session_id, {})
+            connections[connection_id] = (connection_id, websocket)
+        self._input_registry.register_provider(session_id)
+        await websocket.send_json(
+            {"type": "ready", "payload": {"session_id": session_id}}
+        )
+        # message history is incrementally synced on demand via sync_request sent by the frontend; not actively pushed when the connection is established
+        # restore pending input requests
+        pending_request = self._input_registry.get_input_request(session_id)
+        if pending_request:
+            session = self._input_registry.get_or_create(session_id)
+            session.reconnect()
+            await websocket.send_json(pending_request)
+        # restore pending confirmation requests
+        pending_confirm = self._input_registry.get_confirm_request(session_id)
+        if pending_confirm:
+            confirm_session = self._input_registry.get_or_create_confirm_session(
+                session_id
+            )
+            confirm_session.reconnect()
+            await websocket.send_json(pending_confirm)
+        try:
+            while True:
+                message = await websocket.receive_json()
+                await self._handle_message(
+                    session_id, message, websocket, connection_id
+                )
+        except WebSocketDisconnect:
+            print(
+                "[WS DISCONNECT] "
+                f"session_id={session_id} connection_id={connection_id} "
+                f"active_auth={session_id in self._auth_store}"
+            )
+        finally:
+            print(
+                "[WS CLEANUP] begin "
+                f"session_id={session_id} connection_id={connection_id} "
+                f"active_auth_before={session_id in self._auth_store}"
+            )
+            self._router.unregister(connection_id, session_id=session_id)
+            self._input_registry.unregister_provider(session_id)
+            self._input_registry.disconnect_confirm_session(session_id)
+            # unregister chat client
+            for cid, client in list(self._chat_manager._chat_clients.items()):
+                if client.get("connection_id") == connection_id:
+                    await self._chat_manager.unregister_client(cid)
+            # clean up the client_id -> connection_id mapping
+            for cid, (ws_conn_id, _sid) in list(
+                self._gateway._client_connection_map.items()
+            ):
+                if ws_conn_id == connection_id:
+                    self._gateway._client_connection_map.pop(cid, None)
+            async with self._connection_state_lock:
+                conns = self._active_connections.get(session_id)
+                if conns:
+                    conns.pop(connection_id, None)
+                    if not conns:
+                        self._active_connections.pop(session_id, None)
+                        self._auth_store.pop(session_id, None)
+            print(
+                "[WS CLEANUP] end "
+                f"session_id={session_id} connection_id={connection_id} "
+                f"active_auth_after={session_id in self._auth_store}"
+            )
+
+    async def _handle_sync_request(
+        self, session_id: str, agent_seqs: Dict[str, int], websocket: WebSocket
+    ) -> None:
+        """Handle sync requests, returning all historical messages for that agent in the message cache at once"""
+        print(
+            f"[SYNC_REQUEST] received session_id={session_id} "
+            f"agent_seqs={agent_seqs} "
+            f"cache_size={len(self._gateway._message_cache)}"
+        )
+
+        # get the list of agent_ids requested by the frontend
+        requested_agent_ids = set(agent_seqs.keys())
+        # exclude __global__, handle it separately
+        requested_agent_ids.discard("__global__")
+        has_global = "__global__" in agent_seqs
+
+        # collect all matching historical messages (incremental: only return messages with seq > lastSeq)
+        matched_messages = []
+        for cached_message in self._gateway._message_cache:
+            if not isinstance(cached_message, dict):
+                continue
+
+            # get the agent_id of the message
+            msg_type = cached_message.get("type")
+            if msg_type == "output":
+                msg_payload = cached_message.get("payload", {})
+                msg_agent_id = (
+                    msg_payload.get("agent_id")
+                    if isinstance(msg_payload, dict)
+                    else None
+                )
+            elif msg_type == "input_result":
+                msg_payload = cached_message.get("payload", {})
+                msg_agent_id = (
+                    msg_payload.get("agent_id")
+                    if isinstance(msg_payload, dict)
+                    else None
+                )
+            else:
+                msg_agent_id = None
+
+            # check whether it matches the requested agent_id
+            if msg_agent_id and msg_agent_id in requested_agent_ids:
+                # incremental filter: only return messages whose sequence number is greater than the client's latest known sequence number
+                last_seq = agent_seqs.get(msg_agent_id, -1)
+                msg_seq = cached_message.get("seq", -1)
+                if isinstance(msg_seq, (int, float)) and msg_seq > last_seq:
+                    matched_messages.append(cached_message)
+            elif msg_agent_id is None and has_global:
+                # incremental filter for global messages
+                last_seq = agent_seqs.get("__global__", -1)
+                msg_seq = cached_message.get("seq", -1)
+                if isinstance(msg_seq, (int, float)) and msg_seq > last_seq:
+                    matched_messages.append(cached_message)
+
+        # limit to at most the most recent 30 messages to avoid excessive data volume
+        MAX_SYNC_MESSAGES = 30
+        if len(matched_messages) > MAX_SYNC_MESSAGES:
+            matched_messages = matched_messages[-MAX_SYNC_MESSAGES:]
+
+        # merge into a single sync_response message and send it at once
+        print(
+            f"[SYNC_REQUEST] sending sync_response with "
+            f"{len(matched_messages)} messages"
+        )
+        await websocket.send_json(
+            {
+                "type": "sync_response",
+                "payload": {"messages": matched_messages},
+            }
+        )
+        print("[SYNC_REQUEST] sync_response sent successfully")
+
+    async def _handle_message(
+        self,
+        session_id: str,
+        message: Dict[str, Any],
+        websocket: WebSocket,
+        connection_id: Optional[str] = None,
+    ) -> None:
+        if not isinstance(message, dict):
+            return  # type: ignore[unreachable]
+        message_type: Optional[str] = message.get("type")
+        payload = message.get("payload") or {}
+
+        if message_type == "sync_request":
+            # handle incremental sync requests (only handled by the Agent process)
+            if os.environ.get("IS_AGENT_PROCESS") == "1":
+                agent_seqs = payload.get("agent_seqs", {})
+                print(
+                    f"[SYNC_REQUEST] dispatching to _handle_sync_request "
+                    f"session_id={session_id} agent_seqs={agent_seqs}"
+                )
+                await self._handle_sync_request(session_id, agent_seqs, websocket)
+            else:
+                print(
+                    f"[SYNC_REQUEST] IGNORED (not agent process) "
+                    f"IS_AGENT_PROCESS={os.environ.get('IS_AGENT_PROCESS')}"
+                )
+            return
+        if message_type == "input_result":
+            text = payload.get("text", "")
+
+            # [new] add sender info at the top of multi-line messages
+            # prefer the display_name passed by the frontend, fall back to auth info
+            sender_name = payload.get("display_name") or None
+
+            if not sender_name:
+                # get sender display_name from auth info
+                auth_payload = self._auth_store.get(session_id)
+                if auth_payload and isinstance(auth_payload, dict):
+                    user_info = auth_payload.get("user_info")
+                    if user_info and isinstance(user_info, dict):
+                        user_id = user_info.get("user_id")
+                        if user_id and self._user_manager:
+                            user_data = self._user_manager.get_user(user_id)
+                            if user_data:
+                                sender_name = user_data.get(
+                                    "display_name"
+                                ) or user_data.get("username")
+                        if not sender_name:
+                            sender_name = (
+                                user_info.get("display_name")
+                                or user_info.get("username")
+                                or user_info.get("user_id")
+                            )
+
+            # only add the sender prefix in multi-line input mode (no need to add for single-line input)
+            if sender_name and payload.get("input_mode") == "multi":
+                text = f"{sender_name}: {text}"
+
+            # assign a sequence number to the user input message
+            agent_id = payload.get("agent_id")
+            if agent_id:
+                seq = self._gateway._agent_message_sequences.get(agent_id, 0)
+                self._gateway._agent_message_sequences[agent_id] = seq + 1
+            else:
+                seq = self._gateway._global_message_sequence
+                self._gateway._global_message_sequence += 1
+            message_with_seq = dict(message)
+            message_with_seq["seq"] = seq
+
+            # ➕ new: broadcast user input as an output message to all frontends, ensuring all frontends receive the user input with seq
+            user_input_msg = {
+                "type": "output",
+                "payload": {
+                    "output_type": "user_input",
+                    "agent_name": "user",
+                    "text": text,
+                    "lang": "text",
+                    "agent_id": agent_id,
+                },
+                "seq": seq,
+            }
+            self._router.publish(user_input_msg, session_id=session_id)
+
+            # cache the user input message to restore conversation integrity after reconnection
+            self._gateway._message_cache.append(message_with_seq)
+            # send the user input message with seq back to the frontend so it can be added to the history
+            self._router.publish(message_with_seq, session_id=session_id)
+            # check whether currently waiting for input
+            session = self._input_registry.get_or_create(session_id)
+            if session.is_waiting_for_input():
+                # currently waiting for input, submit directly
+                self._input_registry.submit_input(session_id, text)
+            else:
+                # not in a waiting-for-input state, store in the global buffer
+                from haijunbot.haijunbot_utils.globals import add_input_buffer
+
+                add_input_buffer(text)
+            return
+        if message_type == "confirm_result":
+            confirmed = payload.get("confirmed", False)
+            self._input_registry.submit_confirm(session_id, confirmed)
+            return
+        if message_type == "eval_js_result":
+            self._gateway.submit_js_eval_result(payload)
+            return
+        if message_type == "terminal_input":
+            execution_id = payload.get("execution_id")
+            data = payload.get("data", "")
+            if not execution_id:
+                return
+            self._terminal_input_registry.submit_terminal_input(execution_id, data)
+            return
+        if message_type == "terminal_resize":
+            execution_id = payload.get("execution_id")
+            rows = payload.get("rows")
+            cols = payload.get("cols")
+            if not execution_id:
+                return
+            if rows is None or cols is None:
+                return
+            try:
+                rows_int = int(rows)
+                cols_int = int(cols)
+            except (TypeError, ValueError):
+                return
+            self._terminal_input_registry.submit_terminal_resize(
+                execution_id, rows_int, cols_int
+            )
+            return
+        if message_type == "manual_interrupt":
+            # first check whether there is a running script process; if so, send a SIGINT signal
+            script_pid = get_script_pid()
+            if script_pid is not None:
+                try:
+                    os.kill(script_pid, signal.SIGINT)
+                except OSError:
+                    pass  # the process may have already ended
+            set_interrupt(True)
+            return
+        if message_type == "get_status":
+            # handle requests where the frontend actively requests status
+            logger.info("[WS MESSAGE] Received get_status request")
+            if get_agent_status_manager is not None:
+                try:
+                    status_manager = get_agent_status_manager()
+                    current_status = status_manager.get_status()
+                    logger.info(f"[WS MESSAGE] Current agent status: {current_status}")
+                    # return a status_update message
+                    status_message = {
+                        "type": "status_update",
+                        "payload": {"execution_status": current_status},
+                    }
+                    self._router.publish(status_message, session_id=session_id)
+                    logger.info(
+                        f"[WS MESSAGE] Published status_update to session {session_id}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[WS MESSAGE] Error handling get_status: {e}", exc_info=True
+                    )
+            else:
+                logger.warning("[WS MESSAGE] get_agent_status_manager is not available")  # type: ignore[unreachable]
+            return
+        # standalone terminal session message handling
+        # check whether forwarding to a remote node is needed
+        if message_type in (
+            "terminal_create",
+            "terminal_close",
+            "terminal_session_input",
+            "terminal_session_resize",
+        ):
+            terminal_node_id = str(payload.get("node_id") or "").strip()
+            if terminal_node_id and terminal_node_id not in (
+                _node_runtime.local_node_id if _node_runtime else "master",
+                "master",
+                "",
+            ):
+                # forward to the remote node
+                if _node_connection_manager is None:
+                    logger.error(
+                        "[WS MESSAGE] Node connection manager is not available"
+                    )
+                    return
+                try:
+                    response = await _node_connection_manager.send_request_to_node(
+                        terminal_node_id,
+                        NODE_TERMINAL_REQUEST,
+                        {
+                            "action": message_type,
+                            "payload": payload,
+                            "session_id": session_id,
+                        },
+                    )
+                    resp_payload = response.get("payload") or {}
+                    # for terminal_create, forward the response to the frontend
+                    if message_type == "terminal_create" and resp_payload.get(
+                        "success"
+                    ):
+                        result_data = resp_payload.get("data") or {}
+                        # add node_id so the frontend knows which node the terminal is on
+                        result_data["node_id"] = terminal_node_id
+                        result_msg = {
+                            "type": "terminal_created",
+                            "payload": result_data,
+                        }
+                        self._router.publish(result_msg, session_id=session_id)
+                        # real-time terminal sharing: broadcast to all admin users
+                        self._publish_terminal_event_to_admins(result_msg, session_id)
+                        # register a shadow session of the child node terminal on the master so that list_sessions_for_user
+                        # can return child node terminals (frontend sync recovery); ACL decisions remain on the master
+                        if _terminal_session_manager:
+                            terminal_id = result_data.get("terminal_id")
+                            if terminal_id:
+                                owner_id = ""
+                                if session_id and session_id.startswith("session_"):
+                                    owner_id = session_id[len("session_") :]
+                                _terminal_session_manager.register_remote_session(
+                                    terminal_id=terminal_id,
+                                    node_id=terminal_node_id,
+                                    owner_id=owner_id,
+                                    session_id=session_id,
+                                    interpreter=result_data.get("interpreter", "bash"),
+                                    working_dir=result_data.get("working_dir", "."),
+                                )
+                    elif message_type == "terminal_close" and resp_payload.get(
+                        "success"
+                    ):
+                        result_msg = {
+                            "type": "terminal_closed",
+                            "payload": {"terminal_id": payload.get("terminal_id")},
+                        }
+                        self._router.publish(result_msg, session_id=session_id)
+                        # real-time terminal sharing: broadcast to all admin users
+                        self._publish_terminal_event_to_admins(result_msg, session_id)
+                        # remove the shadow session of the child node terminal registered on the master
+                        if _terminal_session_manager:
+                            _terminal_session_manager.unregister_session(
+                                str(payload.get("terminal_id") or "")
+                            )
+                except Exception as e:
+                    save_exception(
+                        e, module="haijunbot_web_gateway.app", function="__init__"
+                    )
+                    pass
+                return
+
+        if message_type == "terminal_create":
+            # permission check: terminal:create
+            auth_payload = self._auth_store.get(session_id)
+            user_id = None
+            if auth_payload and isinstance(auth_payload, dict):
+                user_info = auth_payload.get("user_info")
+                if user_info and isinstance(user_info, dict):
+                    user_id = user_info.get("user_id")
+            if user_id and user_id != "system" and self._permission_manager:
+                if not self._permission_manager.check_permission(
+                    user_id, "terminal:create"
+                ):
+                    error_msg: Dict[str, Any] = {
+                        "type": "terminal_error",
+                        "payload": {"error": "Permission denied: terminal:create"},
+                    }
+                    self._router.publish(error_msg, session_id=session_id)
+                    return
+                # node access check
+                check_node_id = terminal_node_id if terminal_node_id else "master"  # ty: ignore[possibly-unresolved-reference]
+                if not self._permission_manager.check_node_access(
+                    user_id, check_node_id
+                ):
+                    error_msg = {
+                        "type": "terminal_error",
+                        "payload": {
+                            "error": f"Permission denied: no access to node {check_node_id}"
+                        },
+                    }
+                    self._router.publish(error_msg, session_id=session_id)
+                    return
+            interpreter = payload.get("interpreter") or os.environ.get("SHELL", "bash")
+            raw_working_dir = payload.get("working_dir")
+            working_dir = str(raw_working_dir).strip() if raw_working_dir else ""
+            if not working_dir:
+                working_dir = str(pathlib.Path.home())
+            if _terminal_session_manager:
+                terminal_id, error = _terminal_session_manager.create_session(
+                    interpreter=interpreter,
+                    working_dir=working_dir,
+                    stream_publisher=self._router,
+                    session_id=session_id,
+                    owner_id=user_id or "",
+                )
+                if terminal_id:
+                    message = {
+                        "type": "terminal_created",
+                        "payload": {
+                            "terminal_id": terminal_id,
+                            "interpreter": interpreter,
+                            "working_dir": working_dir,
+                            "node_id": str(
+                                _node_runtime.local_node_id
+                                if _node_runtime
+                                else "master"
+                            ),
+                        },
+                    }
+                    self._router.publish(message, session_id=session_id)
+                    # real-time terminal sharing: broadcast to all admin users (admins can view all terminals),
+                    # so other devices (administrators) can see new terminals appear in real time
+                    self._publish_terminal_event_to_admins(message, session_id)
+            return
+        if message_type == "terminal_close":
+            # permission check: terminal:create (unified permission for terminal operations)
+            auth_payload = self._auth_store.get(session_id)
+            user_id = None
+            if auth_payload and isinstance(auth_payload, dict):
+                user_info = auth_payload.get("user_info")
+                if user_info and isinstance(user_info, dict):
+                    user_id = user_info.get("user_id")
+            if user_id and user_id != "system" and self._permission_manager:
+                if not self._permission_manager.check_permission(
+                    user_id, "terminal:create"
+                ):
+                    error_msg = {
+                        "type": "terminal_error",
+                        "payload": {"error": "Permission denied: terminal:create"},
+                    }
+                    self._router.publish(error_msg, session_id=session_id)
+                    return
+            terminal_id = payload.get("terminal_id")
+            if terminal_id and _terminal_session_manager:
+                # ownership check: only the owner can close the session (fix IDOR)
+                if user_id and user_id != "system":
+                    term_session = _terminal_session_manager.get_session(terminal_id)
+                    if term_session is None or term_session.owner_id != user_id:
+                        error_msg = {
+                            "type": "terminal_error",
+                            "payload": {
+                                "error": "Permission denied: not the owner of this terminal"
+                            },
+                        }
+                        self._router.publish(error_msg, session_id=session_id)
+                        return
+                _terminal_session_manager.close_session(terminal_id)
+                message = {
+                    "type": "terminal_closed",
+                    "payload": {"terminal_id": terminal_id},
+                }
+                self._router.publish(message, session_id=session_id)
+                # real-time terminal sharing: broadcast to all admin users so other devices remove the closed terminal in real time
+                self._publish_terminal_event_to_admins(message, session_id)
+            return
+        if message_type == "terminal_session_input":
+            # permission check: terminal:create (unified permission for terminal operations)
+            auth_payload = self._auth_store.get(session_id)
+            user_id = None
+            if auth_payload and isinstance(auth_payload, dict):
+                user_info = auth_payload.get("user_info")
+                if user_info and isinstance(user_info, dict):
+                    user_id = user_info.get("user_id")
+            if user_id and user_id != "system" and self._permission_manager:
+                if not self._permission_manager.check_permission(
+                    user_id, "terminal:create"
+                ):
+                    error_msg = {
+                        "type": "terminal_error",
+                        "payload": {"error": "Permission denied: terminal:create"},
+                    }
+                    self._router.publish(error_msg, session_id=session_id)
+                    return
+            terminal_id = payload.get("terminal_id")
+            data = payload.get("data", "")
+            if terminal_id and _terminal_session_manager:
+                # interaction check: only the owner or interact users can input (fix IDOR)
+                if user_id and user_id != "system":
+                    access = _terminal_session_manager.check_access(
+                        terminal_id, user_id, True
+                    )
+                    if access not in ("owner", "interact"):
+                        error_msg = {
+                            "type": "terminal_error",
+                            "payload": {
+                                "error": "Permission denied: no interact access to this terminal"
+                            },
+                        }
+                        self._router.publish(error_msg, session_id=session_id)
+                        return
+                _terminal_session_manager.write_input(terminal_id, data)
+            return
+        if message_type == "terminal_session_resize":
+            auth_payload = self._auth_store.get(session_id)
+            user_id = None
+            if auth_payload and isinstance(auth_payload, dict):
+                user_info = auth_payload.get("user_info")
+                if user_info and isinstance(user_info, dict):
+                    user_id = user_info.get("user_id")
+            terminal_id = payload.get("terminal_id")
+            rows = payload.get("rows")
+            cols = payload.get("cols")
+            if terminal_id and _terminal_session_manager:
+                if rows is None or cols is None:
+                    return
+                try:
+                    rows_int = int(rows)
+                    cols_int = int(cols)
+                except (TypeError, ValueError):
+                    return
+                # interaction check: only the owner or interact users can resize
+                if user_id and user_id != "system":
+                    access = _terminal_session_manager.check_access(
+                        terminal_id, user_id, True
+                    )
+                    if access not in ("owner", "interact"):
+                        error_msg = {
+                            "type": "terminal_error",
+                            "payload": {
+                                "error": "Permission denied: no interact access to this terminal"
+                            },
+                        }
+                        self._router.publish(error_msg, session_id=session_id)
+                        return
+                _terminal_session_manager.resize(terminal_id, rows_int, cols_int)
+            return
+        if message_type == "file_upload":
+            # permission check: file:upload
+            auth_payload = self._auth_store.get(session_id)
+            user_id = None
+            if auth_payload and isinstance(auth_payload, dict):
+                user_info = auth_payload.get("user_info")
+                if user_info and isinstance(user_info, dict):
+                    user_id = user_info.get("user_id")
+            if user_id and user_id != "system" and self._permission_manager:
+                if not self._permission_manager.check_permission(
+                    user_id, "file:upload"
+                ):
+                    error_msg = {
+                        "type": "file_upload_response",
+                        "message_id": message.get("message_id"),
+                        "payload": {
+                            "success": False,
+                            "error": "Permission denied: file:upload",
+                        },
+                    }
+                    self._router.publish(error_msg, session_id=session_id)
+                    return
+            # handle file upload requests
+            message_id = message.get("message_id")
+            file_name = payload.get("file_name")
+            file_data = payload.get("file_data")
+
+            if not all([message_id, file_name, file_data]):
+                error_msg = {
+                    "type": "file_upload_response",
+                    "message_id": message_id,
+                    "payload": {"success": False, "error": "Missing required fields"},
+                }
+                self._router.publish(error_msg, session_id=session_id)
+                return
+
+            # check whether forwarding to a remote node is needed
+            node_id = str(payload.get("node_id") or "").strip()
+            if node_id and node_id not in (
+                _node_runtime.local_node_id if _node_runtime else "master",
+                "master",
+                "",
+            ):
+                # forward to the remote node
+                if _node_connection_manager is None:
+                    logger.error(
+                        "[WS MESSAGE] Node connection manager is not available"
+                    )
+                    return
+                try:
+                    response = await _node_connection_manager.send_request_to_node(
+                        node_id,
+                        NODE_TERMINAL_REQUEST,
+                        {
+                            "action": "file_upload",
+                            "payload": payload,
+                            "session_id": session_id,
+                        },
+                    )
+                    # forward the remote node's response to the frontend
+                    self._router.publish(response, session_id=session_id)
+                except Exception as e:
+                    logger.error(
+                        f"[WS MESSAGE] Failed to forward file upload to node {node_id}: {e}"
+                    )
+                    error_msg = {
+                        "type": "file_upload_response",
+                        "message_id": message_id,
+                        "payload": {
+                            "success": False,
+                            "error": f"Failed to forward to node: {str(e)}",
+                        },
+                    }
+                    self._router.publish(error_msg, session_id=session_id)
+                return
+
+            # handle file upload locally
+            try:
+                result = await _handle_file_upload(payload)
+                response_msg = {
+                    "type": "file_upload_response",
+                    "message_id": message_id,
+                    "payload": result,
+                }
+                self._router.publish(response_msg, session_id=session_id)
+            except Exception as e:
+                logger.error(
+                    f"[WS MESSAGE] Error handling file upload: {e}", exc_info=True
+                )
+                error_msg = {
+                    "type": "file_upload_response",
+                    "message_id": message_id,
+                    "payload": {"success": False, "error": str(e)},
+                }
+                self._router.publish(error_msg, session_id=session_id)
+            return
+
+        # ============================================================
+        # chat room message handling
+        # ============================================================
+        if message_type and message_type.startswith("chat_"):
+            await self._handle_chat_message(
+                message_type, payload, websocket, session_id, connection_id
+            )
+            return
+
+    def _publish_terminal_event_to_admins(
+        self, message: Dict[str, Any], exclude_session_id: Optional[str] = None
+    ) -> None:
+        """Broadcast terminal events (create/close) to all admin users to achieve real-time terminal sharing.
+
+        admin users are allowed through via _access_level (treated as owner) and can view all terminals, therefore
+        terminal events should be pushed in real time to all online admin users, so other devices (administrators) can
+        see terminals appear/disappear in real time. Offline users have no connection, and publishing to their session_id has no side effects.
+        """
+        try:
+            if _terminal_session_manager is None:
+                return
+            for admin_sid in _terminal_session_manager.get_all_admin_session_ids():
+                if admin_sid != exclude_session_id:
+                    self._router.publish(message, session_id=admin_sid)
+        except Exception as e:
+            logger.error(
+                f"[WS MESSAGE] Failed to broadcast terminal event to admins: {e}"
+            )
+
+    async def _handle_chat_message(
+        self,
+        message_type: str,
+        payload: Dict[str, Any],
+        websocket: WebSocket,
+        session_id: str,
+        connection_id: Optional[str] = None,
+    ) -> None:
+        """Handle chat room related messages."""
+        try:
+            if message_type == "chat_register":
+                await self._handle_chat_register(
+                    payload, websocket, session_id, connection_id
+                )
+            elif message_type == "chat_get_rooms":
+                await self._handle_chat_get_rooms(websocket)
+            elif message_type == "chat_create_room":
+                await self._handle_chat_create_room(payload, websocket)
+            elif message_type == "chat_join_room":
+                await self._handle_chat_join_room(payload, websocket)
+            elif message_type == "chat_leave_room":
+                await self._handle_chat_leave_room(payload, websocket)
+            elif message_type == "chat_rename_room":
+                await self._handle_chat_rename_room(payload, websocket)
+            elif message_type == "chat_delete_room":
+                await self._handle_chat_delete_room(payload, websocket)
+            elif message_type == "chat_send_message":
+                await self._handle_chat_send_message(payload, websocket)
+            elif message_type == "chat_get_clients":
+                await self._handle_chat_get_clients(websocket)
+            elif message_type == "chat_get_room_members":
+                await self._handle_chat_get_room_members(payload, websocket)
+            elif message_type == "chat_send_private":
+                await self._handle_chat_send_private(payload, websocket, session_id)
+            elif message_type == "chat_get_private_history":
+                await self._handle_chat_get_private_history(
+                    payload, websocket, session_id
+                )
+            else:
+                await websocket.send_json(
+                    {
+                        "type": "chat_error",
+                        "payload": {"error": f"Unknown message type: {message_type}"},
+                    }
+                )
+        except Exception as e:
+            logger.error(f"[CHAT] Error handling {message_type}: {e}", exc_info=True)
+            try:
+                await websocket.send_json(
+                    {"type": "chat_error", "payload": {"error": str(e)}}
+                )
+            except Exception:
+                pass
+
+    async def _handle_chat_register(
+        self,
+        payload: Dict[str, Any],
+        websocket: WebSocket,
+        session_id: str,
+        connection_id: Optional[str] = None,
+    ) -> None:
+        """Register a chat client."""
+        client_id = payload.get("client_id", "")
+        name = payload.get("name", "Anonymous User")
+        if not client_id:
+            await websocket.send_json(
+                {
+                    "type": "chat_register_response",
+                    "payload": {"success": False, "error": "client_id cannot be empty"},
+                }
+            )
+            return
+        if connection_id:
+            # record the client_id to WS connection mapping, for precise per-connection delivery by eval_js etc.
+            self._gateway._client_connection_map[client_id] = (
+                connection_id,
+                session_id,
+            )
+        connection_id = str(uuid.uuid4())
+        # get user_id from auth info
+        auth_payload = self._auth_store.get(session_id)
+        user_id = None
+        if auth_payload and isinstance(auth_payload, dict):
+            user_info = auth_payload.get("user_info")
+            if user_info and isinstance(user_info, dict):
+                user_id = user_info.get("user_id")
+        # get display_name from user_manager
+        display_name = None
+        if user_id and self._user_manager:
+            user_data = self._user_manager.get_user(user_id)
+            if user_data:
+                display_name = user_data.get("display_name")
+        result = await self._chat_manager.register_client(
+            client_id,
+            name,
+            connection_id,
+            websocket,
+            user_id=user_id,
+            display_name=display_name,
+        )
+        await websocket.send_json({"type": "chat_register_response", "payload": result})
+
+    async def _handle_chat_get_rooms(self, websocket: WebSocket) -> None:
+        """Get the chat room list."""
+        rooms = self._chat_manager.get_rooms()
+        await websocket.send_json(
+            {
+                "type": "chat_get_rooms_response",
+                "payload": {"success": True, "rooms": rooms},
+            }
+        )
+
+    async def _handle_chat_create_room(
+        self, payload: Dict[str, Any], websocket: WebSocket
+    ) -> None:
+        """Create a chat room."""
+        name = payload.get("name", "")
+        creator_id = payload.get("client_id", "")
+        if not name:
+            await websocket.send_json(
+                {
+                    "type": "chat_create_room_response",
+                    "payload": {"success": False, "error": "Chat room name cannot be empty"},
+                }
+            )
+            return
+        # look up user_id from client_id
+        client_info = self._chat_manager.get_client(creator_id)
+        user_id = client_info.get("user_id") if client_info else None
+        result = await self._chat_manager.create_room(name, creator_id, user_id=user_id)
+        await websocket.send_json(
+            {"type": "chat_create_room_response", "payload": result}
+        )
+        # broadcast the new room notification to all other online users
+        if result.get("success"):
+            await self._chat_manager.broadcast_to_all(
+                {
+                    "type": "chat_room_created",
+                    "payload": {
+                        "room_id": result["room_id"],
+                        "name": result["name"],
+                        "member_count": 1,
+                        "created_by": creator_id,
+                    },
+                },
+                exclude_client_id=creator_id,
+            )
+
+    async def _handle_chat_join_room(
+        self, payload: Dict[str, Any], websocket: WebSocket
+    ) -> None:
+        """Join a chat room."""
+        room_id = payload.get("room_id", "")
+        client_id = payload.get("client_id", "")
+        result = await self._chat_manager.join_room(room_id, client_id)
+        await websocket.send_json(
+            {"type": "chat_join_room_response", "payload": result}
+        )
+
+    async def _handle_chat_leave_room(
+        self, payload: Dict[str, Any], websocket: WebSocket
+    ) -> None:
+        """Leave a chat room."""
+        room_id = payload.get("room_id", "")
+        client_id = payload.get("client_id", "")
+        result = await self._chat_manager.leave_room(room_id, client_id)
+        await websocket.send_json(
+            {"type": "chat_leave_room_response", "payload": result}
+        )
+
+    async def _handle_chat_delete_room(
+        self, payload: Dict[str, Any], websocket: WebSocket
+    ) -> None:
+        """Delete a chat room (only the creator and administrators can delete)."""
+        room_id = payload.get("room_id", "")
+        client_id = payload.get("client_id", "")
+        result = await self._chat_manager.delete_room(room_id, client_id)
+        if result.get("success"):
+            # notify all members of the deleted room
+            room_name = result.get("name", "")
+            members = result.get("members", [])
+            for mid in members:
+                if mid == client_id:
+                    continue
+                client = self._chat_manager.get_client(mid)
+                if client and client.get("websocket"):
+                    try:
+                        await client["websocket"].send_json(
+                            {
+                                "type": "chat_room_deleted",
+                                "payload": {"room_id": room_id, "name": room_name},
+                            }
+                        )
+                    except Exception:
+                        pass
+        await websocket.send_json(
+            {"type": "chat_delete_room_response", "payload": result}
+        )
+
+    async def _handle_chat_rename_room(
+        self, payload: Dict[str, Any], websocket: WebSocket
+    ) -> None:
+        """Rename a chat room (only the creator can rename)."""
+        room_id = payload.get("room_id", "")
+        client_id = payload.get("client_id", "")
+        new_name = payload.get("new_name", "")
+        result = await self._chat_manager.rename_room(room_id, client_id, new_name)
+        if result.get("success"):
+            # broadcast the rename notification to all room members
+            room = self._chat_manager._chat_rooms.get(room_id)
+            if room:
+                for mid in room["members"]:
+                    client = self._chat_manager.get_client(mid)
+                    if client and client.get("websocket"):
+                        try:
+                            await client["websocket"].send_json(
+                                {
+                                    "type": "chat_room_renamed",
+                                    "payload": {
+                                        "room_id": room_id,
+                                        "old_name": result.get("old_name", ""),
+                                        "new_name": result.get("new_name", ""),
+                                    },
+                                }
+                            )
+                        except Exception:
+                            pass
+        await websocket.send_json(
+            {"type": "chat_rename_room_response", "payload": result}
+        )
+
+    async def _handle_chat_send_message(
+        self, payload: Dict[str, Any], websocket: WebSocket
+    ) -> None:
+        """Send a chat room message."""
+        room_id = payload.get("room_id", "")
+        client_id = payload.get("client_id", "")
+        content = payload.get("content", "")
+        image_url = payload.get("image_url", "")
+        client = self._chat_manager.get_client(client_id)
+        if not client:
+            await websocket.send_json(
+                {
+                    "type": "chat_send_message_response",
+                    "payload": {"success": False, "error": "Client not registered"},
+                }
+            )
+            return
+        msg: Dict[str, Any] = {
+            "type": "chat_message",
+            "payload": {
+                "room_id": room_id,
+                "client_id": client_id,
+                "sender_name": client["name"],
+                "sender_display_name": client.get("display_name", client["name"]),
+                "content": content,
+                "timestamp": time.time(),
+            },
+        }
+        if image_url:
+            msg["payload"]["image_url"] = image_url
+        await self._chat_manager.broadcast_to_room(
+            room_id, msg, exclude_client_id=client_id
+        )
+        await websocket.send_json(
+            {"type": "chat_send_message_response", "payload": {"success": True}}
+        )
+
+    async def _handle_chat_get_clients(self, websocket: WebSocket) -> None:
+        """Get the online client list."""
+        clients = self._chat_manager.get_clients()
+        await websocket.send_json(
+            {
+                "type": "chat_get_clients_response",
+                "payload": {"success": True, "clients": clients},
+            }
+        )
+
+    async def _handle_chat_get_room_members(
+        self, payload: Dict[str, Any], websocket: WebSocket
+    ) -> None:
+        """Get the chat room member list."""
+        room_id = payload.get("room_id", "")
+        members = self._chat_manager.get_room_members(room_id)
+        await websocket.send_json(
+            {
+                "type": "chat_get_room_members_response",
+                "payload": {"success": True, "room_id": room_id, "members": members},
+            }
+        )
+
+    async def _handle_chat_send_private(
+        self,
+        payload: Dict[str, Any],
+        websocket: WebSocket,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Send a private message.
+
+        Security: the sender is forced to use the client_id corresponding to the authenticated user, ignoring the
+        sender_id passed by the client, to prevent impersonating others to send private messages (identity spoofing).
+        """
+        receiver_id = payload.get("receiver_id", "")
+        # resolve the current authenticated user's client_id
+        sender_id = None
+        if session_id:
+            auth_payload = self._auth_store.get(session_id)
+            if auth_payload and isinstance(auth_payload, dict):
+                user_info = auth_payload.get("user_info")
+                if user_info and isinstance(user_info, dict):
+                    auth_user_id = user_info.get("user_id")
+                    if auth_user_id:
+                        client_info = self._chat_manager.get_client_by_user_id(
+                            auth_user_id
+                        )
+                        if client_info:
+                            sender_id = client_info.get("client_id")
+        if not sender_id:
+            await websocket.send_json(
+                {
+                    "type": "chat_send_private_response",
+                    "payload": {"success": False, "error": "Sender not registered"},
+                }
+            )
+            return
+        content = payload.get("content", "")
+        image_url = payload.get("image_url", "")
+        result = await self._chat_manager.send_private(
+            sender_id, receiver_id, content, image_url=image_url
+        )
+        await websocket.send_json(
+            {"type": "chat_send_private_response", "payload": result}
+        )
+
+    async def _handle_chat_get_private_history(
+        self,
+        payload: Dict[str, Any],
+        websocket: WebSocket,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Get private chat history messages.
+
+        Security: one party of the conversation is forced to use the authenticated user's user_id, ignoring the client_id passed by the client,
+        to prevent unauthorized reading of others' private chats (IDOR).
+        """
+        other_id = payload.get("other_id", "")
+        # resolve the current authenticated user
+        auth_user_id = None
+        if session_id:
+            auth_payload = self._auth_store.get(session_id)
+            if auth_payload and isinstance(auth_payload, dict):
+                user_info = auth_payload.get("user_info")
+                if user_info and isinstance(user_info, dict):
+                    auth_user_id = user_info.get("user_id")
+        if not auth_user_id:
+            await websocket.send_json(
+                {
+                    "type": "chat_get_private_history_response",
+                    "payload": {"success": False, "error": "No access to this private chat conversation"},
+                }
+            )
+            return
+        # force the authenticated user's user_id as one party of the conversation: whatever the client passes, it can only query conversations it participates in
+        result = self._chat_manager.get_private_history(auth_user_id, other_id)
+        await websocket.send_json(
+            {"type": "chat_get_private_history_response", "payload": result}
+        )
+
+
+def create_app(
+    custom_app: Optional[FastAPI] = None,
+    node_config: Optional[NodeRuntimeConfig] = None,
+    port: int = 8000,
+    host: str = "127.0.0.1",
+) -> FastAPI:
+    """Create a FastAPI application.
+
+    Args:
+        custom_app: custom FastAPI app, used to add extra routes (such as status queries)
+
+    Returns:
+        FastAPI application instance
+    """
+
+    node_config = node_config or build_node_runtime_config()
+    node_runtime = NodeRuntime(node_config)
+
+    # generate and set the Gateway Token (generated once at startup, used permanently)
+    gateway_token = os.environ.get("HAIJUNBOT_AUTH_TOKEN", generate_gateway_token())
+    # uniformly set it in environment variables for use by child processes (Agent)
+    os.environ["HAIJUNBOT_AUTH_TOKEN"] = gateway_token
+
+    # initialize user management and permission management
+    from haijunbot.haijunbot_utils.utils import get_data_dir
+
+    _data_dir = get_data_dir()
+    user_manager = UserManager(_data_dir)
+    permission_manager = PermissionManager(_data_dir)
+    permission_manager.set_user_manager(
+        user_manager
+    )  # inject user_manager so check_permission supports is_admin bypass
+
+    # ensure the admin user is in the sys-admin group
+    admin_user = user_manager.get_user_by_username("admin")
+    if admin_user:
+        admin_groups = permission_manager.get_user_groups(admin_user["user_id"])
+        admin_group_names = (
+            [g["name"] for g in admin_groups]
+            if admin_groups and isinstance(admin_groups[0], dict)
+            else (admin_groups or [])
+        )
+        if "sys-admin" not in admin_group_names:
+            permission_manager.set_user_groups(admin_user["user_id"], ["sys-admin"])
+
+    # set node_secret in environment variables (for use by the Unix Domain Socket service)
+    if node_config.node_secret:
+        os.environ["HAIJUNBOT_NODE_SECRET"] = node_config.node_secret
+
+    # set the master_url global variable according to the node mode (only set when unset, to avoid overwriting the Agent's existing value)
+    if jglobals.master_url is None:
+        if node_config.is_child:
+            # Child node: convert the passed-in master_url to the HTTP protocol
+            if node_config.master_url:
+                jglobals.master_url = node_config.master_url.replace(
+                    "ws://", "http://"
+                ).replace("wss://", "https://")
+        elif node_config.is_master:
+            # Master node: prefer the HAIJUNBOT_MASTER_URL environment variable,
+            # otherwise assemble the gateway URL from the listen address (wildcard address falls back to 127.0.0.1)
+            env_master_url = os.environ.get("HAIJUNBOT_MASTER_URL", "").strip()
+            if env_master_url:
+                jglobals.master_url = env_master_url
+            else:
+                effective_host = host.strip() if host else ""
+                if not effective_host or effective_host in ("0.0.0.0", "::", "[::]"):
+                    effective_host = "127.0.0.1"
+                jglobals.master_url = f"http://{effective_host}:{port}"
+
+    # because uvicorn.run() starting a child process resets GLOBAL_CONFIG_DATA, the config needs to be reloaded
+    from haijunbot.haijunbot_utils.utils import init_env
+
+    init_env(welcome_str="", config_file=None)
+
+    # create AgentManager and set the status change callback
+    agent_manager = AgentManager(on_status_change=_on_agent_status_change)
+    # save agent_manager to global so the callback can access it
+    global _global_agent_manager
+    _global_agent_manager = agent_manager
+
+    # create AgentProxyManager
+    agent_proxy_manager = AgentProxyManager(agent_manager)
+    node_connection_manager = NodeConnectionManager(
+        node_runtime,
+        agent_manager,
+        agent_proxy_manager,
+        node_http_dispatcher=None,
+    )
+    child_node_client = (
+        ChildNodeClient(
+            node_runtime,
+            agent_manager,
+            agent_proxy_manager,
+            node_connection_manager,
+        )
+        if node_config.is_child
+        else None
+    )
+
+    router = SessionOutputRouter()
+    input_registry = InputSessionRegistry()
+    terminal_input_registry = TerminalInputRegistry()
+    terminal_session_manager = TerminalSessionManager(max_sessions=None)
+
+    def _build_callback_from_metadata(metadata: Dict[str, Any]):
+        action_metadata = metadata.get("action")
+        if not isinstance(action_metadata, dict):
+            raise ValueError("Persisted timer metadata.action must be an object")
+        return _build_timer_action({"action": action_metadata})[0]
+
+    timer_manager = TimerManager(task_factory=_build_callback_from_metadata)
+
+    # save router to global, used to push messages during status updates
+    global _router, _terminal_session_manager, _node_connection_manager, _node_runtime
+    _router = router
+    _terminal_session_manager = terminal_session_manager
+    _node_connection_manager = node_connection_manager
+    _node_runtime = node_runtime
+    # also inject router and terminal_session_manager into node_connection_manager for terminal forwarding
+    node_connection_manager._router = router
+    node_connection_manager._terminal_session_manager = terminal_session_manager
+    auth_store: Dict[str, Optional[Dict[str, Any]]] = {}
+    gateway = WebGateway(router, input_registry, auth_store, terminal_input_registry)
+    manager = WebSocketConnectionManager(
+        router,
+        input_registry,
+        terminal_input_registry,
+        gateway,
+        auth_store,
+        user_manager,
+        permission_manager,
+        _data_dir,
+    )
+
+    set_current_gateway(gateway)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+        """Lifespan context manager for startup and shutdown events."""
+        # Startup
+        agent_manager.set_event_loop(asyncio.get_running_loop())
+        daemon_capability_manager.set_event_loop(asyncio.get_running_loop())
+        await agent_manager.start_monitoring_for_running_agents()
+        # start the pipeline progress event bridging thread (daemon, exits with the process)
+        _pipeline_pump_stop.clear()
+        from haijunbot.haijunbot_tools.pipeline_events import set_local_pump_active
+
+        set_local_pump_active(True)
+        threading.Thread(
+            target=_pipeline_event_pump,
+            name="pipeline-event-pump",
+            daemon=True,
+        ).start()
+        # sync the new Token to all Agents in the running state
+        gateway_token = os.environ.get("HAIJUNBOT_AUTH_TOKEN", "")
+        if gateway_token:
+            async with httpx.AsyncClient(trust_env=False) as client:
+                for agent in agent_manager.get_agent_list():
+                    if agent.get("status") == "running":
+                        port = agent.get("port")
+                        if port:
+                            try:
+                                await client.post(
+                                    f"http://127.0.0.1:{port}/update_token",
+                                    json={"token": gateway_token},
+                                    headers={"X-Internal-Sync": "true"},
+                                    timeout=5.0,
+                                )
+                            except Exception as e:
+                                save_exception(
+                                    e,
+                                    module="haijunbot_web_gateway.app",
+                                    function="_build_callback_from_metadata",
+                                )
+                                pass
+        if node_config.is_master:
+            node_runtime.mark_ready()
+            # start the Unix Domain Socket server (provides node_secret to child nodes)
+            await _start_node_secret_socket_server(node_config)
+        else:
+            node_runtime.mark_degraded()
+            if child_node_client is not None:
+                child_node_client.start()
+        yield
+        # Shutdown
+        _pipeline_pump_stop.set()
+        from haijunbot.haijunbot_tools.pipeline_events import set_local_pump_active
+
+        set_local_pump_active(False)
+        agent_manager._save_agents()
+        await agent_proxy_manager.cleanup()
+        terminal_session_manager.cleanup()
+        if child_node_client is not None:
+            await child_node_client.stop()
+        timer_manager.shutdown()
+        # reclaim all language server child processes (the on_shutdown event does not fire under a custom lifespan)
+        lsp_pool = getattr(app.state, "lsp_process_pool", None)
+        if lsp_pool is not None:
+            try:
+                await lsp_pool.shutdown()
+            except Exception as e:
+                save_exception(
+                    e,
+                    module="haijunbot_web_gateway.app",
+                    function="lifespan",
+                )
+        set_current_gateway(None)
+        # stop the Unix Domain Socket server
+        await _stop_node_secret_socket_server()
+
+    # use a custom app or create a new app
+    if custom_app is not None:
+        app = custom_app
+    else:
+        app = FastAPI(lifespan=lifespan)
+    app.state.timer_manager = timer_manager
+    app.state.node_config = node_config
+    app.state.node_runtime = node_runtime
+    app.state.agent_manager = agent_manager
+    app.state.agent_proxy_manager = agent_proxy_manager
+    app.state.node_connection_manager = node_connection_manager
+    app.state.browser_extension_manager = browser_extension_manager
+    app.state.daemon_capability_manager = daemon_capability_manager
+
+    # inject the extension latest version provider: sent down to the extension with hello_ack during the handshake,
+    # so the extension can discover new versions and prompt the user to upgrade without opening the HaijunBot web page.
+    def _latest_extension_version() -> Optional[str]:
+        ext_dir = resolve_browser_extension_dir()
+        if not ext_dir:
+            return None
+        version = read_browser_extension_version(ext_dir)
+        return None if version == "unknown" else version
+
+    browser_extension_manager.set_latest_version_provider(_latest_extension_version)
+
+    # mount the uploads directory as a static file service so uploaded images can be accessed via HTTP
+    from haijunbot.haijunbot_utils.config import get_data_dir as _get_data_dir
+
+    _uploads_dir = os.path.join(_get_data_dir(), "uploads")
+    os.makedirs(_uploads_dir, exist_ok=True)
+    app.mount("/uploads", StaticFiles(directory=_uploads_dir), name="uploads")
+    app.state.child_node_client = child_node_client
+
+    # add CORS middleware to allow cross-origin access from the frontend
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # in production, specific domains should be specified
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # HTTP authentication dependency
+    def verify_token(request: Request) -> Dict[str, Any]:
+        """Validate the Token of an HTTP request and return user info.
+
+        Two authentication methods are supported (either one passing is sufficient):
+        1. Authorization: Bearer <token> - compatible with existing services
+        2. X-HaijunBot-Token: <token> - used for LLM proxy scenarios, to avoid conflicts with the LLM API Key
+
+        Args:
+            request: FastAPI Request object
+
+        Returns:
+            user info dictionary
+
+        Raises:
+            HTTPException: throws a 401 error when the Token is invalid
+        """
+        from fastapi import HTTPException
+
+        def _enforce_password_change(user_info: Dict[str, Any]) -> None:
+            """Forced password-change interception: users without a password (must_change_password) are forbidden from all operations except the whitelist.
+
+            Whitelist: /api/auth/me, /api/auth/logout, /api/users/{user_id}/change-password.
+            The system user (internal to the gateway) is not subject to this restriction.
+            """
+            user_id = user_info.get("user_id", "")
+            if not user_id or user_id == "system":
+                return
+            full_user = user_manager.get_user(user_id)
+            if full_user and full_user.get("must_change_password"):
+                path = request.url.path
+                allowed = (
+                    path == "/api/auth/me"
+                    or path == "/api/auth/logout"
+                    or (
+                        path.startswith("/api/users/")
+                        and path.endswith("/change-password")
+                    )
+                )
+                if not allowed:
+                    raise HTTPException(
+                        status_code=403,
+                        detail={
+                            "code": "FORCE_PASSWORD_CHANGE",
+                            "message": "You must set a password before using HaijunBot",
+                        },
+                    )
+
+        # try to extract the Token from the X-HaijunBot-Token header (preferred)
+        haijunbot_token = request.headers.get("X-HaijunBot-Token")
+        if haijunbot_token:
+            user_info = validate_gateway_token(haijunbot_token)
+            if user_info is None:
+                raise HTTPException(
+                    status_code=401,
+                    detail={
+                        "code": "INVALID_TOKEN",
+                        "message": "Invalid or expired X-HaijunBot-Token",
+                    },
+                )
+            _enforce_password_change(user_info)
+            request.state.user_info = user_info
+            return user_info
+
+        # try to extract the Token from the Authorization header (compatibility mode)
+        authorization = request.headers.get("Authorization")
+        if not authorization:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "MISSING_TOKEN",
+                    "message": "Authorization or X-HaijunBot-Token header is required",
+                },
+            )
+
+        parts = authorization.split()
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "code": "INVALID_TOKEN_FORMAT",
+                    "message": "Authorization header must be 'Bearer <token>'",
+                },
+            )
+
+        token = parts[1]
+
+        # validate the Token
+        user_info = validate_gateway_token(token)
+        if user_info is None:
+            raise HTTPException(
+                status_code=401,
+                detail={"code": "INVALID_TOKEN", "message": "Invalid or expired token"},
+            )
+        _enforce_password_change(user_info)
+        request.state.user_info = user_info
+        return user_info
+
+    def verify_agent_proxy_access(request: Request) -> None:
+        """Validate Agent HTTP proxy access permission.
+
+        A valid Bearer Token (or a logged-in session) must be carried, consistent with the WS proxy endpoint.
+        Non-owner and non-admin users must be in the target agent's access_acl.read to have access.
+        """
+        from fastapi import HTTPException
+
+        user_info = verify_token(request)
+        user_id = user_info.get("user_id", "")
+        if user_id and user_id != "system":
+            is_admin = user_info.get("is_admin", False)
+            if not is_admin:
+                agent_id = str(request.path_params.get("agent_id") or "").strip()
+                if agent_id:
+                    agent_info = agent_manager.get_agent(agent_id)
+                    if (
+                        agent_info
+                        and agent_info.owner_id
+                        and agent_info.owner_id != user_id
+                    ):
+                        access_acl = agent_info.access_acl or {}
+                        has_read = user_id in (access_acl.get("read") or [])
+                        if not has_read:
+                            raise HTTPException(
+                                status_code=403,
+                                detail={
+                                    "code": "PERMISSION_DENIED",
+                                    "message": "No read access to this agent",
+                                },
+                            )
+
+    # HTTP API: login endpoint
+    @app.post("/api/auth/login")
+    async def login(request: Request) -> Dict[str, Any]:
+        """Login endpoint, validates the username and password and returns a JWT Token."""
+        try:
+            body = await request.json()
+            username = str(body.get("username", "")).strip()
+            password = str(body.get("password", "")).strip()
+
+            if not username:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "MISSING_CREDENTIALS",
+                        "message": "username is required",
+                    },
+                }
+
+            # try user authentication
+            user = user_manager.authenticate(username, password)
+            if user:
+                # JWT authentication succeeded
+                token = generate_jwt_token(
+                    user_id=user["user_id"],
+                    username=user["username"],
+                    is_admin=user.get("is_admin", False),
+                )
+                logger.info(f"[AUTH] User '{username}' login successful (JWT)")
+                return {
+                    "success": True,
+                    "data": {
+                        "token": token,
+                        "user": {
+                            "user_id": user["user_id"],
+                            "username": user["username"],
+                            "display_name": user.get("display_name", ""),
+                            "is_admin": user.get("is_admin", False),
+                            "must_change_password": user.get(
+                                "must_change_password", False
+                            ),
+                        },
+                    },
+                }
+
+            logger.warning(f"[AUTH] Login failed for user '{username}'")
+            return {
+                "success": False,
+                "error": {
+                    "code": "AUTH_FAILED",
+                    "message": "Invalid username or password",
+                },
+            }
+        except Exception as e:
+            logger.error(f"[AUTH] Login failed with exception: {type(e).__name__}: {e}")
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: logout endpoint
+    @app.post("/api/auth/logout")
+    async def logout(request: Request) -> Dict[str, Any]:
+        """Logout endpoint, adds the current JWT to the blacklist."""
+        authorization = request.headers.get("Authorization")
+        if authorization:
+            token = extract_token_from_authorization_header(authorization)
+            if token:
+                revoke_token(token)
+        haijunbot_token = request.headers.get("X-HaijunBot-Token")
+        if haijunbot_token:
+            revoke_token(haijunbot_token)
+        return {"success": True, "data": {"message": "Logged out successfully"}}
+
+    # HTTP API: get current user info
+    @app.get("/api/auth/me")
+    async def get_current_user(request: Request) -> Dict[str, Any]:
+        """Get information about the currently logged-in user."""
+        user_info = verify_token(request)
+        if user_info.get("user_id") != "system":
+            full_user = user_manager.get_user(user_info["user_id"])
+            if full_user:
+                return {"success": True, "data": {"user": full_user}}
+        return {"success": True, "data": {"user": user_info}}
+
+    @app.get("/api/chat/user-rooms", dependencies=[Depends(verify_token)])
+    async def get_user_chat_rooms(request: Request) -> Dict[str, Any]:
+        """Get the list of chat room IDs the current user has joined (used for recovery after login)."""
+        user_info = verify_token(request)
+        user_id = user_info.get("user_id", "")
+        room_id_list = manager._chat_manager.get_user_rooms(user_id)
+        # Return room details
+        rooms = []
+        for room_id in room_id_list:
+            room = manager._chat_manager._chat_rooms.get(room_id)
+            if room:
+                rooms.append(
+                    {
+                        "room_id": room_id,
+                        "name": room["name"],
+                        "member_count": len(room["members"]),
+                    }
+                )
+        return {"success": True, "rooms": rooms}
+
+    # ------------------------------------------------------------------
+    # Chat room HTTP API (for the Agent to call via gateway_manager)
+    # ------------------------------------------------------------------
+
+    @app.get("/api/chat/rooms", dependencies=[Depends(verify_token)])
+    async def api_chat_list_rooms(request: Request) -> Dict[str, Any]:
+        """Get the list of all chat rooms."""
+        rooms = manager._chat_manager.get_rooms()
+        return {"success": True, "rooms": rooms}
+
+    @app.get("/api/chat/online-clients", dependencies=[Depends(verify_token)])
+    async def api_chat_get_online_clients(request: Request) -> Dict[str, Any]:
+        """Get the list of online users."""
+        clients = manager._chat_manager.get_clients()
+        return {"success": True, "clients": clients}
+
+    @app.get("/api/chat/sessions", dependencies=[Depends(verify_token)])
+    async def api_chat_get_sessions(request: Request) -> Dict[str, Any]:
+        """Get the list of all active sessions (one record per connection, including the corresponding user info)."""
+        sessions = manager._chat_manager.get_sessions()
+        return {"success": True, "sessions": sessions}
+
+    @app.post("/api/frontend/eval-js", dependencies=[Depends(verify_token)])
+    async def api_frontend_eval_js(request: Request) -> Dict[str, Any]:
+        """Send JS to the frontend and wait for the execution result.
+
+        Request body: {"code": str, "timeout": float, "target": str}
+        target values: current (default) / all / client_id / session_id
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return {"success": False, "error": "invalid json body"}
+        code = body.get("code")
+        if not code or not str(code).strip():
+            return {"success": False, "error": "code is required"}
+        try:
+            timeout = float(body.get("timeout", 30))
+        except (TypeError, ValueError):
+            timeout = 30.0
+        target = body.get("target") or "current"
+        # request_frontend_js is a blocking call (Queue.get); run it in a thread pool to avoid blocking the event loop
+        result = await asyncio.to_thread(
+            manager._gateway.request_frontend_js,
+            str(code),
+            timeout,
+            str(target),
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Browser extension API: for the Agent tool layer (subprocess) to call via HTTP
+    # ------------------------------------------------------------------
+    @app.get("/api/browser-ext/sessions", dependencies=[Depends(verify_token)])
+    async def api_browser_ext_list_sessions(request: Request) -> Dict[str, Any]:
+        """List the currently online browser extension sessions.
+
+        Optional query parameter: user_id (returns only that user's sessions).
+        When a non-admin does not explicitly pass user_id, only their own (token's user_id) sessions are returned by default.
+        """
+        user_info = request.state.user_info or {}
+        current_user_id = user_info.get("user_id")
+        is_admin = bool(user_info.get("is_admin"))
+        requested_user_id = request.query_params.get("user_id") or None
+        if is_admin or current_user_id in (None, "system"):
+            user_id = requested_user_id
+        else:
+            user_id = requested_user_id or current_user_id
+            if user_id != current_user_id:
+                return {"success": False, "error": "forbidden: cannot list other users"}
+        sessions = browser_extension_manager.list_sessions(user_id=user_id)
+        return {"success": True, "sessions": sessions}
+
+    @app.post("/api/browser-ext/command", dependencies=[Depends(verify_token)])
+    async def api_browser_ext_command(request: Request) -> Dict[str, Any]:
+        """Send a command to the specified browser extension session and wait for the result.
+
+        Request body: {"session_id": str, "action": str, "params": dict, "timeout": float}
+        Non-admins can only operate on sessions belonging to themselves (the token's user_id).
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return {"success": False, "error": "invalid json body"}
+        session_id = str(body.get("session_id") or "").strip()
+        action = str(body.get("action") or "").strip()
+        if not session_id:
+            return {"success": False, "error": "session_id is required"}
+        if not action:
+            return {"success": False, "error": "action is required"}
+        params = body.get("params") or {}
+        if not isinstance(params, dict):
+            return {"success": False, "error": "params must be an object"}
+        try:
+            timeout = float(body.get("timeout", 15.0))
+        except (TypeError, ValueError):
+            timeout = 15.0
+        user_info = request.state.user_info or {}
+        try:
+            result = await browser_extension_manager.send_command(
+                session_id,
+                action,
+                params,
+                timeout=timeout,
+                user_id=user_info.get("user_id"),
+                is_admin=bool(user_info.get("is_admin")),
+            )
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        return {"success": True, "result": result}
+
+    # ------------------------------------------------------------------
+    # Daemon (haijunbot-daemon) API: for the Agent tool layer (subprocess) to call via HTTP
+    # ------------------------------------------------------------------
+    def _resolve_daemon_session_node(session_id: str) -> Optional[str]:
+        """Return the remote node ID hosting the specified daemon session; returns None for local sessions.
+
+        Background: the daemon (haijunbot-daemon) only communicates with "the gateway process it directly connects to",
+        whichever process a session is registered with must be the process that executes its capabilities. Under the current architecture, daemon
+        sessions are not synchronized across nodes (there are no session-sync messages in node_protocol), so
+        any session this process can look up must be a local session, and this function always returns None.
+
+        This function is kept to reserve the single entry point for cross-node capabilities: once "cross-node session
+        synchronization" is implemented, only this location needs to be changed to return node_id based on the session's true ownership, and callers
+        (capability query/invocation interfaces) will automatically gain forwarding capability without further changes to the interface layer.
+
+        Note: the session's ``node_id`` cannot be used directly as the node ownership -- that field comes from the daemon's
+        self-reported hello, and defaults back to client_id when absent (in the form daemon-<host>-<pid>),
+        which is merely a client identifier. A historical implementation treated it as a node ID for forwarding, causing hits on non-existent
+        nodes and reporting "node connection not found". Therefore it is required here that it can be found in
+        the node_registry as a real node; otherwise it is treated as a local session.
+        """
+        session = daemon_capability_manager.get_session(session_id)
+        if session is None:
+            return None
+        node_id = str(session.get("node_id") or "").strip()
+        local_node_id = _node_runtime.local_node_id if _node_runtime else "master"
+        if not node_id or node_id in (local_node_id, "master"):
+            return None
+        registry = _node_runtime.node_registry if _node_runtime else None
+        if registry is None or registry.get(node_id) is None:
+            return None
+        return node_id
+
+    @app.get("/api/daemon/sessions", dependencies=[Depends(verify_token)])
+    async def api_daemon_list_sessions(request: Request) -> Dict[str, Any]:
+        """List the currently online daemon sessions (including each one's registered capability list).
+
+        Non-admins can only see sessions belonging to themselves (the token's user_id).
+        """
+        user_info = request.state.user_info or {}
+        user_id = user_info.get("user_id")
+        is_admin = bool(user_info.get("is_admin"))
+        if user_id and user_id != "system" and not is_admin:
+            sessions = daemon_capability_manager.list_sessions(user_id=user_id)
+        else:
+            sessions = daemon_capability_manager.list_sessions()
+        return {"success": True, "sessions": sessions}
+
+    @app.post("/api/daemon/capability/list", dependencies=[Depends(verify_token)])
+    async def api_daemon_capability_list(request: Request) -> Dict[str, Any]:
+        """Query the capability list of the specified daemon session.
+
+        Request body: {"session_id": str, "timeout": float}
+        Non-admins can only query sessions belonging to themselves (the token's user_id).
+        Daemon sessions are not synchronized across nodes, so they are always handled in this process.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return {"success": False, "error": "invalid json body"}
+        session_id = str(body.get("session_id") or "").strip()
+        if not session_id:
+            return {"success": False, "error": "session_id is required"}
+        try:
+            timeout = float(body.get("timeout", 15.0))
+        except (TypeError, ValueError):
+            timeout = 15.0
+        user_info = request.state.user_info or {}
+        user_id = user_info.get("user_id")
+        is_admin = bool(user_info.get("is_admin"))
+        # Session ownership check
+        allowed, reason = daemon_capability_manager.check_session_access(
+            session_id, user_id, is_admin
+        )
+        if not allowed:
+            return {"success": False, "error": reason}
+        try:
+            capabilities = await daemon_capability_manager.list_capabilities(
+                session_id,
+                timeout=timeout,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        return {"success": True, "capabilities": capabilities}
+
+    @app.post("/api/daemon/capability/call", dependencies=[Depends(verify_token)])
+    async def api_daemon_capability_call(request: Request) -> Dict[str, Any]:
+        """Invoke a capability of the specified daemon session and wait for the result.
+
+        Non-admins can only invoke sessions belonging to themselves (the token's user_id).
+        Daemon sessions are not synchronized across nodes, so they are always executed in this process.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return {"success": False, "error": "invalid json body"}
+        session_id = str(body.get("session_id") or "").strip()
+        name = str(body.get("name") or "").strip()
+        if not session_id:
+            return {"success": False, "error": "session_id is required"}
+        if not name:
+            return {"success": False, "error": "name is required"}
+        params = body.get("params") or {}
+        if not isinstance(params, dict):
+            return {"success": False, "error": "params must be an object"}
+        try:
+            timeout = float(body.get("timeout", 30.0))
+        except (TypeError, ValueError):
+            timeout = 30.0
+        user_info = request.state.user_info or {}
+        user_id = user_info.get("user_id")
+        is_admin = bool(user_info.get("is_admin"))
+        # Session ownership check (the remote node side validates again; here we give a clear error first)
+        allowed, reason = daemon_capability_manager.check_session_access(
+            session_id, user_id, is_admin
+        )
+        if not allowed:
+            return {"success": False, "error": reason}
+        try:
+            result = await daemon_capability_manager.call_capability(
+                session_id,
+                name,
+                params=params,
+                timeout=timeout,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        return {
+            "success": True,
+            "result": {
+                "success": bool(result.get("success")),
+                "data": result.get("data"),
+                "error": result.get("error") or "",
+            },
+        }
+
+    @app.post("/api/ocr", dependencies=[Depends(verify_token)])
+    async def api_ocr(request: Request) -> Dict[str, Any]:
+        """OCR text recognition interface: hand a base64 image to the gateway-side OCR tool to recognize as plain text.
+
+        Request body:
+            {
+              "image_base64": str,   # required, base64 of the image content (may include a data URL prefix)
+              "filename": str,       # optional, used to infer the extension, default "image.png"
+              "backend": str,        # optional, auto/tesseract/rapidocr/paddleocr/easyocr/vision
+              "lang": str,           # optional, default "eng"; tesseract may accept "chi_sim+eng"
+              "psm": int,            # optional, tesseract page segmentation mode
+              "detail": bool         # optional, whether to return per-line/coordinate information
+            }
+
+        Returns: {"success": bool, "text": str, "backend": str, "lines": list, "error": str}
+
+        Design notes:
+        - Only base64 image content is accepted, **local paths/URLs are not accepted**: the gateway and the caller (e.g. daemon)
+          are usually not on the same machine, so a path is meaningless on the gateway side; a URL should be downloaded by the caller and converted to base64.
+        - Reuses the project's existing OcrTool (without modifying its code), so its multi-backend and graceful degradation capabilities are inherited as well.
+        - OcrTool.execute is synchronously blocking (it may run the tesseract CLI or call a model),
+          so asyncio.to_thread is used here to offload it to a thread pool, avoiding blocking the event loop.
+        """
+        import base64
+        import tempfile
+
+        try:
+            body = await request.json()
+        except Exception:
+            return {"success": False, "error": "invalid json body"}
+
+        image_base64 = body.get("image_base64")
+        if not image_base64 or not isinstance(image_base64, str):
+            return {"success": False, "error": "image_base64 is required"}
+
+        # Support the data URL prefix (e.g. "data:image/png;base64,xxxx")
+        if image_base64.startswith("data:") and "," in image_base64:
+            image_base64 = image_base64.split(",", 1)[1]
+
+        # Image size limit: kept consistent with the OCR tool (CONTENT_CONFIG.max_image_size, default 20 MiB)
+        try:
+            from haijunbot.haijunbot_platform.content_types import CONTENT_CONFIG
+
+            raw_max = CONTENT_CONFIG.get("max_image_size", 20 * 1024 * 1024)
+            max_size = raw_max if isinstance(raw_max, int) else 20 * 1024 * 1024
+        except Exception:
+            max_size = 20 * 1024 * 1024
+
+        try:
+            raw = base64.b64decode(image_base64, validate=False)
+        except Exception as exc:
+            return {"success": False, "error": f"image_base64 decoding failed: {exc}"}
+
+        if len(raw) > max_size:
+            return {
+                "success": False,
+                "error": (
+                    f"Image too large: {len(raw)} bytes, exceeds the limit of {max_size} bytes"
+                    f"(about {max_size // (1024 * 1024)} MiB)"
+                ),
+            }
+
+        # Infer the extension (whitelist validation; non-whitelisted falls back to .png)
+        from haijunbot.haijunbot_tools.ocr import _SUPPORTED_EXTS
+
+        filename = str(body.get("filename") or "image.png").strip()
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext not in _SUPPORTED_EXTS:
+            ext = "png"
+
+        backend = str(body.get("backend") or "auto").strip().lower() or "auto"
+        lang = str(body.get("lang") or "eng").strip() or "eng"
+        psm = body.get("psm")
+        detail = bool(body.get("detail", False))
+
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix="haijunbot_gw_ocr_", suffix=f".{ext}")
+            with os.fdopen(fd, "wb") as f:
+                f.write(raw)
+
+            from haijunbot.haijunbot_tools.ocr import OcrTool
+
+            tool = OcrTool()
+            args: Dict[str, Any] = {
+                "image": tmp_path,
+                "backend": backend,
+                "lang": lang,
+                "detail": detail,
+            }
+            if psm is not None:
+                args["psm"] = psm
+
+            # OcrTool.execute blocks synchronously; run it in a thread pool to avoid stalling the event loop
+            result = await asyncio.to_thread(tool.execute, args)
+
+            if not result.get("success"):
+                return {
+                    "success": False,
+                    "error": result.get("stderr") or "OCR recognition failed",
+                }
+            return {
+                "success": True,
+                "text": result.get("text", ""),
+                "backend": result.get("backend", backend),
+                "lines": result.get("lines", []),
+                "error": "",
+            }
+        except Exception as exc:
+            return {"success": False, "error": f"OCR execution exception: {exc}"}
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+    @app.post("/api/browser-ext/scripts/save", dependencies=[Depends(verify_token)])
+    async def api_browser_ext_script_save(request: Request) -> Dict[str, Any]:
+        """Save the script source code to browser_scripts/ under the gateway data directory.
+
+        Request body: {"name": str, "content": str}
+        A script with the same name will be overwritten. Used to let the Agent persist scripts from the extension to disk,
+        avoiding transmitting large chunks of raw script text in the conversation.
+        """
+        from haijunbot.haijunbot_web_gateway.script_store import (
+            ScriptStoreError,
+            save_script,
+        )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return {"success": False, "error": "invalid json body"}
+        name = body.get("name")
+        content = body.get("content")
+        try:
+            result = await asyncio.to_thread(save_script, name, content)
+        except ScriptStoreError as exc:
+            return {"success": False, "error": str(exc)}
+        except Exception as exc:
+            return {"success": False, "error": f"failed to save script: {exc}"}
+        return {"success": True, **result}
+
+    @app.get("/api/browser-ext/scripts/load", dependencies=[Depends(verify_token)])
+    async def api_browser_ext_script_load(request: Request) -> Dict[str, Any]:
+        """Read the script source code from the gateway data directory.
+
+        query parameter: name (script name, may include the .js suffix)
+        """
+        from haijunbot.haijunbot_web_gateway.script_store import (
+            ScriptStoreError,
+            load_script,
+        )
+
+        name = request.query_params.get("name") or ""
+        try:
+            result = await asyncio.to_thread(load_script, name)
+        except ScriptStoreError as exc:
+            return {"success": False, "error": str(exc)}
+        except Exception as exc:
+            return {"success": False, "error": f"failed to load script: {exc}"}
+        return {"success": True, **result}
+
+    @app.get("/api/browser-ext/scripts/list", dependencies=[Depends(verify_token)])
+    async def api_browser_ext_script_list() -> Dict[str, Any]:
+        """List the scripts saved under the gateway data directory (excluding source code, to avoid an oversized response)."""
+        from haijunbot.haijunbot_web_gateway.script_store import list_scripts
+
+        try:
+            scripts = await asyncio.to_thread(list_scripts)
+        except Exception as exc:
+            return {"success": False, "error": f"failed to list scripts: {exc}"}
+        return {"success": True, "scripts": scripts}
+
+    @app.get("/api/browser-ext/scripts/installed", dependencies=[Depends(verify_token)])
+    async def api_browser_ext_scripts_installed(request: Request) -> Dict[str, Any]:
+        """List metadata for the custom scripts (userscript-like scripts) installed in each online browser extension session.
+
+        Calls ``script.list`` live for each online session, returning
+        ``[{session_id, name, scripts:[{id,name,description,match,version,enabled,
+        installed_at,updated_at,source_size}]}]``.
+        Non-admins can only see sessions belonging to themselves (the token's user_id).
+        A failure to query a single session does not block the whole operation; a failed session's scripts is set to empty with an accompanying error.
+        """
+        user_info = request.state.user_info or {}
+        current_user_id = user_info.get("user_id")
+        is_admin = bool(user_info.get("is_admin"))
+        if is_admin or current_user_id in (None, "system"):
+            user_id = None
+        else:
+            user_id = current_user_id
+        sessions = browser_extension_manager.list_sessions(user_id=user_id)
+        result = []
+        for s in sessions:
+            session_id = s.get("session_id")
+            if not session_id:
+                continue
+            entry: Dict[str, Any] = {
+                "session_id": session_id,
+                "name": s.get("name") or "",
+                "scripts": [],
+            }
+            try:
+                resp = await browser_extension_manager.send_command(
+                    session_id,
+                    "script.list",
+                    {},
+                    timeout=5.0,
+                    user_id=current_user_id,
+                    is_admin=is_admin,
+                )
+                # The extension side's script.list returns {success, scripts:[...]} or {scripts:[...]}
+                scripts = (resp or {}).get("scripts")
+                if not isinstance(scripts, list):
+                    scripts = []
+                entry["scripts"] = scripts
+            except Exception as exc:
+                entry["error"] = str(exc)
+            result.append(entry)
+        return {"success": True, "sessions": result}
+
+    @app.get("/api/browser-ext/download", dependencies=[Depends(verify_token)])
+    async def api_browser_ext_download() -> Response:
+        """Dynamically package the browser extension source code and download it as a zip attachment.
+
+        The extension source is located at browser_extension/ in the repository root; it is packaged on demand here,
+        ensuring the downloaded extension version matches the current gateway version.
+        """
+        extension_dir = resolve_browser_extension_dir()
+        if not extension_dir:
+            return Response(
+                content=json.dumps(
+                    {"success": False, "error": "browser extension not found"}
+                ),
+                media_type="application/json",
+                status_code=404,
+            )
+        try:
+            # Packaging is a CPU-intensive operation; put it in a thread pool to avoid blocking the event loop
+            payload = await asyncio.to_thread(
+                build_browser_extension_zip, extension_dir
+            )
+        except Exception as exc:
+            return Response(
+                content=json.dumps({"success": False, "error": str(exc)}),
+                media_type="application/json",
+                status_code=500,
+            )
+        version = read_browser_extension_version(extension_dir)
+        filename = f"haijunbot-browser-bridge-{version}.zip"
+        return Response(
+            content=payload,
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(payload)),
+            },
+        )
+
+    @app.get("/api/browser-ext/version", dependencies=[Depends(verify_token)])
+    async def api_browser_ext_version() -> Dict[str, Any]:
+        """Return the latest extension version packaged by the gateway and the online extension version, for the frontend to detect updates."""
+        extension_dir = resolve_browser_extension_dir()
+        latest_version = (
+            read_browser_extension_version(extension_dir) if extension_dir else None
+        )
+        sessions = [
+            {
+                "session_id": s.get("session_id"),
+                "extension_version": s.get("extension_version"),
+            }
+            for s in browser_extension_manager.list_sessions()
+        ]
+        return {
+            "success": True,
+            "latest_version": latest_version,
+            "sessions": sessions,
+        }
+
+    @app.get("/api/chat/room-members", dependencies=[Depends(verify_token)])
+    async def api_chat_get_room_members(request: Request) -> Dict[str, Any]:
+        """Get the chat room member list."""
+        room_id = request.query_params.get("room_id", "")
+        if not room_id:
+            return {"success": False, "error": "room_id is required"}
+        members = manager._chat_manager.get_room_members(room_id)
+        return {"success": True, "room_id": room_id, "members": members}
+
+    @app.post("/api/chat/send-room-message", dependencies=[Depends(verify_token)])
+    async def api_chat_send_room_message(request: Request) -> Dict[str, Any]:
+        """Send a chat room message (called by the Agent, as the owner)."""
+        body = await request.json()
+        room_id = body.get("room_id", "")
+        content = body.get("content", "")
+        sender_name = body.get("sender_name", "Agent")
+        if not room_id or not content:
+            return {"success": False, "error": "room_id and content are required"}
+        # Look up the owner's display_name by agent_id
+        agent_id = body.get("agent_id", "")
+        owner_display_name = None
+        if agent_id:
+            agent_info = agent_manager.get_agent(agent_id)
+            if agent_info and agent_info.owner_id:
+                user_data = user_manager.get_user(agent_info.owner_id)
+                if user_data:
+                    owner_display_name = user_data.get("display_name") or user_data.get(
+                        "username"
+                    )
+        if owner_display_name:
+            sender_name = owner_display_name
+        # Construct the message and broadcast it
+        msg = {
+            "type": "chat_message",
+            "payload": {
+                "room_id": room_id,
+                "client_id": "agent",
+                "sender_name": sender_name,
+                "sender_display_name": sender_name,
+                "content": content,
+                "timestamp": time.time(),
+            },
+        }
+        await manager._chat_manager.broadcast_to_room(room_id, msg)
+        return {"success": True}
+
+    @app.post("/api/chat/send-private-message", dependencies=[Depends(verify_token)])
+    async def api_chat_send_private_message(request: Request) -> Dict[str, Any]:
+        """Send a private message (called by the Agent, as the owner)."""
+        body = await request.json()
+        receiver_id = body.get("receiver_id", "")
+        content = body.get("content", "")
+        sender_name = body.get("sender_name", "Agent")
+        if not receiver_id or not content:
+            return {"success": False, "error": "receiver_id and content are required"}
+        # Look up the owner's display_name and owner_id by agent_id
+        agent_id = body.get("agent_id", "")
+        owner_id = None
+        owner_display_name = None
+        if agent_id:
+            agent_info = agent_manager.get_agent(agent_id)
+            if agent_info and agent_info.owner_id:
+                owner_id = agent_info.owner_id
+                user_data = user_manager.get_user(owner_id)
+                if user_data:
+                    owner_display_name = user_data.get("display_name") or user_data.get(
+                        "username"
+                    )
+        if owner_display_name:
+            sender_name = owner_display_name
+        # Find the owner's online client to use as the sender
+        owner_client = None
+        if owner_id:
+            for cid, info in manager._chat_manager._chat_clients.items():
+                if info.get("user_id") == owner_id:
+                    owner_client = cid
+                    break
+        sender_id = owner_client or "agent"
+        # If the sender is not registered, register a temporary client first
+        if sender_id not in manager._chat_manager._chat_clients:
+            # Temporary registration to support send_private
+            temp_ws = None  # no actual WebSocket connection
+            manager._chat_manager._chat_clients[sender_id] = {
+                "name": sender_name,
+                "display_name": sender_name,
+                "connection_id": "agent_temp",
+                "websocket": temp_ws,
+                "registered_at": time.time(),
+                "user_id": owner_id or "agent",
+            }
+        result = await manager._chat_manager.send_private(
+            sender_id, receiver_id, content
+        )
+        return result
+
+    # Permission check dependency
+    def require_permission(resource: str, action: str):
+        """Create a FastAPI dependency requiring a specific permission."""
+        from fastapi import HTTPException
+
+        def check_perm(request: Request) -> Dict[str, Any]:
+            user_info = verify_token(request)
+            user_id = user_info.get("user_id", "")
+            if user_id == "system":
+                return user_info
+            has_perm = permission_manager.check_permission(
+                user_id, f"{resource}:{action}"
+            )
+            if not has_perm:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "PERMISSION_DENIED",
+                        "message": f"Permission denied: {resource}:{action}",
+                    },
+                )
+            return user_info
+
+        return Depends(check_perm)
+
+    @app.get("/api/users/brief", dependencies=[Depends(verify_token)])
+    async def api_list_users_brief(
+        request: Request, search: str = ""
+    ) -> Dict[str, Any]:
+        """List brief user information (login only; used for scenarios such as ACL selection)."""
+        users = user_manager.list_users(search=search or None, limit=100)
+        brief = [
+            {
+                "user_id": u.get("user_id"),
+                "username": u.get("username"),
+                "display_name": u.get("display_name", u.get("username")),
+                "is_admin": u.get("is_admin", False),
+            }
+            for u in users
+        ]
+        return {"success": True, "data": {"users": brief}}
+
+    @app.get("/api/users", dependencies=[Depends(verify_token)])
+    async def api_list_users(
+        request: Request, search: str = "", offset: int = 0, limit: int = 50
+    ) -> Dict[str, Any]:
+        """List users (requires admin:users permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:users"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:users",
+                },
+            )
+        users = user_manager.list_users(
+            search=search or None, offset=offset, limit=limit
+        )
+        return {"success": True, "data": {"users": users}}
+
+    @app.post("/api/users", dependencies=[Depends(verify_token)])
+    async def api_create_user(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a user (requires admin:users permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:users"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:users",
+                },
+            )
+        username = str(body.get("username", "")).strip()
+        password = str(body.get("password", "")).strip()
+        display_name = str(body.get("display_name", "")).strip() or None
+        is_admin = bool(body.get("is_admin", False))
+        if not username or not password:
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "username and password are required",
+                },
+            }
+        try:
+            user = user_manager.create_user(
+                username, password, display_name=display_name, is_admin=is_admin
+            )
+            permission_manager.invalidate_cache(user["user_id"])
+            return {"success": True, "data": {"user": user}}
+        except ValueError as e:
+            return {
+                "success": False,
+                "error": {"code": "VALIDATION_ERROR", "message": str(e)},
+            }
+
+    @app.get("/api/users/{user_id}", dependencies=[Depends(verify_token)])
+    async def api_get_user(request: Request, user_id: str) -> Dict[str, Any]:
+        """Get user details (can only view yourself, or requires admin:users permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        is_self = user_info.get("user_id") == user_id
+        if (
+            not is_self
+            and user_info.get("user_id") != "system"
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:users"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:users",
+                },
+            )
+        user = user_manager.get_user(user_id)
+        if not user:
+            return {
+                "success": False,
+                "error": {"code": "NOT_FOUND", "message": "User not found"},
+            }
+        return {"success": True, "data": {"user": user}}
+
+    @app.put("/api/users/{user_id}", dependencies=[Depends(verify_token)])
+    async def api_update_user(
+        request: Request, user_id: str, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Update user information (requires admin:users permission, or updating yourself)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        is_self = user_info.get("user_id") == user_id
+        if (
+            not is_self
+            and user_info.get("user_id") != "system"
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:users"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:users",
+                },
+            )
+        try:
+            user = user_manager.update_user(user_id, **body)
+            if user:
+                permission_manager.invalidate_cache(user_id)
+                return {"success": True, "data": {"user": user}}
+            return {
+                "success": False,
+                "error": {"code": "NOT_FOUND", "message": "User not found"},
+            }
+        except ValueError as e:
+            return {
+                "success": False,
+                "error": {"code": "VALIDATION_ERROR", "message": str(e)},
+            }
+
+    @app.delete("/api/users/{user_id}", dependencies=[Depends(verify_token)])
+    async def api_delete_user(request: Request, user_id: str) -> Dict[str, Any]:
+        """Delete a user (requires admin:users permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:users"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:users",
+                },
+            )
+        success = user_manager.delete_user(user_id)
+        if success:
+            permission_manager.invalidate_cache(user_id)
+            return {"success": True, "data": {"message": "User deleted"}}
+        return {
+            "success": False,
+            "error": {
+                "code": "NOT_FOUND",
+                "message": "User not found or cannot be deleted",
+            },
+        }
+
+    @app.post(
+        "/api/users/{user_id}/reset-password", dependencies=[Depends(verify_token)]
+    )
+    async def api_reset_password(
+        request: Request, user_id: str, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Reset a user's password (requires admin:users permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:users"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:users",
+                },
+            )
+        new_password = str(body.get("new_password", "")).strip()
+        if not new_password:
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "new_password is required",
+                },
+            }
+        success = user_manager.reset_password(user_id, new_password)
+        if success:
+            return {"success": True, "data": {"message": "Password reset successfully"}}
+        return {
+            "success": False,
+            "error": {"code": "NOT_FOUND", "message": "User not found"},
+        }
+
+    @app.post(
+        "/api/users/{user_id}/change-password", dependencies=[Depends(verify_token)]
+    )
+    async def api_change_password(
+        request: Request, user_id: str, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Change password (can only change your own)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get("user_id") != user_id:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Can only change own password",
+                },
+            )
+        old_password = str(body.get("old_password", "")).strip()
+        new_password = str(body.get("new_password", "")).strip()
+        if not new_password:
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "new_password is required",
+                },
+            }
+        # On the forced password change at first login (initial random password), the user may not know the old password, so it is not required
+        user = user_manager.get_user(user_id)
+        must_change = bool(user and user.get("must_change_password"))
+        if not must_change and not old_password:
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_INPUT",
+                    "message": "old_password and new_password are required",
+                },
+            }
+        success = user_manager.change_password(user_id, old_password, new_password)
+        if success:
+            return {
+                "success": True,
+                "data": {"message": "Password changed successfully"},
+            }
+        return {
+            "success": False,
+            "error": {"code": "AUTH_FAILED", "message": "Old password is incorrect"},
+        }
+
+    # ==================== Permission management API ====================
+
+    @app.get("/api/permissions/user/{user_id}", dependencies=[Depends(verify_token)])
+    async def api_get_user_permissions(
+        request: Request, user_id: str
+    ) -> Dict[str, Any]:
+        """Get user permissions."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if (
+            user_info.get("user_id") != "system"
+            and user_info.get("user_id") != user_id
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:permissions"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            )
+        perms = permission_manager.get_user_permissions(user_id)
+        return {"success": True, "data": {"permissions": perms}}
+
+    @app.get(
+        "/api/permissions/user/{user_id}/groups", dependencies=[Depends(verify_token)]
+    )
+    async def api_get_user_groups(request: Request, user_id: str) -> Dict[str, Any]:
+        """Get the groups the user belongs to."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if (
+            user_info.get("user_id") != "system"
+            and user_info.get("user_id") != user_id
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:permissions"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            )
+        groups = permission_manager.get_user_groups(user_id)
+        return {"success": True, "data": {"groups": groups}}
+
+    @app.put(
+        "/api/permissions/user/{user_id}/groups", dependencies=[Depends(verify_token)]
+    )
+    async def api_set_user_groups(
+        request: Request, user_id: str, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Set the groups a user belongs to (requires admin:permissions permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:permissions"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:permissions",
+                },
+            )
+        group_ids = body.get("group_ids", [])
+        permission_manager.set_user_groups(user_id, group_ids)
+        permission_manager.invalidate_cache(user_id)
+        return {"success": True, "data": {"message": "User groups updated"}}
+
+    @app.get(
+        "/api/permissions/user/{user_id}/accessible-nodes",
+        dependencies=[Depends(verify_token)],
+    )
+    async def api_get_user_accessible_nodes(
+        request: Request, user_id: str
+    ) -> Dict[str, Any]:
+        """Get the list of nodes the user can access."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if (
+            user_info.get("user_id") != "system"
+            and user_info.get("user_id") != user_id
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:permissions"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            )
+        nodes = permission_manager.get_user_accessible_nodes(user_id)
+        return {"success": True, "data": {"accessible_nodes": nodes}}
+
+    @app.get(
+        "/api/permissions/user/{user_id}/overrides",
+        dependencies=[Depends(verify_token)],
+    )
+    async def api_get_user_overrides(request: Request, user_id: str) -> Dict[str, Any]:
+        """Get the user's permission overrides."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if (
+            user_info.get("user_id") != "system"
+            and user_info.get("user_id") != user_id
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:permissions"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            )
+        overrides = permission_manager.get_user_overrides(user_id)
+        return {"success": True, "data": {"overrides": overrides}}
+
+    @app.put(
+        "/api/permissions/user/{user_id}/overrides",
+        dependencies=[Depends(verify_token)],
+    )
+    async def api_set_user_overrides(
+        request: Request, user_id: str, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Set the user's permission overrides (requires admin:permissions permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:permissions"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:permissions",
+                },
+            )
+        overrides = body.get("overrides", {})
+        permission_manager.set_user_overrides(user_id, overrides)
+        permission_manager.invalidate_cache(user_id)
+        return {"success": True, "data": {"message": "User overrides updated"}}
+
+    # ==================== Group management API ====================
+
+    @app.get("/api/permissions/schema", dependencies=[Depends(verify_token)])
+    async def api_permission_schema(request: Request) -> Dict[str, Any]:
+        """Get the list of available permissions (resource -> action list), for the permission group configuration UI to render dynamically."""
+        schema = permission_manager.get_permission_schema()
+        return {"success": True, "data": {"schema": schema}}
+
+    @app.get("/api/permissions/groups", dependencies=[Depends(verify_token)])
+    async def api_list_groups(request: Request) -> Dict[str, Any]:
+        """List all permission groups."""
+        groups = permission_manager.list_groups()
+        return {"success": True, "data": {"groups": groups}}
+
+    @app.get("/api/permissions/groups/{group_id}", dependencies=[Depends(verify_token)])
+    async def api_get_group(request: Request, group_id: str) -> Dict[str, Any]:
+        """Get permission group details."""
+        group = permission_manager.get_group(group_id)
+        if not group:
+            return {
+                "success": False,
+                "error": {"code": "NOT_FOUND", "message": "Group not found"},
+            }
+        return {"success": True, "data": {"group": group}}
+
+    @app.post("/api/permissions/groups", dependencies=[Depends(verify_token)])
+    async def api_create_group(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Create a permission group (requires admin:permissions permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:permissions"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:permissions",
+                },
+            )
+        name = str(body.get("name", "")).strip()
+        description = str(body.get("description", "")).strip() or None
+        if not name:
+            return {
+                "success": False,
+                "error": {"code": "INVALID_INPUT", "message": "name is required"},
+            }
+        try:
+            group = permission_manager.create_group(
+                name, display_name=name, description=description or ""
+            )
+            return {"success": True, "data": {"group": group}}
+        except ValueError as e:
+            return {
+                "success": False,
+                "error": {"code": "VALIDATION_ERROR", "message": str(e)},
+            }
+
+    @app.put("/api/permissions/groups/{group_id}", dependencies=[Depends(verify_token)])
+    async def api_update_group(
+        request: Request, group_id: str, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Update a permission group (requires admin:permissions permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:permissions"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:permissions",
+                },
+            )
+        try:
+            group = permission_manager.update_group(group_id, **body)
+            if group:
+                return {"success": True, "data": {"group": group}}
+            return {
+                "success": False,
+                "error": {"code": "NOT_FOUND", "message": "Group not found"},
+            }
+        except ValueError as e:
+            return {
+                "success": False,
+                "error": {"code": "VALIDATION_ERROR", "message": str(e)},
+            }
+
+    @app.delete(
+        "/api/permissions/groups/{group_id}", dependencies=[Depends(verify_token)]
+    )
+    async def api_delete_group(request: Request, group_id: str) -> Dict[str, Any]:
+        """Delete a permission group (requires admin:permissions permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:permissions"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:permissions",
+                },
+            )
+        success = permission_manager.delete_group(group_id)
+        if success:
+            return {"success": True, "data": {"message": "Group deleted"}}
+        return {
+            "success": False,
+            "error": {
+                "code": "NOT_FOUND",
+                "message": "Group not found or cannot be deleted",
+            },
+        }
+
+    @app.get(
+        "/api/permissions/groups/{group_id}/permissions",
+        dependencies=[Depends(verify_token)],
+    )
+    async def api_get_group_permissions(
+        request: Request, group_id: str
+    ) -> Dict[str, Any]:
+        """Get group permissions (requires admin:permissions permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:permissions"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:permissions",
+                },
+            )
+        perms = permission_manager.get_group_permissions(group_id)
+        return {"success": True, "data": {"permissions": perms}}
+
+    @app.put(
+        "/api/permissions/groups/{group_id}/permissions",
+        dependencies=[Depends(verify_token)],
+    )
+    async def api_set_group_permissions(
+        request: Request, group_id: str, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Set group permissions (requires admin:permissions permission)."""
+        from fastapi import HTTPException
+
+        user_info = request.state.user_info
+        if user_info.get(
+            "user_id"
+        ) != "system" and not permission_manager.check_permission(
+            user_info["user_id"], "admin:permissions"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:permissions",
+                },
+            )
+        permissions = body.get("permissions", {})
+        permission_manager.set_group_permissions(group_id, permissions)
+        permission_manager.invalidate_cache()
+        return {"success": True, "data": {"message": "Group permissions updated"}}
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket) -> None:
+        await manager.handle(websocket)
+
+    @app.websocket("/api/node/master/ws")
+    async def master_websocket_endpoint(websocket: WebSocket) -> None:
+        await manager.handle(websocket)
+
+    @app.websocket("/ws/node")
+    async def node_websocket_endpoint(websocket: WebSocket) -> None:
+        if not node_config.is_master:
+            await websocket.accept()
+            await _send_error(
+                websocket, "UNSUPPORTED", "child mode does not accept node connections"
+            )
+            await websocket.close(code=4404)
+            return
+        await node_connection_manager.handle_node_websocket(websocket)
+
+    # ------------------------------------------------------------------
+    # LSP language server bridge (config comes from the lsp.languages section of ~/.haijunbot/config.yaml)
+    # ------------------------------------------------------------------
+    from haijunbot.haijunbot_web_gateway.lsp_bridge import (
+        LspProcessPool,
+        resolve_workspace_root,
+    )
+    from haijunbot.haijunbot_web_gateway.lsp_registry import (
+        get_lsp_server_spec,
+        load_lsp_server_specs,
+    )
+
+    lsp_process_pool = LspProcessPool()
+    # Used by lifespan to reap subprocesses on application exit. Note: this app uses a custom lifespan,
+    # in which case add_event_handler("shutdown", ...) will not be called and must be wired in explicitly.
+    app.state.lsp_process_pool = lsp_process_pool
+
+    @app.get("/api/lsp/servers", dependencies=[Depends(verify_token)])
+    async def list_lsp_servers() -> Dict[str, Any]:
+        """List all registered LSP language servers.
+
+        Only expose the fields the frontend needs; do not return sensitive information such as command / args / environment variables.
+        """
+        specs = load_lsp_server_specs()
+        return {
+            "success": True,
+            "servers": [
+                {
+                    "id": spec.get("id"),
+                    "monacoLanguage": spec.get("monacoLanguage"),
+                    "extensions": spec.get("extensions", []),
+                    "installHint": spec.get("installHint", ""),
+                    "source": spec.get("_source", ""),
+                }
+                for spec in sorted(specs.values(), key=lambda s: s.get("id", ""))
+            ],
+        }
+
+    @app.websocket("/api/lsp/{server_id}")
+    async def lsp_websocket_endpoint(websocket: WebSocket, server_id: str) -> None:
+        """Generic JSON-RPC bridge between WebSocket and a language server subprocess's stdio.
+
+        Completely agnostic to the language: commands come from the manifest, and messages are purely forwarded.
+        Query parameter: ``root`` (optional) workspace root directory.
+        """
+        # Authentication (reuses the existing WS auth pattern)
+        auth_payload = _extract_auth_from_headers(websocket)
+        if auth_payload is not None:
+            authorized, reason = gateway._check_auth(auth_payload)
+        else:
+            authorized = False
+            reason = "Authentication required"
+        if not authorized:
+            await websocket.accept(subprotocol="haijunbot-ws")
+            await _send_error(websocket, "AUTH_FAILED", reason or "Invalid token")
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+
+        # Validate server_id
+        spec = get_lsp_server_spec(server_id)
+        if spec is None:
+            await websocket.accept(subprotocol="haijunbot-ws")
+            await _send_error(
+                websocket, "UNKNOWN_SERVER", f"unknown lsp server id: {server_id}"
+            )
+            await websocket.close(code=4404, reason="Unknown server")
+            return
+
+        raw_root = websocket.query_params.get("root")
+        workspace_root = resolve_workspace_root(raw_root, spec)
+
+        try:
+            proc = await lsp_process_pool.get_or_create(server_id, workspace_root)
+        except Exception as e:
+            await websocket.accept(subprotocol="haijunbot-ws")
+            await _send_error(websocket, "SERVER_START_FAILED", str(e))
+            await websocket.close(code=4400, reason="Server start failed")
+            return
+
+        await websocket.accept(subprotocol="haijunbot-ws")
+
+        async def _send_to_ws(message: Dict[str, Any]) -> None:
+            await websocket.send_text(json.dumps(message, ensure_ascii=False))
+
+        lsp_process_pool.subscribe(proc, _send_to_ws)
+
+        try:
+            while True:
+                text = await websocket.receive_text()
+                try:
+                    message = json.loads(text)
+                except json.JSONDecodeError:
+                    logger.warning(
+                        "[lsp_bridge] received a non-JSON WS message, ignored (server_id=%s)",
+                        server_id,
+                    )
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                try:
+                    await lsp_process_pool.send(proc, message)
+                except RuntimeError as e:
+                    await _send_error(websocket, "SERVER_GONE", str(e))
+                    break
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.warning("[lsp_bridge] WS bridge exception (server_id=%s): %s", server_id, e)
+        finally:
+            lsp_process_pool.unsubscribe(proc)
+
+    # Browser extension WebSocket: the plugin inside the user's browser actively connects out to the gateway
+    @app.websocket("/api/browser-ext/ws")
+    async def browser_ext_websocket_endpoint(websocket: WebSocket) -> None:
+        """Browser extension connection endpoint.
+
+        Authentication reuses _extract_auth_from_headers + gateway._check_auth,
+        after the connection is established it is handled by browser_extension_manager;
+        the user_id parsed from the token is bound to the session for subsequent ownership checks.
+        """
+        auth_payload = _extract_auth_from_headers(websocket)
+        if auth_payload is not None:
+            authorized, reason = gateway._check_auth(auth_payload)
+        else:
+            authorized = False
+            reason = "Authentication required"
+        if not authorized:
+            await websocket.accept(subprotocol="haijunbot-ext")
+            await _send_error(websocket, "AUTH_FAILED", reason or "Invalid token")
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+        user_info = (auth_payload or {}).get("user_info") or {}
+        await browser_extension_manager.handle_extension_websocket(
+            websocket, user_id=user_info.get("user_id")
+        )
+
+    # Daemon WebSocket: the haijunbot-daemon on the user's machine actively connects out to the gateway
+    @app.websocket("/api/daemon/ws")
+    async def daemon_websocket_endpoint(websocket: WebSocket) -> None:
+        """Daemon connection endpoint (completely independent from the browser extension endpoint).
+
+        Authentication reuses _extract_auth_from_headers + gateway._check_auth,
+        after the connection is established it is handled by daemon_capability_manager;
+        the user_id parsed from the token is bound to the session for subsequent ownership checks.
+        """
+        auth_payload = _extract_auth_from_headers(websocket)
+        if auth_payload is not None:
+            authorized, reason = gateway._check_auth(auth_payload)
+        else:
+            authorized = False
+            reason = "Authentication required"
+        if not authorized:
+            await websocket.accept(subprotocol=DAEMON_SUBPROTOCOL)
+            await _send_error(websocket, "AUTH_FAILED", reason or "Invalid token")
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+        user_info = (auth_payload or {}).get("user_info") or {}
+        await daemon_capability_manager.handle_daemon_websocket(
+            websocket, user_id=user_info.get("user_id")
+        )
+
+    # WebSocket proxy: proxy to the Agent WebSocket
+    @app.websocket("/api/agent/{agent_id}/ws")
+    async def agent_websocket_proxy(agent_id: str, websocket: WebSocket) -> None:
+        """Proxy a WebSocket connection to the specified Agent.
+
+        Args:
+            agent_id: Agent ID
+            websocket: client WebSocket connection
+        """
+        logger = logging.getLogger(__name__)
+        logger.info(f"[WS PROXY] New WebSocket connection for agent {agent_id}")
+
+        auth_payload = _extract_auth_from_headers(websocket)
+        if auth_payload is not None:
+            authorized, reason = gateway._check_auth(auth_payload)
+        else:
+            authorized = False
+            reason = "Authentication required"
+        if not authorized:
+            await websocket.accept(subprotocol="haijunbot-ws")
+            await _send_error(websocket, "AUTH_FAILED", reason or "Invalid token")
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+
+        # Check read permission: non-owners must be in access_acl.read
+        user_id = None
+        user_info: Dict[str, Any] = {}
+        if auth_payload is not None:
+            user_info = auth_payload.get("user_info") or {}
+            user_id = user_info.get("user_id")
+        if user_id and user_id != "system":
+            is_admin = (user_info or {}).get("is_admin", False)
+            if not is_admin:
+                agent_info = agent_manager.get_agent(agent_id)
+                if (
+                    agent_info
+                    and agent_info.owner_id
+                    and agent_info.owner_id != user_id
+                ):
+                    access_acl = agent_info.access_acl or {}
+                    has_read = user_id in (access_acl.get("read") or [])
+                    if not has_read:
+                        await websocket.accept(subprotocol="haijunbot-ws")
+                        await _send_error(
+                            websocket, "FORBIDDEN", "No read access to this agent"
+                        )
+                        await websocket.close(code=4403, reason="Forbidden")
+                        return
+
+        await websocket.accept(subprotocol="haijunbot-ws")
+
+        requested_node_id = str(websocket.query_params.get("node_id") or "").strip()
+        route = node_runtime.agent_route_registry.get(agent_id)
+        target_node_id = requested_node_id
+        if not target_node_id and route is not None:
+            target_node_id = str(route.node_id or "").strip()
+        logger.info(
+            "[WS PROXY] agent_id=%s requested_node_id=%s route_node_id=%s resolved_target_node_id=%s local_node_id=%s",
+            agent_id,
+            requested_node_id,
+            str(route.node_id or "").strip() if route is not None else "",
+            target_node_id,
+            node_runtime.local_node_id,
+        )
+
+        if target_node_id and target_node_id not in (
+            node_runtime.local_node_id,
+            "master",
+        ):
+            remote_ws_session_id = str(uuid.uuid4())
+            logger.info(
+                "[WS PROXY] opening remote agent ws agent_id=%s target_node_id=%s session_id=%s",
+                agent_id,
+                target_node_id,
+                remote_ws_session_id,
+            )
+            try:
+                open_response = await node_connection_manager.send_request_to_node(
+                    target_node_id,
+                    AGENT_WS_OPEN_REQUEST,
+                    {
+                        "agent_id": agent_id,
+                        "path": "ws",
+                        "session_id": remote_ws_session_id,
+                    },
+                )
+                open_payload = open_response.get("payload") or {}
+                logger.info(
+                    "[WS PROXY] remote open response agent_id=%s target_node_id=%s session_id=%s payload=%s",
+                    agent_id,
+                    target_node_id,
+                    remote_ws_session_id,
+                    open_payload,
+                )
+                if not open_payload.get("success"):
+                    close_reason = (open_payload.get("error") or {}).get(
+                        "message", "Remote websocket open failed"
+                    )
+                    logger.warning(
+                        "[WS PROXY] remote open failed agent_id=%s target_node_id=%s session_id=%s reason=%s",
+                        agent_id,
+                        target_node_id,
+                        remote_ws_session_id,
+                        close_reason,
+                    )
+                    await websocket.close(
+                        code=4003,
+                        reason=close_reason,
+                    )
+                    return
+
+                async def forward_client_to_remote() -> None:
+                    while True:
+                        data = await websocket.receive_text()
+                        # Check interact permission: intercept input_result/confirm_result/manual_interrupt
+                        if user_id and user_id != "system":
+                            try:
+                                msg = json.loads(data)
+                                msg_type = msg.get("type", "")
+                                if msg_type in (
+                                    "input_result",
+                                    "confirm_result",
+                                    "manual_interrupt",
+                                ):
+                                    agent_info = agent_manager.get_agent(agent_id)
+                                    if (
+                                        agent_info
+                                        and agent_info.owner_id
+                                        and agent_info.owner_id != user_id
+                                        and not (user_info or {}).get("is_admin", False)
+                                    ):
+                                        access_acl = agent_info.access_acl or {}
+                                        has_interact = user_id in (
+                                            access_acl.get("interact") or []
+                                        )
+                                        if not has_interact:
+                                            await websocket.send_json(
+                                                {
+                                                    "type": "error",
+                                                    "payload": {
+                                                        "code": "FORBIDDEN",
+                                                        "message": "No interact access to this agent",
+                                                    },
+                                                }
+                                            )
+                                            continue
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+                        send_response = (
+                            await node_connection_manager.send_request_to_node(
+                                target_node_id,
+                                AGENT_WS_SEND_REQUEST,
+                                {
+                                    "session_id": remote_ws_session_id,
+                                    "messages": [data],
+                                },
+                            )
+                        )
+                        send_payload = send_response.get("payload") or {}
+                        if not send_payload.get("success"):
+                            raise RuntimeError(
+                                (send_payload.get("error") or {}).get(
+                                    "message", "Remote websocket send failed"
+                                )
+                            )
+
+                async def forward_remote_to_client() -> None:
+                    while True:
+                        recv_response = (
+                            await node_connection_manager.send_request_to_node(
+                                target_node_id,
+                                AGENT_WS_RECV_REQUEST,
+                                {
+                                    "session_id": remote_ws_session_id,
+                                    "timeout": 1.0,
+                                },
+                                timeout=65.0,
+                            )
+                        )
+                        recv_payload = recv_response.get("payload") or {}
+                        if not recv_payload.get("success"):
+                            raise RuntimeError(
+                                (recv_payload.get("error") or {}).get(
+                                    "message", "Remote websocket receive failed"
+                                )
+                            )
+                        for item in recv_payload.get("messages") or []:
+                            await websocket.send_text(str(item))
+
+                client_to_remote_task = asyncio.create_task(forward_client_to_remote())
+                remote_to_client_task = asyncio.create_task(forward_remote_to_client())
+                done, pending = await asyncio.wait(
+                    {client_to_remote_task, remote_to_client_task},
+                    return_when=asyncio.FIRST_EXCEPTION,
+                )
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+            except Exception as e:
+                logger.error(
+                    "[WS PROXY] Remote websocket proxy error agent_id=%s target_node_id=%s session_id=%s error=%s",
+                    agent_id,
+                    target_node_id,
+                    remote_ws_session_id,
+                    e,
+                )
+                await websocket.close(code=4003, reason="Remote websocket proxy failed")
+            finally:
+                try:
+                    logger.info(
+                        "[WS PROXY] closing remote agent ws agent_id=%s target_node_id=%s session_id=%s",
+                        agent_id,
+                        target_node_id,
+                        remote_ws_session_id,
+                    )
+                    await node_connection_manager.send_request_to_node(
+                        target_node_id,
+                        AGENT_WS_CLOSE_REQUEST,
+                        {"session_id": remote_ws_session_id},
+                    )
+                except Exception as close_exc:
+                    logger.warning(
+                        "[WS PROXY] Remote websocket close warning agent_id=%s target_node_id=%s session_id=%s error=%s",
+                        agent_id,
+                        target_node_id,
+                        remote_ws_session_id,
+                        close_exc,
+                    )
+            return
+
+        # Local proxy path: wraps the websocket to intercept interact messages
+        if user_id and user_id != "system":
+            _original_receive_text = websocket.receive_text
+            _interact_types = {"input_result", "confirm_result", "manual_interrupt"}
+
+            async def _checked_receive_text() -> str:
+                data = await _original_receive_text()
+                try:
+                    msg = json.loads(data)
+                    if msg.get("type", "") in _interact_types:
+                        agent_info = agent_manager.get_agent(agent_id)
+                        if (
+                            agent_info
+                            and agent_info.owner_id
+                            and agent_info.owner_id != user_id
+                            and not (user_info or {}).get("is_admin", False)
+                        ):
+                            access_acl = agent_info.access_acl or {}
+                            has_interact = user_id in (access_acl.get("interact") or [])
+                            if not has_interact:
+                                await websocket.send_json(
+                                    {
+                                        "type": "error",
+                                        "payload": {
+                                            "code": "FORBIDDEN",
+                                            "message": "No interact access to this agent",
+                                        },
+                                    }
+                                )
+                                return await _checked_receive_text()
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                return data
+
+            websocket.receive_text = _checked_receive_text  # type: ignore[method-assign]
+
+        try:
+            await agent_proxy_manager.proxy_websocket(websocket, agent_id)
+        except AgentNotFoundError:
+            logger.error(f"[WS PROXY] Agent not found: {agent_id}")
+            await websocket.close(code=4000, reason="Agent not found")
+        except AgentNotRunningError as e:
+            logger.error(f"[WS PROXY] Agent not running: {e}")
+            await websocket.close(code=4001, reason="Agent not running")
+        except ProxyConnectionError as e:
+            logger.error(f"[WS PROXY] Proxy connection error: {e}")
+            await websocket.close(code=4002, reason="Proxy connection failed")
+        except Exception as e:
+            logger.error(f"[WS PROXY] Unexpected error: {e}")
+            await websocket.close(code=4999, reason="Internal error")
+        finally:
+            logger.info(f"[WS PROXY] WebSocket connection closed for agent {agent_id}")
+
+    @app.websocket("/api/node/{node_id}/agent/{agent_id}/ws")
+    async def node_agent_websocket_proxy(
+        node_id: str, agent_id: str, websocket: WebSocket
+    ) -> None:
+        logger = logging.getLogger(__name__)
+        normalized_node_id = str(node_id or "").strip()
+
+        # Local node: delegate to agent_websocket_proxy
+        if not normalized_node_id or normalized_node_id in (
+            node_runtime.local_node_id,
+            "master",
+        ):
+            await agent_websocket_proxy(agent_id, websocket)
+            return
+
+        # --- Remote node: forward via tunnel ---
+        logger.info(
+            "[NODE AGENT WS] remote agent ws node_id=%s agent_id=%s",
+            normalized_node_id,
+            agent_id,
+        )
+
+        # Authentication
+        auth_payload = _extract_auth_from_headers(websocket)
+        if auth_payload is not None:
+            authorized, reason = gateway._check_auth(auth_payload)
+        else:
+            authorized = False
+            reason = "Authentication required"
+        if not authorized:
+            await websocket.accept(subprotocol="haijunbot-ws")
+            await _send_error(websocket, "AUTH_FAILED", reason or "Invalid token")
+            await websocket.close(code=4401, reason="Unauthorized")
+            return
+
+        await websocket.accept(subprotocol="haijunbot-ws")
+
+        remote_ws_session_id = str(uuid.uuid4())
+        logger.info(
+            "[NODE AGENT WS] opening remote agent ws node_id=%s agent_id=%s session_id=%s",
+            normalized_node_id,
+            agent_id,
+            remote_ws_session_id,
+        )
+        try:
+            open_response = await node_connection_manager.send_request_to_node(
+                normalized_node_id,
+                AGENT_WS_OPEN_REQUEST,
+                {
+                    "agent_id": agent_id,
+                    "path": "ws",
+                    "session_id": remote_ws_session_id,
+                },
+            )
+            open_payload = open_response.get("payload") or {}
+            logger.info(
+                "[NODE AGENT WS] remote open response node_id=%s agent_id=%s session_id=%s payload=%s",
+                normalized_node_id,
+                agent_id,
+                remote_ws_session_id,
+                open_payload,
+            )
+            if not open_payload.get("success"):
+                close_reason = (open_payload.get("error") or {}).get(
+                    "message", "Remote websocket open failed"
+                )
+                logger.warning(
+                    "[NODE AGENT WS] remote open failed node_id=%s agent_id=%s session_id=%s reason=%s",
+                    normalized_node_id,
+                    agent_id,
+                    remote_ws_session_id,
+                    close_reason,
+                )
+                await websocket.close(code=4003, reason=close_reason)
+                return
+
+            async def forward_client_to_remote() -> None:
+                while True:
+                    data = await websocket.receive_text()
+                    send_response = await node_connection_manager.send_request_to_node(
+                        normalized_node_id,
+                        AGENT_WS_SEND_REQUEST,
+                        {
+                            "session_id": remote_ws_session_id,
+                            "messages": [data],
+                        },
+                    )
+                    send_payload = send_response.get("payload") or {}
+                    if not send_payload.get("success"):
+                        raise RuntimeError(
+                            (send_payload.get("error") or {}).get(
+                                "message", "Remote websocket send failed"
+                            )
+                        )
+
+            async def forward_remote_to_client() -> None:
+                while True:
+                    recv_response = await node_connection_manager.send_request_to_node(
+                        normalized_node_id,
+                        AGENT_WS_RECV_REQUEST,
+                        {
+                            "session_id": remote_ws_session_id,
+                            "timeout": 1.0,
+                        },
+                        timeout=65.0,
+                    )
+                    recv_payload = recv_response.get("payload") or {}
+                    if not recv_payload.get("success"):
+                        raise RuntimeError(
+                            (recv_payload.get("error") or {}).get(
+                                "message", "Remote websocket receive failed"
+                            )
+                        )
+                    for item in recv_payload.get("messages") or []:
+                        await websocket.send_text(str(item))
+
+            client_to_remote_task = asyncio.create_task(forward_client_to_remote())
+            remote_to_client_task = asyncio.create_task(forward_remote_to_client())
+            done, pending = await asyncio.wait(
+                {client_to_remote_task, remote_to_client_task},
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+        except Exception as e:
+            logger.error(
+                "[NODE AGENT WS] remote ws proxy error node_id=%s agent_id=%s session_id=%s error=%s",
+                normalized_node_id,
+                agent_id,
+                remote_ws_session_id,
+                e,
+            )
+            try:
+                await websocket.close(code=4003, reason="Remote websocket proxy failed")
+            except Exception as e:
+                save_exception(
+                    e,
+                    module="haijunbot_web_gateway.app",
+                    function="verify_agent_proxy_access",
+                )
+                pass
+        finally:
+            try:
+                logger.info(
+                    "[NODE AGENT WS] closing remote agent ws node_id=%s agent_id=%s session_id=%s",
+                    normalized_node_id,
+                    agent_id,
+                    remote_ws_session_id,
+                )
+                await node_connection_manager.send_request_to_node(
+                    normalized_node_id,
+                    AGENT_WS_CLOSE_REQUEST,
+                    {"session_id": remote_ws_session_id},
+                )
+            except Exception as close_exc:
+                logger.warning(
+                    "[NODE AGENT WS] remote ws close warning node_id=%s agent_id=%s session_id=%s error=%s",
+                    normalized_node_id,
+                    agent_id,
+                    remote_ws_session_id,
+                    close_exc,
+                )
+
+    # HTTP API: execute a shell command on the specified node (permissions same as terminal)
+    # Note: must be registered before the wildcard route /api/node/{node_id}/{path:path} below,
+    # otherwise the wildcard route will match /exec first and misjudge it as an unsupported node api path.
+    @app.post("/api/node/{node_id}/exec", dependencies=[Depends(verify_token)])
+    async def node_exec(
+        node_id: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Synchronously execute a shell command on the specified node and return the output.
+
+        Permission control is the same as terminal: requires terminal:create permission and access to the target node.
+        The command executes locally on the master or a child node; child nodes do not re-authenticate (trusting the master's decision).
+        """
+        from fastapi import HTTPException
+
+        user_info = getattr(request.state, "user_info", None)
+        if user_info and user_info.get("user_id") != "system" and permission_manager:
+            user_id = user_info["user_id"]
+            if not permission_manager.check_permission(user_id, "terminal:create"):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: terminal:create",
+                    },
+                )
+            check_node_id = node_id or "master"
+            if not permission_manager.check_node_access(user_id, check_node_id):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "PERMISSION_DENIED",
+                        "message": f"Permission denied: no access to node {check_node_id}",
+                    },
+                )
+
+        command = str(request_body.get("command") or "").strip()
+        if not command:
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_COMMAND",
+                    "message": "command is required",
+                },
+            }
+        # The default values of interpreter / working_dir must be resolved locally on the "node that actually executes the command":
+        # The master and child nodes may have different SHELL and home directories (for example, the master uses fish,
+        # the child node lacks this interpreter); if parsed on the master side and passed across nodes, it will cause the child node to report
+        # [Errno 2] No such file or directory. Therefore it is only passed down when the user explicitly specifies it.
+        raw_interpreter = str(request_body.get("interpreter") or "").strip()
+        raw_working_dir = request_body.get("working_dir")
+        explicit_working_dir = str(raw_working_dir).strip() if raw_working_dir else ""
+        try:
+            exec_timeout = float(request_body.get("timeout") or 60.0)
+        except (TypeError, ValueError):
+            exec_timeout = 60.0
+
+        try:
+            # Execute directly on the local node
+            if node_id in (node_runtime.local_node_id, "master"):
+                interpreter = raw_interpreter or vinbox_runtime.shell_path()
+                working_dir = explicit_working_dir or str(pathlib.Path.home())
+                # argv list + shell=False: perintah dijalankan pwsh, tidak ada
+                # cmd.exe/bash yang ikut menafsirkan teks.
+                proc = await asyncio.create_subprocess_exec(
+                    *vinbox_runtime.command_argv(interpreter, command),
+                    cwd=working_dir,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        proc.communicate(), timeout=exec_timeout
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "TIMEOUT",
+                            "message": f"command timed out after {exec_timeout}s",
+                        },
+                    }
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "stdout": stdout_bytes.decode("utf-8", "replace"),
+                        "stderr": stderr_bytes.decode("utf-8", "replace"),
+                        "exit_code": proc.returncode,
+                    },
+                }
+
+            # Remote node status check
+            node_info = node_runtime.node_registry.get(node_id)
+            if node_info is None:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NODE_NOT_FOUND",
+                        "message": f"Node not found: {node_id}",
+                    },
+                }
+            if node_info.status != "online":
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NODE_OFFLINE",
+                        "message": f"Node is offline: {node_id}",
+                    },
+                }
+
+            # Forward to the remote node for execution (pass empty when interpreter/working_dir is not explicitly specified,
+            # resolved by the child node according to its local environment, to avoid cross-node default value incompatibility).
+            response = await node_connection_manager.send_request_to_node(
+                node_id,
+                NODE_TERMINAL_REQUEST,
+                {
+                    "action": "exec",
+                    "payload": {
+                        "command": command,
+                        "interpreter": raw_interpreter,
+                        "working_dir": explicit_working_dir,
+                        "timeout": exec_timeout,
+                    },
+                },
+                timeout=exec_timeout + 10.0,
+            )
+            payload = response.get("payload") or {}
+            if payload.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        **(payload.get("data") or {}),
+                    },
+                }
+            return {
+                "success": False,
+                "error": payload.get("error")
+                or {"code": "EXEC_FAILED", "message": "command execution failed"},
+            }
+        except Exception as e:
+            error_message = str(e).strip() or f"exec failed for node: {node_id}"
+            logger.error(
+                "[NODE EXEC] failed node_id=%s error=%s",
+                node_id,
+                error_message,
+                exc_info=True,
+            )
+            return {
+                "success": False,
+                "error": {"code": "EXEC_FAILED", "message": error_message},
+            }
+
+    @app.api_route(
+        "/api/node/{node_id}/{path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+        dependencies=[Depends(verify_token)],
+    )
+    async def node_http_proxy(node_id: str, path: str, request: Request) -> Response:
+        """Unified node HTTP proxy."""
+        try:
+            normalized_node_id = str(node_id or "").strip()
+            if not normalized_node_id:
+                return Response(
+                    content='{"error": "node_id is required"}',
+                    status_code=400,
+                    media_type="application/json",
+                )
+            body = (await request.body()).decode("utf-8", errors="replace")
+
+            # --- agent HTTP proxy: path starts with agent/ ---
+            normalized_path = str(path or "").strip("/")
+            if normalized_path.startswith("agent/"):
+                # Parse agent/{agent_id}/{sub_path}
+                agent_parts = normalized_path[len("agent/") :].split("/", 1)
+                agent_id = agent_parts[0]
+                agent_sub_path = agent_parts[1] if len(agent_parts) > 1 else ""
+                if normalized_node_id in (node_runtime.local_node_id, "master"):
+                    # Local agent HTTP proxy
+                    try:
+                        return await agent_proxy_manager.proxy_http_request(
+                            request, agent_id, agent_sub_path
+                        )
+                    except AgentNotFoundError:
+                        return Response(
+                            content='{"error": "Agent not found"}',
+                            status_code=404,
+                            media_type="application/json",
+                        )
+                    except AgentNotRunningError:
+                        return Response(
+                            content='{"error": "Agent not running"}',
+                            status_code=503,
+                            media_type="application/json",
+                        )
+                    except ProxyConnectionError:
+                        return Response(
+                            content='{"error": "Proxy connection failed"}',
+                            status_code=502,
+                            media_type="application/json",
+                        )
+                else:
+                    # Remote agent HTTP proxy
+                    remote_response = (
+                        await node_connection_manager.send_request_to_node(
+                            normalized_node_id,
+                            AGENT_HTTP_REQUEST,
+                            {
+                                "agent_id": agent_id,
+                                "method": request.method,
+                                "path": agent_sub_path,
+                                "query": str(request.query_params),
+                                "headers": dict(request.headers),
+                                "body": body,
+                            },
+                        )
+                    )
+                    payload = remote_response.get("payload") or {}
+                    if not payload.get("success"):
+                        error = payload.get("error") or {}
+                        return Response(
+                            content=f'{{"error": "{error.get("message", "Remote agent HTTP proxy failed")}"}}',
+                            status_code=502,
+                            media_type="application/json",
+                        )
+                    return Response(
+                        content=payload.get("body", ""),
+                        status_code=int(payload.get("status_code", 200)),
+                        headers=payload.get("headers") or {},
+                        media_type=(payload.get("headers") or {}).get("content-type"),
+                    )
+
+            # --- HTTP proxy: pass through to external URL ---
+            if normalized_path.startswith("http_proxy/"):
+                target_url = normalized_path[len("http_proxy/") :]
+                logger.info(
+                    f"[HTTP PROXY] Received proxy request: node_id={normalized_node_id}, target_url={target_url}"
+                )
+
+                # Debug: record request headers and request body
+                debug_headers = dict(request.headers)
+                logger.info(
+                    f"[HTTP PROXY DEBUG] Headers: Accept={debug_headers.get('accept', 'N/A')}, Content-Type={debug_headers.get('content-type', 'N/A')}"
+                )
+
+                if normalized_node_id in (node_runtime.local_node_id, "master"):
+                    # Local HTTP proxy
+
+                    # Build target URL
+                    full_url = target_url
+                    if request.query_params:
+                        full_url = f"{full_url}?{request.query_params}"
+                    logger.debug(f"[HTTP PROXY] Full target URL: {full_url}")
+
+                    # Validate URL
+                    if not full_url.startswith(("http://", "https://")):
+                        return Response(
+                            content='{"error": "URL must start with http:// or https://"}',
+                            status_code=400,
+                            media_type="application/json",
+                        )
+
+                    # SSRF protection: disallow proxying to internal/loopback/link-local addresses
+                    safe, safe_msg = _is_safe_proxy_url(full_url)
+                    if not safe:
+                        logger.error(
+                            f"[HTTP PROXY] Target URL is unsafe: {full_url} ({safe_msg})"
+                        )
+                        return Response(
+                            content=json.dumps(
+                                {
+                                    "error": f"Proxying to this URL is not allowed: {safe_msg}"
+                                }
+                            ),
+                            status_code=400,
+                            media_type="application/json",
+                        )
+
+                    # Prepare request headers
+                    headers = dict(request.headers)
+                    headers.pop("host", None)
+
+                    # Read request body
+                    raw_body = await request.body()
+
+                    # Determine whether a streaming response is needed: check the Accept header or the stream parameter in the request body
+                    accept_header = headers.get("accept", "")
+                    want_stream = "text/event-stream" in accept_header
+
+                    # If the Accept header is not specified, check the stream field in the request body (OpenAI SDK format)
+                    if not want_stream and raw_body:
+                        try:
+                            body_json = json.loads(raw_body)
+                            # Check the various truthy forms of the stream field
+                            stream_value = body_json.get("stream")
+                            if (
+                                stream_value is True
+                                or stream_value == 1
+                                or stream_value == "true"
+                            ):
+                                want_stream = True
+                                logger.info(
+                                    "[HTTP PROXY] Detected stream=true from request body, enabling streaming mode"
+                                )
+                        except (json.JSONDecodeError, ValueError):
+                            # If JSON parsing fails, check whether the raw body contains the stream keyword
+                            body_str = (
+                                raw_body.decode("utf-8", errors="replace")
+                                if isinstance(raw_body, bytes)
+                                else str(raw_body)
+                            )
+                            if (
+                                '"stream": true' in body_str
+                                or '"stream":true' in body_str
+                            ):
+                                want_stream = True
+                                logger.info(
+                                    "[HTTP PROXY] Detected stream=true from raw request body content, enabling streaming mode"
+                                )
+
+                    logger.info(
+                        f"[HTTP PROXY] Streaming detection: Accept={accept_header}, want_stream={want_stream}, body_length={len(raw_body) if raw_body else 0}"
+                    )
+
+                    try:
+                        if want_stream:
+
+                            async def stream_response() -> AsyncGenerator[bytes, None]:
+                                async with httpx.AsyncClient(
+                                    timeout=httpx.Timeout(60.0)
+                                ).stream(
+                                    method=request.method,
+                                    url=full_url,
+                                    headers=headers,
+                                    content=raw_body,
+                                ) as response:
+                                    logger.debug(
+                                        f"[NODE HTTP PROXY] Streaming response: {response.status_code}"
+                                    )
+                                    async for chunk in response.aiter_bytes():
+                                        if chunk:
+                                            yield chunk
+
+                            return StreamingResponse(
+                                stream_response(),
+                                media_type="text/event-stream",
+                                headers={
+                                    "Cache-Control": "no-cache",
+                                    "Connection": "keep-alive",
+                                    "X-Accel-Buffering": "no",
+                                },
+                            )
+                        else:
+                            http_response = await httpx.AsyncClient(
+                                timeout=httpx.Timeout(60.0)
+                            ).request(
+                                method=request.method,
+                                url=full_url,
+                                headers=headers,
+                                content=raw_body,
+                            )
+
+                            excluded_headers = {
+                                "content-encoding",
+                                "content-length",
+                                "transfer-encoding",
+                                "connection",
+                            }
+                            response_headers = {
+                                k: v
+                                for k, v in http_response.headers.items()
+                                if k.lower() not in excluded_headers
+                            }
+
+                            return Response(
+                                content=http_response.content,
+                                status_code=http_response.status_code,
+                                headers=response_headers,
+                                media_type=http_response.headers.get("content-type"),
+                            )
+                    except httpx.TimeoutException:
+                        return Response(
+                            content='{"error": "Request timeout"}',
+                            status_code=504,
+                            media_type="application/json",
+                        )
+                    except httpx.RequestError as e:
+                        logger.error(f"[NODE HTTP PROXY] Request error: {e}")
+                        return Response(
+                            content=f'{{"error": "Request failed: {str(e)}"}}',
+                            status_code=502,
+                            media_type="application/json",
+                        )
+                else:
+                    # Remote HTTP proxy
+                    accept_header = dict(request.headers).get("accept", "")
+                    want_stream = "text/event-stream" in accept_header
+
+                    # If the Accept header is not specified, check the stream field in the request body (OpenAI SDK format)
+                    if not want_stream and body:
+                        try:
+                            body_json = json.loads(body)
+                            # Check the various truthy forms of the stream field
+                            stream_value = body_json.get("stream")
+                            if (
+                                stream_value is True
+                                or stream_value == 1
+                                or stream_value == "true"
+                            ):
+                                want_stream = True
+                                logger.info(
+                                    "[HTTP PROXY] Remote proxy detected stream=true from request body, enabling streaming mode"
+                                )
+                        except (json.JSONDecodeError, ValueError):
+                            # If JSON parsing fails, check whether the raw body contains the stream keyword
+                            body_str = (
+                                body.decode("utf-8", errors="replace")
+                                if isinstance(body, bytes)
+                                else str(body)
+                            )
+                            if (
+                                '"stream": true' in body_str
+                                or '"stream":true' in body_str
+                            ):
+                                want_stream = True
+                                logger.info(
+                                    "[HTTP PROXY] Remote proxy detected stream=true from raw request body content, enabling streaming mode"
+                                )
+
+                    logger.info(
+                        f"[HTTP PROXY] Remote proxy streaming detection: Accept={accept_header}, want_stream={want_stream}, body_length={len(body) if body else 0}"
+                    )
+
+                    if want_stream:
+                        # Streaming mode: use the streaming method
+                        async def stream_from_node() -> AsyncGenerator[bytes, None]:
+                            async for (
+                                msg
+                            ) in node_connection_manager.send_request_to_node_streaming(
+                                normalized_node_id,
+                                NODE_HTTP_PROXY_REQUEST,
+                                {
+                                    "method": request.method,
+                                    "path": f"http_proxy/{target_url}",
+                                    "query": str(request.query_params),
+                                    "headers": dict(request.headers),
+                                    "body": body,
+                                    "streaming": True,
+                                },
+                            ):
+                                chunk = msg.get("payload", {}).get("chunk", b"")
+                                if isinstance(chunk, str):
+                                    chunk = chunk.encode()
+                                if chunk:
+                                    yield chunk
+
+                        return StreamingResponse(
+                            stream_from_node(),
+                            media_type="text/event-stream",
+                            headers={
+                                "Cache-Control": "no-cache",
+                                "Connection": "keep-alive",
+                                "X-Accel-Buffering": "no",
+                            },
+                        )
+                    else:
+                        response = await node_connection_manager.send_request_to_node(
+                            normalized_node_id,
+                            NODE_HTTP_PROXY_REQUEST,
+                            {
+                                "method": request.method,
+                                "path": f"http_proxy/{target_url}",
+                                "query": str(request.query_params),
+                                "headers": dict(request.headers),
+                                "body": body,
+                            },
+                        )
+                    payload = response.get("payload") or {}
+                    if "body" in payload:
+                        return Response(
+                            content=payload.get("body", ""),
+                            status_code=int(payload.get("status_code", 200)),
+                            headers=payload.get("headers") or {},
+                            media_type=(payload.get("headers") or {}).get(
+                                "content-type"
+                            ),
+                        )
+                    if not payload.get("success"):
+                        error = payload.get("error") or {}
+                        return Response(
+                            content=f'{{"error": "{error.get("message", "Remote HTTP proxy failed")}"}}',
+                            status_code=502,
+                            media_type="application/json",
+                        )
+                    return Response(
+                        content=payload.get("body", ""),
+                        status_code=int(payload.get("status_code", 200)),
+                        headers=payload.get("headers") or {},
+                        media_type=(payload.get("headers") or {}).get("content-type"),
+                    )
+
+            # --- node-level API ---
+            logger.info(
+                f"[NODE HTTP PROXY] Start processing request: node_id={normalized_node_id}, method={request.method}, path={path}"
+            )
+            if normalized_node_id in (node_runtime.local_node_id, "master"):
+                result = await _dispatch_node_http_request(
+                    method=request.method,
+                    path=path,
+                    query=str(request.query_params),
+                    headers=dict(request.headers),
+                    body=body,
+                    user_info=getattr(request.state, "user_info", None),
+                )
+                return Response(
+                    content=result.get("body", "{}"),
+                    status_code=int(result.get("status_code", 200)),
+                    media_type="application/json",
+                )
+            # Check whether the node is online
+            node_info = node_runtime.node_registry.get(normalized_node_id)
+            if node_info is None:
+                logger.error(
+                    f"[NODE HTTP PROXY] Node does not exist: node_id={normalized_node_id}"
+                )
+                return Response(
+                    content=f'{{"error": "Node {normalized_node_id} not found"}}',
+                    status_code=502,
+                    media_type="application/json",
+                )
+            if node_info.status != "online":
+                logger.error(
+                    f"[NODE HTTP PROXY] Node not online: node_id={normalized_node_id}, status={node_info.status}"
+                )
+                return Response(
+                    content=f'{{"error": "Node {normalized_node_id} is not online (status: {node_info.status})"}}',
+                    status_code=502,
+                    media_type="application/json",
+                )
+            # Permission check: master uniformly controls cross-node access, child nodes no longer perform duplicate checks.
+            # Child nodes have no local auth data and cannot determine independently, so all permission decisions are centralized on the master.
+            _proxy_user_info = getattr(request.state, "user_info", None)
+            _proxy_user_id = (
+                _proxy_user_info.get("user_id") if _proxy_user_info else None
+            )
+            if (
+                _proxy_user_id
+                and _proxy_user_id != "system"
+                and permission_manager
+                and not permission_manager.check_node_access(
+                    _proxy_user_id, normalized_node_id
+                )
+            ):
+                logger.warning(
+                    f"[NODE HTTP PROXY] Permission denied: user_id={_proxy_user_id}, node_id={normalized_node_id}"
+                )
+                return Response(
+                    content=(
+                        '{"success": false, "error": {"code": "PERMISSION_DENIED", '
+                        f'"message": "Permission denied: no access to node {normalized_node_id}"}}}}'
+                    ),
+                    status_code=403,
+                    media_type="application/json",
+                )
+
+            # The file:upload permission for the upload interface is likewise uniformly controlled by the master
+            # (child nodes have no local auth data, no duplicate checks).
+            if (
+                str(path or "").strip("/") == "upload"
+                and _proxy_user_id
+                and _proxy_user_id != "system"
+                and permission_manager
+                and not permission_manager.check_permission(
+                    _proxy_user_id, "file:upload"
+                )
+            ):
+                logger.warning(
+                    f"[NODE HTTP PROXY] Permission denied: user_id={_proxy_user_id}, permission=file:upload"
+                )
+                return Response(
+                    content=(
+                        '{"success": false, "error": {"code": "PERMISSION_DENIED", '
+                        '"message": "Permission denied: file:upload"}}'
+                    ),
+                    status_code=403,
+                    media_type="application/json",
+                )
+
+            # The admin:config permission for the service restart interface is likewise uniformly controlled by the master
+            # (child nodes have no local auth data and cannot determine independently, and would be misjudged as having no permission).
+            if (
+                str(path or "").strip("/") == "service/restart"
+                and _proxy_user_id
+                and _proxy_user_id != "system"
+                and permission_manager
+                and not permission_manager.check_permission(
+                    _proxy_user_id, "admin:config"
+                )
+            ):
+                logger.warning(
+                    f"[NODE HTTP PROXY] Permission denied: user_id={_proxy_user_id}, permission=admin:config"
+                )
+                return Response(
+                    content=(
+                        '{"success": false, "error": {"code": "PERMISSION_DENIED", '
+                        '"message": "Permission denied: admin:config"}}'
+                    ),
+                    status_code=403,
+                    media_type="application/json",
+                )
+
+            response = await node_connection_manager.send_request_to_node(
+                normalized_node_id,
+                NODE_HTTP_PROXY_REQUEST,
+                {
+                    "method": request.method,
+                    "path": path,
+                    "query": str(request.query_params),
+                    "headers": dict(request.headers),
+                    "body": body,
+                    "user_info": getattr(request.state, "user_info", None),
+                },
+            )
+            payload = response.get("payload") or {}
+            # If the payload contains a body, it means the child side has correctly handled the request,
+            # directly return its status_code and body (even if the business-level success=False).
+            # Only when the payload contains no body (a real proxy failure) is 502 returned.
+            if "body" in payload:
+                logger.info(
+                    f"[NODE HTTP PROXY] Request succeeded: node_id={normalized_node_id}, path={path}, status_code={payload.get('status_code', 200)}"
+                )
+                return Response(
+                    content=payload.get("body", ""),
+                    status_code=int(payload.get("status_code", 200)),
+                    headers=payload.get("headers") or {},
+                    media_type=(payload.get("headers") or {}).get("content-type"),
+                )
+            if not payload.get("success"):
+                error = payload.get("error") or {}
+                error_message = error.get("message", "Node HTTP proxy failed")
+                error_code = error.get("code", "unknown")
+                logger.error(
+                    f"[NODE HTTP PROXY] Request failed: node_id={normalized_node_id}, path={path}, error_code={error_code}, error_message={error_message}"
+                )
+                return Response(
+                    content=f'{{"error": "{error_message}", "code": "{error_code}"}}',
+                    status_code=502,
+                    media_type="application/json",
+                )
+            return Response(
+                content=payload.get("body", ""),
+                status_code=int(payload.get("status_code", 200)),
+                headers=payload.get("headers") or {},
+                media_type=(payload.get("headers") or {}).get("content-type"),
+            )
+        except Exception as e:
+            logger.error(f"[NODE HTTP PROXY] error node_id={node_id} path={path}: {e}")
+            return Response(
+                content='{"error": "Node HTTP proxy failed"}',
+                status_code=502,
+                media_type="application/json",
+            )
+
+    # HTTP proxy: proxy to Agent HTTP API
+    @app.api_route(
+        "/api/agent/{agent_id}/{path:path}",
+        methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
+        dependencies=[Depends(verify_agent_proxy_access)],
+    )
+    async def agent_http_proxy(agent_id: str, path: str, request: Request) -> Response:
+        """Proxy HTTP requests to the specified Agent.
+
+        Args:
+            agent_id: Agent ID
+            path: target path
+            request: FastAPI Request object
+
+        Returns:
+            the proxied HTTP response
+        """
+        logger = logging.getLogger(__name__)
+        logger.info(f"[HTTP PROXY] {request.method} /api/agent/{agent_id}/{path}")
+
+        route = node_runtime.agent_route_registry.get(agent_id)
+        if route is not None and route.node_id not in (
+            node_runtime.local_node_id,
+            "master",
+        ):
+            try:
+                body = (await request.body()).decode("utf-8", errors="replace")
+                remote_response = await node_connection_manager.send_request_to_node(
+                    route.node_id,
+                    AGENT_HTTP_REQUEST,
+                    {
+                        "agent_id": agent_id,
+                        "method": request.method,
+                        "path": path,
+                        "query": str(request.query_params),
+                        "headers": dict(request.headers),
+                        "body": body,
+                    },
+                )
+                payload = remote_response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return Response(
+                        content=f'{{"error": "{error.get("message", "Remote HTTP proxy failed")}"}}',
+                        status_code=502,
+                        media_type="application/json",
+                    )
+                return Response(
+                    content=payload.get("body", ""),
+                    status_code=int(payload.get("status_code", 200)),
+                    headers=payload.get("headers") or {},
+                    media_type=(payload.get("headers") or {}).get("content-type"),
+                )
+            except Exception as e:
+                logger.error(f"[HTTP PROXY] Remote HTTP proxy error: {e}")
+                return Response(
+                    content='{"error": "Remote HTTP proxy failed"}',
+                    status_code=502,
+                    media_type="application/json",
+                )
+
+        try:
+            response = await agent_proxy_manager.proxy_http_request(
+                request, agent_id, path
+            )
+            # If it is a /status request and the status is waiting_confirm, add pending_confirm information
+            if path == "status" and request.method == "GET":
+                try:
+                    import json as json_module
+
+                    body_bytes = bytes(response.body)
+                    body = json_module.loads(body_bytes.decode("utf-8"))
+                    if body.get("execution_status") == "waiting_confirm":
+                        # Multi-user mode: get the pending_confirm of any active session
+                        session_id = next(
+                            (
+                                sid
+                                for sid, auth in gateway._auth_store.items()
+                                if auth and gateway._check_auth(auth)[0]
+                            ),
+                            None,
+                        )
+                        pending_confirm = (
+                            input_registry.get_confirm_request(session_id)
+                            if session_id
+                            else None
+                        )
+                        if pending_confirm:
+                            body["pending_confirm"] = pending_confirm
+                            from starlette.responses import JSONResponse
+
+                            return JSONResponse(
+                                content=body,
+                                status_code=response.status_code,
+                                headers=dict(response.headers),
+                            )
+                except Exception as e:
+                    logger.warning(
+                        f"[HTTP PROXY] Failed to add pending_confirm to status: {e}"
+                    )
+            return response
+        except AgentNotFoundError:
+            logger.error(f"[HTTP PROXY] Agent not found: {agent_id}")
+            return Response(
+                content='{"error": "Agent not found"}',
+                status_code=404,
+                media_type="application/json",
+            )
+        except AgentNotRunningError as e:
+            logger.error(f"[HTTP PROXY] Agent not running: {e}")
+            return Response(
+                content='{"error": "Agent not running"}',
+                status_code=503,
+                media_type="application/json",
+            )
+        except ProxyConnectionError as e:
+            logger.error(f"[HTTP PROXY] Proxy connection error: {e}")
+            return Response(
+                content='{"error": "Proxy connection failed"}',
+                status_code=502,
+                media_type="application/json",
+            )
+        except Exception as e:
+            logger.error(f"[HTTP PROXY] Unexpected error: {e}")
+            return Response(
+                content='{"error": "Internal error"}',
+                status_code=500,
+                media_type="application/json",
+            )
+
+    @app.get("/api/node/status", dependencies=[Depends(verify_token)])
+    async def get_node_status() -> Dict[str, Any]:
+        # Supplement the version field for each node: child reports it via heartbeat, master takes the locally running version
+        nodes = []
+        has_master = False
+        for node in node_runtime.node_registry.list_all():
+            item = dict(node)
+            if item.get("node_id") == "master":
+                item["version"] = HAIJUNBOT_VERSION
+                has_master = True
+            nodes.append(item)
+        # The master itself does not register via heartbeat, so it must always appear in the node list
+        if not has_master:
+            nodes.insert(
+                0,
+                {
+                    "node_id": "master",
+                    "status": "online",
+                    "version": HAIJUNBOT_VERSION,
+                },
+            )
+        return {
+            "success": True,
+            "data": {
+                "node": node_config.to_dict(),
+                "runtime_status": node_runtime.status,
+                "version": HAIJUNBOT_VERSION,
+                "token_sync": {
+                    "last_synced_at": node_runtime.token_sync_state.last_synced_at,
+                    "sync_status": node_runtime.token_sync_state.sync_status,
+                    "source_node_id": node_runtime.token_sync_state.source_node_id,
+                    "error_message": node_runtime.token_sync_state.error_message,
+                },
+                "nodes": nodes,
+                "agent_routes": node_runtime.agent_route_registry.list_all(),
+            },
+        }
+
+    @app.get("/api/node/secret", dependencies=[Depends(verify_token)])
+    async def get_node_secret(request: Request) -> Dict[str, Any]:
+        """Get the node connection private key (master mode only, requires admin:config permission)."""
+        from fastapi import HTTPException
+
+        user_info = getattr(request.state, "user_info", None)
+        if (
+            user_info
+            and user_info.get("user_id") != "system"
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:config"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:config",
+                },
+            )
+        if not node_config.is_master:
+            return {
+                "success": False,
+                "error": {
+                    "code": "NOT_MASTER_MODE",
+                    "message": "Node secret is only available in master mode",
+                },
+            }
+
+        node_secret = os.environ.get("HAIJUNBOT_NODE_SECRET")
+        if not node_secret:
+            return {
+                "success": False,
+                "error": {
+                    "code": "SECRET_NOT_CONFIGURED",
+                    "message": "Node secret is not configured",
+                },
+            }
+
+        return {
+            "success": True,
+            "data": {
+                "node_secret": node_secret,
+            },
+        }
+
+    @app.get("/api/config/schema", dependencies=[Depends(verify_token)])
+    async def get_config_schema(request: Request) -> Dict[str, Any]:
+        """Get the configuration JSON Schema (requires admin:config permission).
+
+        Used by the frontend "Config File" editor to dynamically generate forms according to the Schema.
+        """
+        from fastapi import HTTPException
+
+        user_info = getattr(request.state, "user_info", None)
+        if (
+            user_info
+            and user_info.get("user_id") != "system"
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:config"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:config",
+                },
+            )
+        try:
+            import importlib.resources as resources
+
+            try:
+                schema_path = pathlib.Path(
+                    str(resources.files("haijunbot.haijunbot_data") / "config_schema.json")
+                )
+            except Exception:
+                schema_path = (
+                    pathlib.Path(__file__).resolve().parent.parent
+                    / "haijunbot_data"
+                    / "config_schema.json"
+                )
+            if not schema_path.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "SCHEMA_NOT_FOUND",
+                        "message": f"Config schema not found: {schema_path}",
+                    },
+                }
+            with open(schema_path, "r", encoding="utf-8") as f:
+                schema = json.load(f)
+            return {"success": True, "data": schema}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {
+                    "code": "GET_SCHEMA_FAILED",
+                    "message": str(e),
+                },
+            }
+
+    def _validate_config_against_schema(
+        config_data: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        """Validate the configuration with config_schema.json, return a list of errors (empty means passed).
+
+        Args:
+            config_data: the complete configuration dictionary to be validated
+
+        Returns:
+            list of errors, each item contains path and message; empty means validation passed
+        """
+        try:
+            from haijunbot.haijunbot_config.schema_parser import SchemaParser
+
+            import importlib.resources as resources
+
+            try:
+                schema_path = pathlib.Path(
+                    str(resources.files("haijunbot.haijunbot_data") / "config_schema.json")
+                )
+            except Exception:
+                schema_path = (
+                    pathlib.Path(__file__).resolve().parent.parent
+                    / "haijunbot_data"
+                    / "config_schema.json"
+                )
+            if not schema_path.exists():
+                return [
+                    {
+                        "path": "",
+                        "message": f"Config schema not found: {schema_path}",
+                    }
+                ]
+
+            parser = SchemaParser(str(schema_path))
+            errors = parser.validate_config(config_data)
+            return [{"path": e.path or "", "message": e.message} for e in errors]
+        except Exception as e:
+            return [{"path": "", "message": f"Schema validation failed: {e}"}]
+
+    @app.get("/api/nodes/{node_id}/config", dependencies=[Depends(verify_token)])
+    async def get_node_config(node_id: str, request: Request) -> Dict[str, Any]:
+        """Get the configuration of the specified node (requires admin:config permission)."""
+        from fastapi import HTTPException
+
+        user_info = getattr(request.state, "user_info", None)
+        if (
+            user_info
+            and user_info.get("user_id") != "system"
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:config"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:config",
+                },
+            )
+        try:
+            # Check whether it is a local node
+            if node_id in (node_runtime.local_node_id, "master"):
+                # Read local configuration
+                config_file = pathlib.Path.home() / ".haijunbot" / "config.yaml"
+                if not config_file.exists():
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "CONFIG_NOT_FOUND",
+                            "message": "Config file not found",
+                        },
+                    }
+
+                with open(config_file, "r", encoding="utf-8") as f:
+                    config_data = yaml.safe_load(f) or {}
+
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "config": config_data,
+                    },
+                }
+
+            # Check remote node status
+            node_info = node_runtime.node_registry.get(node_id)
+            if node_info is None:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NODE_NOT_FOUND",
+                        "message": f"Node not found: {node_id}",
+                    },
+                }
+
+            if node_info.status != "online":
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NODE_OFFLINE",
+                        "message": f"Node is offline: {node_id}",
+                    },
+                }
+
+            # Get configuration from remote node
+            response = await node_connection_manager.send_request_to_node(
+                node_id,
+                CONFIG_GET_REQUEST,
+                {},
+                timeout=30.0,
+            )
+
+            payload = response.get("payload") or {}
+            if payload.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "config": payload.get("data", {}).get("config_data", {}),
+                    },
+                }
+            else:
+                error = payload.get("error") or {}
+                return {
+                    "success": False,
+                    "error": error,
+                }
+        except Exception as e:
+            error_message = str(e).strip()
+            if not error_message:
+                if isinstance(e, TimeoutError):
+                    error_message = f"Get config timed out for node: {node_id}"
+                else:
+                    error_message = f"Get config failed for node: {node_id}"
+            logger.error(
+                "[CONFIG GET] failed node_id=%s error=%s",
+                node_id,
+                error_message,
+                exc_info=True,
+            )
+            return {
+                "success": False,
+                "error": {
+                    "code": "GET_CONFIG_FAILED",
+                    "message": error_message,
+                },
+            }
+
+    @app.post("/api/nodes/{node_id}/config", dependencies=[Depends(verify_token)])
+    async def set_node_config(
+        node_id: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Set the configuration of the specified node (requires admin:config permission)."""
+        from fastapi import HTTPException
+
+        user_info = getattr(request.state, "user_info", None)
+        if (
+            user_info
+            and user_info.get("user_id") != "system"
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:config"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:config",
+                },
+            )
+        try:
+            config_sections = request_body.get("config_sections", [])
+            config_data = request_body.get("config_data", {})
+
+            if not config_sections:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": "config_sections is required",
+                    },
+                }
+
+            if not config_data:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": "config_data is required",
+                    },
+                }
+
+            # Use config_schema.json to perform Schema validation on the submitted configuration, to prevent illegal formats from being written and making the application fail to start
+            schema_errors = _validate_config_against_schema(config_data)
+            if schema_errors:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "CONFIG_SCHEMA_VALIDATION_FAILED",
+                        "message": "Configuration does not conform to the Schema specification, not written",
+                        "details": schema_errors,
+                    },
+                }
+
+            # Check whether it is a local node
+            if node_id in (node_runtime.local_node_id, "master"):
+                # Apply the configuration directly on the local node
+                try:
+                    config_file = pathlib.Path.home() / ".haijunbot" / "config.yaml"
+
+                    # Back up the original configuration file
+                    backup_file = config_file.with_suffix(".yaml.bak")
+                    if config_file.exists():
+                        shutil.copy2(config_file, backup_file)
+
+                    # Read the existing configuration
+                    existing_config: Dict[str, Any] = {}
+                    if config_file.exists():
+                        with open(config_file, "r", encoding="utf-8") as f:
+                            existing_config = yaml.safe_load(f) or {}
+
+                    # Update configuration
+                    updated_config = existing_config.copy()
+                    for section in config_sections:
+                        if section in config_data:
+                            updated_config[section] = config_data[section]
+
+                    # Save configuration
+                    config_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(config_file, "w", encoding="utf-8") as f:
+                        yaml.safe_dump(
+                            updated_config,
+                            f,
+                            allow_unicode=True,
+                            default_flow_style=False,
+                        )
+
+                    return {
+                        "success": True,
+                        "data": {
+                            "node_id": node_id,
+                            "message": "Configuration set successfully",
+                            "backup_file": str(backup_file),
+                        },
+                    }
+                except Exception as e:
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "CONFIG_SET_ERROR",
+                            "message": str(e),
+                        },
+                    }
+
+            # Check remote node status
+            node_info = node_runtime.node_registry.get(node_id)
+            if node_info is None:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NODE_NOT_FOUND",
+                        "message": f"Node not found: {node_id}",
+                    },
+                }
+
+            if node_info.status != "online":
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NODE_OFFLINE",
+                        "message": f"Node is offline: {node_id}",
+                    },
+                }
+
+            # Send the configuration set request to the remote node
+            response = await node_connection_manager.send_request_to_node(
+                node_id,
+                CONFIG_SET_REQUEST,
+                {
+                    "config_sections": config_sections,
+                    "config_data": config_data,
+                },
+                timeout=30.0,
+            )
+
+            payload = response.get("payload") or {}
+            if payload.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "message": "Configuration set successfully",
+                        "data": payload.get("data", {}),
+                    },
+                }
+            else:
+                error = payload.get("error") or {}
+                return {
+                    "success": False,
+                    "error": error,
+                }
+        except Exception as e:
+            error_message = str(e).strip()
+            if not error_message:
+                if isinstance(e, TimeoutError):
+                    error_message = f"Set config timed out for node: {node_id}"
+                else:
+                    error_message = f"Set config failed for node: {node_id}"
+            logger.error(
+                "[CONFIG SET] failed node_id=%s error=%s",
+                node_id,
+                error_message,
+                exc_info=True,
+            )
+            return {
+                "success": False,
+                "error": {
+                    "code": "SET_CONFIG_FAILED",
+                    "message": error_message,
+                },
+            }
+
+    @app.post("/api/service/restart", dependencies=[Depends(verify_token)])
+    async def restart_service(
+        request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Request haijunbot-service to restart the service (requires admin:config permission)."""
+        from fastapi import HTTPException
+
+        user_info = getattr(request.state, "user_info", None)
+        # The admin:config permission for cross-node proxy requests has already been uniformly validated by the master
+        # (child nodes have no local auth data and cannot determine independently), so no duplicate check is performed here.
+        trusted_proxy = bool(getattr(request.state, "trusted_proxy", False))
+        if (
+            user_info
+            and user_info.get("user_id") != "system"
+            and not trusted_proxy
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:config"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:config",
+                },
+            )
+        try:
+            target_node_id = str(request_body.get("node_id") or "").strip()
+            restart_frontend = bool(request_body.get("restart_frontend", True))
+
+            # If a remote node is specified, forward the restart request
+            if target_node_id and target_node_id not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                node_info = node_runtime.node_registry.get(target_node_id)
+                if node_info is None:
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_NOT_FOUND",
+                            "message": f"Node not found: {target_node_id}",
+                        },
+                    }
+                if node_info.status != "online":
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_OFFLINE",
+                            "message": f"Node is offline: {target_node_id}",
+                        },
+                    }
+                response = await node_connection_manager.send_request_to_node(
+                    target_node_id,
+                    SERVICE_RESTART_REQUEST,
+                    {"restart_frontend": restart_frontend},
+                    timeout=30.0,
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "RESTART_FAILED"),
+                            "message": error.get("message", "Remote restart failed"),
+                        },
+                    }
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": target_node_id,
+                        "message": f"Requested node {target_node_id} to restart the service",
+                    },
+                }
+
+            # Local restart
+            lock_file_path = get_single_instance_lock_path()
+            if not lock_file_path.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "UNSUPPORTED",
+                        "message": "Restart not supported in the current environment: haijunbot-service lock file not detected",
+                    },
+                }
+
+            service_pid_text = lock_file_path.read_text(encoding="utf-8").strip()
+            if not service_pid_text:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "UNSUPPORTED",
+                        "message": "Restart not supported in the current environment: service PID not detected",
+                    },
+                }
+
+            service_pid = int(service_pid_text)
+            # Restarting will terminate the current gateway process; if the signal is sent immediately, the HTTP response cannot be written back to the client in time,
+            # and the frontend will receive a 502/connection interruption (misjudged as a restart failure). Therefore the restart is triggered after a delay,
+            # to ensure the response is returned first.
+            restart_delay_seconds = 1.0
+            # Choose the signal according to the restart_frontend parameter
+            # Linux: SIGUSR1/SIGUSR2
+            # Windows: send the restart command via the TCP command channel
+            if sys.platform != "win32":
+                # SIGUSR1: restart all services (including the frontend)
+                # SIGUSR2: restart only the gateway service
+                signal_to_send = signal.SIGUSR1 if restart_frontend else signal.SIGUSR2
+                signal_name = "SIGUSR1" if restart_frontend else "SIGUSR2"
+                asyncio.get_running_loop().call_later(
+                    restart_delay_seconds, os.kill, service_pid, signal_to_send
+                )
+            else:
+                # Windows: send the restart command via the TCP command channel
+                import socket as socket_module
+
+                command = "RESTART_ALL" if restart_frontend else "RESTART_GATEWAY_ONLY"
+
+                def _send_restart_command() -> None:
+                    try:
+                        sock = socket_module.socket(
+                            socket_module.AF_INET, socket_module.SOCK_STREAM
+                        )
+                        sock.connect(("127.0.0.1", _RESTART_COMMAND_TCP_PORT))
+                        sock.sendall(command.encode("utf-8") + b"\n")
+                        sock.close()
+                    except Exception as e:
+                        logger.warning(f"Failed to send restart command via TCP: {e}")
+
+                asyncio.get_running_loop().call_later(
+                    restart_delay_seconds, _send_restart_command
+                )
+                signal_name = command
+            message = (
+                "Requested haijunbot-service to restart all services"
+                if restart_frontend
+                else "Requested haijunbot-service to restart only the gateway service (frontend stays running)"
+            )
+            return {
+                "success": True,
+                "data": {
+                    "pid": service_pid,
+                    "signal": signal_name,
+                    "message": message,
+                },
+            }
+        except (ValueError, ProcessLookupError):
+            return {
+                "success": False,
+                "error": {
+                    "code": "UNSUPPORTED",
+                    "message": "Restart not supported in the current environment: not started via haijunbot-service",
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {
+                    "code": "PERMISSION_DENIED",
+                    "message": "No permission to send a restart signal to haijunbot-service",
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.post("/api/nodes/{node_id}/code-update", dependencies=[Depends(verify_token)])
+    async def node_code_update(node_id: str, request: Request) -> Dict[str, Any]:
+        """Update the specified node's code to the main branch (requires admin:config permission)."""
+        import subprocess
+
+        from fastapi import HTTPException
+
+        user_info = getattr(request.state, "user_info", None)
+        if (
+            user_info
+            and user_info.get("user_id") != "system"
+            and not permission_manager.check_permission(
+                user_info["user_id"], "admin:config"
+            )
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied: admin:config",
+                },
+            )
+        try:
+            # Check whether it is a local node
+            if node_id in (node_runtime.local_node_id, "master"):
+                # Perform the update directly on the local node
+                try:
+                    result = subprocess.run(
+                        ["git", "pull", "origin", "main"],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    if result.returncode == 0:
+                        return {
+                            "success": True,
+                            "data": {
+                                "node_id": node_id,
+                                "message": "Code update succeeded",
+                                "output": result.stdout,
+                            },
+                        }
+                    else:
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "UPDATE_FAILED",
+                                "message": result.stderr or "Code update failed",
+                            },
+                        }
+                except subprocess.TimeoutExpired:
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "TIMEOUT",
+                            "message": "Code update timed out",
+                        },
+                    }
+                except Exception as e:
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "UPDATE_FAILED",
+                            "message": str(e),
+                        },
+                    }
+
+            # Check remote node status
+            node_info = node_runtime.node_registry.get(node_id)
+            if node_info is None:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NODE_NOT_FOUND",
+                        "message": f"Node not found: {node_id}",
+                    },
+                }
+
+            if node_info.status != "online":
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NODE_OFFLINE",
+                        "message": f"Node is offline: {node_id}",
+                    },
+                }
+
+            # Send the update request to the remote node
+            response = await node_connection_manager.send_request_to_node(
+                node_id,
+                CODE_UPDATE_TO_MAIN_REQUEST,
+                {},
+                timeout=60.0,
+            )
+
+            payload = response.get("payload") or {}
+            if payload.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "message": "Code update succeeded",
+                        "output": payload.get("data", {}).get("message", ""),
+                    },
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "UPDATE_FAILED",
+                        "message": payload.get("error", {}).get(
+                            "message", "Code update failed"
+                        ),
+                    },
+                }
+        except Exception as e:
+            error_message = str(e).strip()
+            if not error_message:
+                if isinstance(e, TimeoutError):
+                    error_message = f"Code update timed out for node: {node_id}"
+                else:
+                    error_message = f"Code update failed for node: {node_id}"
+            logger.error(
+                "[CODE UPDATE] failed node_id=%s error=%s",
+                node_id,
+                error_message,
+                exc_info=True,
+            )
+            return {
+                "success": False,
+                "error": {
+                    "code": "UPDATE_FAILED",
+                    "message": error_message,
+                },
+            }
+
+    # HTTP API: create Agent (requires authentication)
+    @app.post("/api/agents", dependencies=[Depends(verify_token)])
+    async def create_agent(
+        request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Create Agent."""
+        try:
+            # Get owner_id from the authentication information
+            user_info = getattr(request.state, "user_info", None)
+            if user_info and user_info.get("user_id"):
+                owner_id = user_info["user_id"]
+            else:
+                owner_id = request_body.get("owner_id")
+            agent_type = request_body.get("agent_type")
+            working_dir = request_body.get("working_dir")
+            name = request_body.get("name")
+            llm_group = request_body.get("llm_group", "default")
+            tool_group = request_body.get("tool_group", "default")
+            config_file = request_body.get("config_file")
+            task = request_body.get("task")
+            additional_args = request_body.get("additional_args")
+            worktree = bool(request_body.get("worktree", False))
+            quick_mode = bool(request_body.get("quick_mode", False))
+            restore_session = request_body.get("restore_session")
+            # Ensure restore_session is a boolean or string
+            if isinstance(restore_session, str):
+                # If it is a string, keep it as is (specify the file path)
+                pass
+            elif restore_session:
+                # If it is truthy (such as True), convert to a boolean
+                restore_session = True
+            else:
+                # If it is falsy (such as False, None), convert to False
+                restore_session = False
+            no_interaction_mode = bool(request_body.get("no_interaction_mode", False))
+            proxy_node = request_body.get("proxy_node")
+            access_acl = request_body.get("access_acl")
+            target_node_id = str(request_body.get("node_id") or "").strip()
+
+            if not agent_type:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "MISSING_AGENT_TYPE",
+                        "message": "agent_type is required",
+                    },
+                }
+            if not working_dir:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "MISSING_WORKING_DIR",
+                        "message": "working_dir is required",
+                    },
+                }
+
+            # Validate non-interactive mode: task must be provided
+            if no_interaction_mode and not task:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "MISSING_TASK",
+                        "message": "task is required when no_interaction_mode is enabled",
+                    },
+                }
+
+            resolved_target_node = target_node_id or node_runtime.local_node_id
+
+            # Permission check: creating an Agent requires the agent:create permission (system/admin are allowed through internally by _check_permission)
+            if user_info and user_info.get("user_id") != "system":
+                if _check_permission(user_info, "agent:create"):
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "PERMISSION_DENIED",
+                            "message": "Permission denied: agent:create",
+                        },
+                    }
+
+            # Node access check: only performed on the master.
+            # Child nodes have no local auth data (permission data is not synchronized) and cannot determine independently;
+            # the permissions for cross-node requests have already been uniformly controlled by the master before forwarding,
+            # so child nodes trust the master's decision and no longer perform duplicate checks.
+            if (
+                node_config.is_master
+                and owner_id
+                and owner_id != "system"
+                and permission_manager
+            ):
+                if not permission_manager.check_node_access(
+                    owner_id, resolved_target_node
+                ):
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "PERMISSION_DENIED",
+                            "message": f"Permission denied: no access to node {resolved_target_node}",
+                        },
+                    }
+
+            if resolved_target_node not in (node_runtime.local_node_id, "master"):
+                node_info = node_runtime.node_registry.get(resolved_target_node)
+                if node_info is None:
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_NOT_FOUND",
+                            "message": f"Node not found: {resolved_target_node}",
+                        },
+                    }
+                if node_info.status != "online":
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_OFFLINE",
+                            "message": f"Node is offline: {resolved_target_node}",
+                        },
+                    }
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    AGENT_CREATE_REQUEST,
+                    {
+                        "agent_type": agent_type,
+                        "working_dir": working_dir,
+                        "name": name,
+                        "llm_group": llm_group,
+                        "tool_group": tool_group,
+                        "config_file": config_file,
+                        "task": task,
+                        "additional_args": additional_args,
+                        "worktree": worktree,
+                        "quick_mode": quick_mode,
+                        "restore_session": restore_session,
+                        "no_interaction_mode": no_interaction_mode,
+                        "proxy_node": proxy_node,
+                        "owner_id": owner_id,
+                        "access_acl": access_acl,
+                    },
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "AGENT_CREATE_FAILED"),
+                            "message": error.get(
+                                "message", "Remote agent creation failed"
+                            ),
+                        },
+                    }
+                agent_info = payload.get("agent_info") or {}
+                node_runtime.agent_route_registry.register(
+                    AgentRouteInfo(
+                        agent_id=agent_info["agent_id"],
+                        node_id=resolved_target_node,
+                        status=agent_info.get("status", "running"),
+                        working_dir=agent_info.get("working_dir"),
+                        port=agent_info.get("port"),
+                    )
+                )
+                return {"success": True, "data": agent_info}
+
+            # Get the current Token from the environment variables and pass it to the Agent
+            auth_token = os.environ.get("HAIJUNBOT_AUTH_TOKEN")
+
+            agent_info = agent_manager.create_agent(
+                auth_token=auth_token,
+                agent_type=agent_type,
+                working_dir=working_dir,
+                name=name,
+                llm_group=llm_group,
+                tool_group=tool_group,
+                config_file=config_file,
+                task=task,
+                additional_args=additional_args,
+                worktree=worktree,
+                node_id=node_runtime.local_node_id,
+                quick_mode=quick_mode,
+                restore_session=restore_session,
+                no_interaction_mode=no_interaction_mode,
+                proxy_node=proxy_node,
+                owner_id=owner_id,
+                access_acl=access_acl,
+            )
+            node_runtime.agent_route_registry.register(
+                AgentRouteInfo(
+                    agent_id=agent_info["agent_id"],
+                    node_id=agent_info.get("node_id", node_runtime.local_node_id),
+                    status=agent_info.get("status", "running"),
+                    working_dir=agent_info.get("working_dir"),
+                    port=agent_info.get("port"),
+                )
+            )
+
+            return {"success": True, "data": agent_info}
+        except ValueError as e:
+            return {
+                "success": False,
+                "error": {"code": "INVALID_ARGUMENT", "message": str(e)},
+            }
+        except RuntimeError as e:
+            return {
+                "success": False,
+                "error": {"code": "START_FAILED", "message": str(e)},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: get Agent list
+    @app.get("/api/agents", dependencies=[Depends(verify_token)])
+    async def get_agents(request: Request) -> Dict[str, Any]:
+        """Get the Agent list (filtered by user permissions)."""
+        try:
+            agents = agent_manager.get_agent_list()
+            user_info = getattr(request.state, "user_info", None)
+            user_id = user_info.get("user_id") if user_info else None
+            known_agent_ids: set[str] = set()
+            for agent in agents:
+                agent_id = str(agent.get("agent_id") or "")
+                if agent_id:
+                    known_agent_ids.add(agent_id)
+                route = node_runtime.agent_route_registry.get(agent_id)
+                if route is not None:
+                    agent.setdefault("node_id", route.node_id)
+                else:
+                    agent.setdefault("node_id", node_runtime.local_node_id)
+
+            for node_info in node_runtime.node_registry.list_all():
+                node_id = str((node_info or {}).get("node_id") or "")
+                node_status = str((node_info or {}).get("status") or "")
+                if node_id == node_runtime.local_node_id or node_status != "online":
+                    continue
+                try:
+                    response = await node_connection_manager.send_request_to_node(
+                        node_id,
+                        AGENT_LIST_REQUEST,
+                        {},
+                        timeout=10.0,
+                    )
+                    payload = response.get("payload") or {}
+                    if not payload.get("success"):
+                        logger.warning(
+                            "[AGENTS] remote list failed node_id=%s error=%s",
+                            node_id,
+                            (payload.get("error") or {}).get("message"),
+                        )
+                        continue
+                    for agent in payload.get("agents") or []:
+                        agent_id = str((agent or {}).get("agent_id") or "")
+                        if not agent_id or agent_id in known_agent_ids:
+                            continue
+                        agents.append(agent)
+                        known_agent_ids.add(agent_id)
+                except Exception as exc:
+                    logger.warning(
+                        "[AGENTS] remote list request failed node_id=%s error=%s",
+                        node_id,
+                        exc,
+                    )
+            # Filter by user permission: non-system users can only see ones they own or ones with read permission in the ACL
+            logger.debug(
+                "[AGENTS] Filtering: user_id=%s, user_info=%s, total_agents=%d",
+                user_id,
+                user_info,
+                len(agents),
+            )
+            if user_id and user_id != "system":
+                # is_admin users can see all agents
+                is_admin = (user_info or {}).get("is_admin", False)
+                logger.debug(
+                    "[AGENTS] is_admin=%s, has_agent_read=%s",
+                    is_admin,
+                    permission_manager.check_permission(user_id, "agent:read"),
+                )
+                if not is_admin:
+                    # Check whether the user has the agent:read group permission (can see all agents)
+                    has_agent_read = permission_manager.check_permission(
+                        user_id, "agent:read"
+                    )
+                    if not has_agent_read:
+                        filtered = []
+                        for agent in agents:
+                            agent_id = agent.get("agent_id", "")
+                            owner_id = agent.get("owner_id")
+                            # visible to the owner
+                            if owner_id == user_id:
+                                filtered.append(agent)
+                                continue
+                            # visible if read permission is in the ACL
+                            access_acl = agent.get("access_acl") or {}
+                            if user_id in (access_acl.get("read") or []):
+                                filtered.append(agent)
+                                continue
+                        agents = filtered
+                logger.debug(
+                    "[AGENTS] After filtering: %d agents for user_id=%s",
+                    len(agents),
+                    user_id,
+                )
+            return {"success": True, "data": agents}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: get model group list
+    def _reload_model_groups_config() -> Dict[str, Any]:
+        """Reload the model group related configuration, without affecting the global configuration."""
+        try:
+            # Find and load the configuration file
+
+            # Get the configuration file in the user home directory
+            user_config_path = os.path.expanduser("~/.haijunbot/config.yaml")
+            config_files = []
+
+            # Add the user configuration file (if it exists)
+            if os.path.exists(user_config_path):
+                config_files.append(user_config_path)
+
+            # Find the project configuration file
+            project_config_files = _find_all_config_files(os.getcwd())
+            config_files.extend(project_config_files)
+
+            if not config_files:
+                return {}
+
+            # Merge the configuration (project configuration overrides user configuration)
+            _, merged_config = _merge_configs(config_files)
+            return merged_config
+
+        except Exception:
+            # If reloading fails, return an empty configuration
+            return {}
+
+    @app.get("/api/model-groups", dependencies=[Depends(verify_token)])
+    async def get_model_groups() -> Dict[str, Any]:
+        """Get the model group list."""
+        try:
+            # Reload the configuration on every request to ensure the latest data is obtained
+            config = _reload_model_groups_config()
+            llm_groups = config.get("llm_groups", {})
+            llms = config.get("llms", {})
+            default_llm_group = config.get("llm_group", "")
+
+            if not isinstance(llm_groups, dict) or not llm_groups:
+                return {
+                    "success": True,
+                    "data": [],
+                    "default_llm_group": default_llm_group,
+                }
+
+            # Convert format: llm_groups and llms -> list of dict
+            data = []
+            for group_name, group_config in llm_groups.items():
+                if not isinstance(group_config, dict):
+                    continue
+
+                # Get the model configuration of each platform
+                smart_llm_ref = group_config.get("smart_llm", "")
+                normal_llm_ref = group_config.get("normal_llm", "")
+                cheap_llm_ref = group_config.get("cheap_llm", "")
+                eval_llm_ref = group_config.get("eval_llm", "")
+
+                # Get the actual model names from llms
+                smart_model = "-"
+                normal_model = "-"
+                cheap_model = "-"
+                eval_model = "-"
+
+                if isinstance(llms, dict):
+                    if smart_llm_ref and smart_llm_ref in llms:
+                        smart_config = llms[smart_llm_ref]
+                        if isinstance(smart_config, dict):
+                            smart_model = str(smart_config.get("model", smart_llm_ref))
+
+                    if normal_llm_ref and normal_llm_ref in llms:
+                        normal_config = llms[normal_llm_ref]
+                        if isinstance(normal_config, dict):
+                            normal_model = str(
+                                normal_config.get("model", normal_llm_ref)
+                            )
+
+                    if cheap_llm_ref and cheap_llm_ref in llms:
+                        cheap_config = llms[cheap_llm_ref]
+                        if isinstance(cheap_config, dict):
+                            cheap_model = str(cheap_config.get("model", cheap_llm_ref))
+
+                    if eval_llm_ref and eval_llm_ref in llms:
+                        eval_config = llms[eval_llm_ref]
+                        if isinstance(eval_config, dict):
+                            eval_model = str(eval_config.get("model", eval_llm_ref))
+
+                data.append(
+                    {
+                        "name": group_name,
+                        "smart_model": smart_model,
+                        "normal_model": normal_model,
+                        "cheap_model": cheap_model,
+                        "eval_model": eval_model,
+                    }
+                )
+
+            return {
+                "success": True,
+                "data": data,
+                "default_llm_group": default_llm_group,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: stop Agent
+    @app.delete("/api/agents/{agent_id}/stop", dependencies=[Depends(verify_token)])
+    async def stop_agent(agent_id: str, request: Request) -> Dict[str, Any]:
+        """Stop Agent."""
+        # Permission check: only the owner or admin can stop the Agent
+        user_info = getattr(request.state, "user_info", None)
+        if user_info and user_info.get("user_id") != "system":
+            is_admin = user_info.get("is_admin", False)
+            if not is_admin:
+                agent_info = agent_manager.get_agent(agent_id)
+                if (
+                    agent_info
+                    and agent_info.owner_id
+                    and agent_info.owner_id != user_info.get("user_id")
+                ):
+                    if not permission_manager.check_permission(
+                        user_info["user_id"], "agent:delete"
+                    ):
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "FORBIDDEN",
+                                "message": "You can only stop your own agents",
+                            },
+                        }
+        try:
+            route = node_runtime.agent_route_registry.get(agent_id)
+            if route is not None and route.node_id not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                response = await node_connection_manager.send_request_to_node(
+                    route.node_id,
+                    AGENT_STOP_REQUEST,
+                    {"agent_id": agent_id},
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "AGENT_STOP_FAILED"),
+                            "message": error.get("message", "Remote agent stop failed"),
+                        },
+                    }
+                return {"success": True, "data": payload.get("result")}
+            # Try local first
+            try:
+                result = agent_manager.stop_agent(agent_id)
+                return {"success": True, "data": result}
+            except (KeyError, Exception):
+                pass
+            # Not found locally and not in route registry — try all online child nodes
+            for node_info in node_runtime.node_registry.list_all():
+                nid = str((node_info or {}).get("node_id") or "")
+                nst = str((node_info or {}).get("status") or "")
+                if nid == node_runtime.local_node_id or nst != "online":
+                    continue
+                try:
+                    response = await node_connection_manager.send_request_to_node(
+                        nid,
+                        AGENT_STOP_REQUEST,
+                        {"agent_id": agent_id},
+                        timeout=10.0,
+                    )
+                    payload = response.get("payload") or {}
+                    if payload.get("success"):
+                        return {"success": True, "data": payload.get("result")}
+                except Exception as e:
+                    save_exception(
+                        e,
+                        module="haijunbot_web_gateway.app",
+                        function="_reload_model_groups_config",
+                    )
+                    pass
+            return {
+                "success": False,
+                "error": {
+                    "code": "AGENT_NOT_FOUND",
+                    "message": f"Agent not found: {agent_id}",
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: update Agent (rename)
+    @app.patch("/api/agents/{agent_id}", dependencies=[Depends(verify_token)])
+    async def patch_agent(
+        agent_id: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Update Agent information (supports renaming, model group, proxy node)."""
+        # Permission check: only the owner or admin can update the Agent
+        user_info = getattr(request.state, "user_info", None)
+        if user_info and user_info.get("user_id") != "system":
+            is_admin = user_info.get("is_admin", False)
+            if not is_admin:
+                agent_info = agent_manager.get_agent(agent_id)
+                if (
+                    agent_info
+                    and agent_info.owner_id
+                    and agent_info.owner_id != user_info.get("user_id")
+                ):
+                    if not permission_manager.check_permission(
+                        user_info["user_id"], "agent:delete"
+                    ):
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "FORBIDDEN",
+                                "message": "You can only update your own agents",
+                            },
+                        }
+        try:
+            name = request_body.get("name")
+            llm_group = request_body.get("llm_group")
+            proxy_node = request_body.get("proxy_node")
+            target_node_id = str(request_body.get("node_id") or "").strip()
+
+            if name is not None and not isinstance(name, str):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_ARGUMENT",
+                        "message": "name must be a string or null",
+                    },
+                }
+            if llm_group is not None and not isinstance(llm_group, str):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_ARGUMENT",
+                        "message": "llm_group must be a string",
+                    },
+                }
+            if proxy_node is not None and not isinstance(proxy_node, str):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_ARGUMENT",
+                        "message": "proxy_node must be a string",
+                    },
+                }
+
+            resolved_target_node = target_node_id
+            if not resolved_target_node:
+                route = node_runtime.agent_route_registry.get(agent_id)
+                if route is not None:
+                    resolved_target_node = str(route.node_id or "").strip()
+
+            if resolved_target_node and resolved_target_node not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                update_body: Dict[str, Any] = {}
+                if name is not None:
+                    update_body["name"] = name
+                if llm_group is not None:
+                    update_body["llm_group"] = llm_group
+                if proxy_node is not None:
+                    update_body["proxy_node"] = proxy_node
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    NODE_HTTP_PROXY_REQUEST,
+                    {
+                        "method": "PATCH",
+                        "path": f"agents/{agent_id}",
+                        "query": "",
+                        "headers": {"content-type": "application/json"},
+                        "body": json.dumps(update_body),
+                    },
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "AGENT_UPDATE_FAILED"),
+                            "message": error.get(
+                                "message", "Remote agent update failed"
+                            ),
+                        },
+                    }
+                body = payload.get("body") or "{}"
+                return json.loads(body)  # type: ignore[no-any-return]
+
+            if llm_group is not None or proxy_node is not None:
+                result = agent_manager.update_agent_runtime_config(
+                    agent_id, llm_group=llm_group, proxy_node=proxy_node
+                )
+            else:
+                result = agent_manager.rename_agent(agent_id, name)
+            return {"success": True, "data": result}
+        except KeyError as e:
+            return {
+                "success": False,
+                "error": {"code": "AGENT_NOT_FOUND", "message": str(e)},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+# HTTP API: Update Agent Access Control
+    @app.put("/api/agents/{agent_id}/access", dependencies=[Depends(verify_token)])
+    async def update_agent_access(
+        agent_id: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Update the Agent's access control list (only the owner can operate)."""
+        user_info = getattr(request.state, "user_info", None)
+        if user_info and user_info.get("user_id") != "system":
+            is_admin = user_info.get("is_admin", False)
+            if not is_admin:
+                agent_info = agent_manager.get_agent(agent_id)
+                if (
+                    agent_info
+                    and agent_info.owner_id
+                    and agent_info.owner_id != user_info.get("user_id")
+                ):
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "FORBIDDEN",
+                            "message": "Only the agent owner can update access control",
+                        },
+                    }
+
+        access_acl = request_body.get("access_acl")
+        if access_acl is not None and not isinstance(access_acl, dict):
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "access_acl must be a dict",
+                },
+            }
+
+        try:
+            result = agent_manager.update_agent_access(agent_id, access_acl or {})
+            return {"success": True, "data": result}
+        except KeyError as e:
+            return {
+                "success": False,
+                "error": {"code": "AGENT_NOT_FOUND", "message": str(e)},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.delete("/api/agents/{agent_id}", dependencies=[Depends(verify_token)])
+    async def delete_agent(
+        agent_id: str, request: Request, node_id: str = ""
+    ) -> Dict[str, Any]:
+        """Delete Agent."""
+# Permission check: Only the owner or admin can delete the Agent
+        user_info = getattr(request.state, "user_info", None)
+        if user_info and user_info.get("user_id") != "system":
+            is_admin = user_info.get("is_admin", False)
+            if not is_admin:
+                agent_info = agent_manager.get_agent(agent_id)
+                if (
+                    agent_info
+                    and agent_info.owner_id
+                    and agent_info.owner_id != user_info.get("user_id")
+                ):
+                    if not permission_manager.check_permission(
+                        user_info["user_id"], "agent:delete"
+                    ):
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "FORBIDDEN",
+                                "message": "You can only delete your own agents",
+                            },
+                        }
+        try:
+            resolved_target_node = str(node_id or "").strip()
+            route = node_runtime.agent_route_registry.get(agent_id)
+            if not resolved_target_node and route is not None:
+                resolved_target_node = str(route.node_id or "").strip()
+            if resolved_target_node and resolved_target_node not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    AGENT_DELETE_REQUEST,
+                    {"agent_id": agent_id},
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "AGENT_DELETE_FAILED"),
+                            "message": error.get(
+                                "message", "Remote agent delete failed"
+                            ),
+                        },
+                    }
+                node_runtime.agent_route_registry.remove(agent_id)
+                return {"success": True, "data": payload.get("result")}
+            # Try local first
+            try:
+                result = agent_manager.delete_agent(agent_id)
+                node_runtime.agent_route_registry.remove(agent_id)
+                return {"success": True, "data": result}
+            except (KeyError, Exception):
+                pass
+            # Not found locally and not in route registry — try all online child nodes
+            for node_info in node_runtime.node_registry.list_all():
+                nid = str((node_info or {}).get("node_id") or "")
+                nst = str((node_info or {}).get("status") or "")
+                if nid == node_runtime.local_node_id or nst != "online":
+                    continue
+                try:
+                    response = await node_connection_manager.send_request_to_node(
+                        nid,
+                        AGENT_DELETE_REQUEST,
+                        {"agent_id": agent_id},
+                        timeout=10.0,
+                    )
+                    payload = response.get("payload") or {}
+                    if payload.get("success"):
+                        node_runtime.agent_route_registry.remove(agent_id)
+                        return {"success": True, "data": payload.get("result")}
+                except Exception as e:
+                    save_exception(
+                        e,
+                        module="haijunbot_web_gateway.app",
+                        function="_reload_model_groups_config",
+                    )
+                    pass
+            return {
+                "success": False,
+                "error": {
+                    "code": "AGENT_NOT_FOUND",
+                    "message": f"Agent not found: {agent_id}",
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+# HTTP API: Agent Lossless Rebirth (Save Session → Delete → Rebuild)
+    @app.post("/api/agents/{agent_id}/regenerate", dependencies=[Depends(verify_token)])
+    async def regenerate_agent(
+        agent_id: str, request: Request, node_id: str = ""
+    ) -> Dict[str, Any]:
+        """Lossless Rebirth Agent: Complete saving the session on the gateway side → Delete → Rebuild the entire process.
+
+After rebirth, agent_id does not change, only the port may change; all processes are completed by the gateway.
+Enables the Agent to regenerate itself without interruption to the process.
+        """
+# Permission Check: Only the owner or admin can respawn the Agent
+        user_info = getattr(request.state, "user_info", None)
+        if user_info and user_info.get("user_id") != "system":
+            is_admin = user_info.get("is_admin", False)
+            if not is_admin:
+                agent_info = agent_manager.get_agent(agent_id)
+                if (
+                    agent_info
+                    and agent_info.owner_id
+                    and agent_info.owner_id != user_info.get("user_id")
+                ):
+                    if not permission_manager.check_permission(
+                        user_info["user_id"], "agent:delete"
+                    ):
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "FORBIDDEN",
+                                "message": "You can only regenerate your own agents",
+                            },
+                        }
+        try:
+            resolved_target_node = str(node_id or "").strip()
+            route = node_runtime.agent_route_registry.get(agent_id)
+            if not resolved_target_node and route is not None:
+                resolved_target_node = str(route.node_id or "").strip()
+            if resolved_target_node and resolved_target_node not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    AGENT_REGENERATE_REQUEST,
+                    {"agent_id": agent_id},
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "AGENT_REGENERATE_FAILED"),
+                            "message": error.get(
+                                "message", "Remote agent regenerate failed"
+                            ),
+                        },
+                    }
+# After remote resurrection, the port may change, re-register the route
+                result = payload.get("result") or {}
+                new_agent = result.get("new_agent") or {}
+                if new_agent.get("agent_id"):
+                    node_runtime.agent_route_registry.register(
+                        AgentRouteInfo(
+                            agent_id=new_agent["agent_id"],
+                            node_id=new_agent.get("node_id", resolved_target_node),
+                            status=new_agent.get("status", "running"),
+                            working_dir=new_agent.get("working_dir"),
+                            port=new_agent.get("port"),
+                        )
+                    )
+                return {"success": True, "data": result}
+# Local Rebirth
+            result = agent_manager.regenerate_agent(agent_id)
+            new_agent = result.get("new_agent") or {}
+            if new_agent.get("agent_id"):
+                node_runtime.agent_route_registry.register(
+                    AgentRouteInfo(
+                        agent_id=new_agent["agent_id"],
+                        node_id=new_agent.get("node_id", node_runtime.local_node_id),
+                        status=new_agent.get("status", "running"),
+                        working_dir=new_agent.get("working_dir"),
+                        port=new_agent.get("port"),
+                    )
+                )
+            return {"success": True, "data": result}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+# HTTP API: Get the list of recoverable sessions
+    @app.get("/api/agents/{agent_id}/sessions", dependencies=[Depends(verify_token)])
+    async def list_agent_sessions(
+        agent_id: str, request: Request, node_id: str = ""
+    ) -> Dict[str, Any]:
+        """Get the list of recoverable sessions."""
+# Permission check: non-owners need read ACL permission
+        user_info = getattr(request.state, "user_info", None)
+        if user_info and user_info.get("user_id") != "system":
+            is_admin = user_info.get("is_admin", False)
+            if not is_admin:
+                agent_info = agent_manager.get_agent(agent_id)
+                if (
+                    agent_info
+                    and agent_info.owner_id
+                    and agent_info.owner_id != user_info.get("user_id")
+                ):
+                    access_acl = agent_info.access_acl or {}
+                    has_read = user_info.get("user_id") in (
+                        access_acl.get("read") or []
+                    )
+                    if not has_read:
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "FORBIDDEN",
+                                "message": "No read access to this agent",
+                            },
+                        }
+        try:
+            resolved_target_node = str(node_id or "").strip()
+            if not resolved_target_node:
+                route = node_runtime.agent_route_registry.get(agent_id)
+                if route is not None:
+                    resolved_target_node = str(route.node_id or "").strip()
+
+            if resolved_target_node and resolved_target_node not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    NODE_HTTP_PROXY_REQUEST,
+                    {
+                        "method": "GET",
+                        "path": f"agents/{agent_id}/sessions",
+                        "query": "",
+                        "headers": {},
+                        "body": "",
+                    },
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "SESSION_LIST_FAILED"),
+                            "message": error.get(
+                                "message", "Remote session list failed"
+                            ),
+                        },
+                    }
+                body = payload.get("body") or "{}"
+                return json.loads(body)  # type: ignore[no-any-return]
+
+            agent_info = agent_manager.get_agent(agent_id)
+            if agent_info is None:
+                return {
+                    "success": False,
+                    "error": {"code": "AGENT_NOT_FOUND", "message": "Agent not found"},
+                }
+
+# Proxying the /sessions interface to the Agent process
+            import httpx
+
+            async with httpx.AsyncClient(trust_env=False) as client:
+                http_response = await client.get(
+                    f"http://127.0.0.1:{agent_info.port}/sessions"
+                )
+                return http_response.json()  # type: ignore[no-any-return]
+        except KeyError as e:
+            return {
+                "success": False,
+                "error": {"code": "AGENT_NOT_FOUND", "message": str(e)},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+# HTTP API: Restore the specified session
+    @app.post("/api/agents/{agent_id}/sessions", dependencies=[Depends(verify_token)])
+    async def restore_agent_session(
+        agent_id: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Restore the specified session."""
+# Permission check: Non-owners need interact ACL permission
+        user_info = getattr(request.state, "user_info", None)
+        if user_info and user_info.get("user_id") != "system":
+            is_admin = user_info.get("is_admin", False)
+            if not is_admin:
+                agent_info = agent_manager.get_agent(agent_id)
+                if (
+                    agent_info
+                    and agent_info.owner_id
+                    and agent_info.owner_id != user_info.get("user_id")
+                ):
+                    access_acl = agent_info.access_acl or {}
+                    has_interact = user_info.get("user_id") in (
+                        access_acl.get("interact") or []
+                    )
+                    if not has_interact:
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "FORBIDDEN",
+                                "message": "No interact access to this agent",
+                            },
+                        }
+        try:
+            resolved_target_node = str(request_body.get("node_id") or "").strip()
+            if not resolved_target_node:
+                route = node_runtime.agent_route_registry.get(agent_id)
+                if route is not None:
+                    resolved_target_node = str(route.node_id or "").strip()
+
+            if resolved_target_node and resolved_target_node not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                forward_body = dict(request_body)
+                forward_body.pop("node_id", None)
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    NODE_HTTP_PROXY_REQUEST,
+                    {
+                        "method": "POST",
+                        "path": f"agents/{agent_id}/sessions",
+                        "query": "",
+                        "headers": {"content-type": "application/json"},
+                        "body": json.dumps(forward_body),
+                    },
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "SESSION_RESTORE_FAILED"),
+                            "message": error.get(
+                                "message", "Remote session restore failed"
+                            ),
+                        },
+                    }
+                body = payload.get("body") or "{}"
+                return json.loads(body)  # type: ignore[no-any-return]
+
+            agent_info = agent_manager.get_agent(agent_id)
+            if agent_info is None:
+                return {
+                    "success": False,
+                    "error": {"code": "AGENT_NOT_FOUND", "message": "Agent not found"},
+                }
+
+# Proxy the /sessions interface to the Agent process
+            import httpx
+
+            async with httpx.AsyncClient(trust_env=False) as client:
+                http_response = await client.post(
+                    f"http://127.0.0.1:{agent_info.port}/sessions", json=request
+                )
+                return http_response.json()  # type: ignore[no-any-return]
+        except KeyError as e:
+            return {
+                "success": False,
+                "error": {"code": "AGENT_NOT_FOUND", "message": str(e)},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+# HTTP API: Get Completion List
+    @app.get("/api/completions/{agent_id}", dependencies=[Depends(verify_token)])
+    async def get_completions(agent_id: str, node_id: str = "") -> Dict[str, Any]:
+        """Get all available completions (excluding files)."""
+        try:
+            resolved_target_node = str(node_id or "").strip()
+            if not resolved_target_node:
+                route = node_runtime.agent_route_registry.get(agent_id)
+                if route is not None:
+                    resolved_target_node = str(route.node_id or "").strip()
+
+            if resolved_target_node and resolved_target_node not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    NODE_HTTP_PROXY_REQUEST,
+                    {
+                        "method": "GET",
+                        "path": f"completions/{agent_id}",
+                        "query": "",
+                        "headers": {},
+                        "body": "",
+                    },
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "COMPLETIONS_FAILED"),
+                            "message": error.get(
+                                "message", "Remote completions failed"
+                            ),
+                        },
+                    }
+                body = payload.get("body") or "{}"
+                return json.loads(body)  # type: ignore[no-any-return]
+
+            from haijunbot.haijunbot_utils.config import get_replace_map
+            from haijunbot.haijunbot_utils.tag import ot
+            from haijunbot.haijunbot_utils.input import BUILTIN_COMMANDS
+            import os
+
+# Get the working directory of the Agent
+            agent = agent_manager.get_agent(agent_id)
+            if not agent:
+                return {
+                    "success": False,
+                    "error": {"code": "AGENT_NOT_FOUND", "message": "Agent not found"},
+                }
+            working_dir = agent.working_dir
+            os.chdir(working_dir)
+
+            all_completions = []
+
+# Add replace_map
+            try:
+                replace_map = get_replace_map()
+                for tag, info in replace_map.items():
+                    desc = (
+                        info.get("description", tag) + "(Append)"
+                        if info.get("append")
+                        else "(Replace)"
+                    )
+                    all_completions.append(
+                        {
+                            "type": "replace",
+                            "value": ot(tag),
+                            "display": tag,
+                            "description": desc,
+                        }
+                    )
+            except Exception as e:
+                print(f"[COMPLETIONS] Failed to load replace_map: {e}")
+
+# Add built-in command
+            for cmd, desc in BUILTIN_COMMANDS:
+                all_completions.append(
+                    {
+                        "type": "command",
+                        "value": ot(cmd),
+                        "display": cmd,
+                        "description": desc,
+                    }
+                )
+
+# Add rule
+            try:
+                from haijunbot.haijunbot_agent.rules_manager import RulesManager
+
+                rules_manager = RulesManager(working_dir)
+                available_rules = rules_manager.get_all_available_rule_names()
+
+# Built-in Rules
+                if available_rules.get("builtin"):
+                    for rule_name in available_rules["builtin"]:
+                        all_completions.append(
+                            {
+                                "type": "rule",
+                                "value": f"<rule:{rule_name}>",
+                                "display": rule_name,
+"description": "📚 Built-in rules"
+                            }
+                        )
+
+# File Rules
+                if available_rules.get("files"):
+                    for rule_name in available_rules["files"]:
+                        all_completions.append(
+                            {
+                                "type": "rule",
+                                "value": f"<rule:{rule_name}>",
+                                "display": rule_name,
+"description": "📄 File Rules"
+                            }
+                        )
+
+# YAML Rules
+                if available_rules.get("yaml"):
+                    for rule_name in available_rules["yaml"]:
+                        all_completions.append(
+                            {
+                                "type": "rule",
+                                "value": f"<rule:{rule_name}>",
+                                "display": rule_name,
+                                "description": "📝 YAML Rules",
+                            }
+                        )
+            except Exception as e:
+                print(f"[COMPLETIONS] Failed to load rules: {e}")
+
+            return {"success": True, "data": all_completions}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.get("/api/completions/{agent_id}/search", dependencies=[Depends(verify_token)])
+    async def search_completions(
+        agent_id: str, query: str = "", node_id: str = ""
+    ) -> Dict[str, Any]:
+        """Search for file completion items.
+
+        Args:
+            agent_id: Agent ID
+query: search keywords
+
+        Returns:
+            {
+                "success": True,
+                "data": [
+                    {
+                        "type": "file",
+                        "value": "path/to/file",
+                        "display": "path/to/file",
+                        "description": "File"
+                    },
+                    ...
+                ]
+            }
+        """
+        try:
+            resolved_target_node = str(node_id or "").strip()
+            if not resolved_target_node:
+                route = node_runtime.agent_route_registry.get(agent_id)
+                if route is not None:
+                    resolved_target_node = str(route.node_id or "").strip()
+
+            if resolved_target_node and resolved_target_node not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                forward_query = urlencode({"query": query})
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    NODE_HTTP_PROXY_REQUEST,
+                    {
+                        "method": "GET",
+                        "path": f"completions/{agent_id}/search",
+                        "query": forward_query,
+                        "headers": {},
+                        "body": "",
+                    },
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "COMPLETION_SEARCH_FAILED"),
+                            "message": error.get(
+                                "message", "Remote completion search failed"
+                            ),
+                        },
+                    }
+                body = payload.get("body") or "{}"
+                return cast(Dict[str, Any], json.loads(body))
+
+            import subprocess
+            from fuzzywuzzy import process
+            from haijunbot.haijunbot_utils.utils import decode_output
+
+# Get the working directory of the Agent
+            agent = agent_manager.get_agent(agent_id)
+            if not agent:
+                return {
+                    "success": False,
+                    "error": {"code": "AGENT_NOT_FOUND", "message": "Agent not found"},
+                }
+            working_dir = agent.working_dir
+# Get the git file list (explicitly specify cwd to avoid reading its agent directory due to os.chdir process-level race conditions)
+            result = subprocess.run(
+                ["git", "ls-files"],
+                cwd=working_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+            )
+            files = []
+            if result.returncode == 0:
+                files = [
+                    line
+                    for line in decode_output(result.stdout).splitlines()
+                    if line.strip()
+                ]
+
+# [New] Merge and append completed directory (including builtin) files
+            from haijunbot.haijunbot_utils.input import (
+                get_additional_completion_dirs,
+                _scan_files_under_dir,
+            )
+
+            for extra_dir in get_additional_completion_dirs():
+                extra_files = _scan_files_under_dir(
+                    extra_dir, exclude_git=True, max_files=5000, use_absolute_path=True
+                )
+# Deduplicate and Merge
+                existing = set(files)
+                for f in extra_files:
+                    if f not in existing:
+                        files.append(f)
+                        existing.add(f)
+
+# Using fzf for fuzzy search
+            search_results = []
+            if query and files:
+                import shutil
+
+                if shutil.which("fzf"):
+# fzf filter mode - sort by relevance
+                    try:
+                        proc = subprocess.run(
+                            ["fzf", "-f", query],
+                            input="\n".join(files).encode("utf-8"),
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                        )
+                        if proc.returncode == 0:
+                            matched = (
+                                decode_output(proc.stdout).strip().split("\n")[:300]
+                            )
+                            for path in matched:
+                                if path:
+                                    search_results.append(
+                                        {
+                                            "type": "file",
+                                            "value": path,
+                                            "display": path,
+                                            "description": "File",
+                                        }
+                                    )
+                    except Exception as e:
+                        save_exception(
+                            e,
+                            module="haijunbot_web_gateway.app",
+                            function="_reload_model_groups_config",
+                        )
+                        pass
+
+# Revert to fuzzywuzzy
+                if not search_results:
+                    scored_items = process.extract(
+                        query,
+                        files,
+                        limit=300,
+                    )
+                    scored_items = [
+                        (item[0], item[1]) for item in scored_items if item[1] > 10
+                    ]
+                    for path, score in scored_items:
+                        search_results.append(
+                            {
+                                "type": "file",
+                                "value": path,
+                                "display": f"{path} ({score}%)"
+                                if score < 100
+                                else path,
+                                "description": "File",
+                            }
+                        )
+
+            return {"success": True, "data": search_results}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.post("/api/global-search/{agent_id}", dependencies=[Depends(verify_token)])
+    async def global_search(agent_id: str, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Perform a global file content search within the Agent working directory."""
+        try:
+            resolved_target_node = str(request.get("node_id") or "").strip()
+            if not resolved_target_node:
+                route = node_runtime.agent_route_registry.get(agent_id)
+                if route is not None:
+                    resolved_target_node = str(route.node_id or "").strip()
+
+            if resolved_target_node and resolved_target_node not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                forward_body = dict(request)
+                forward_body.pop("node_id", None)
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    NODE_HTTP_PROXY_REQUEST,
+                    {
+                        "method": "POST",
+                        "path": f"global-search/{agent_id}",
+                        "query": "",
+                        "headers": {"content-type": "application/json"},
+                        "body": json.dumps(forward_body),
+                    },
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "GLOBAL_SEARCH_FAILED"),
+                            "message": error.get(
+                                "message", "Remote global search failed"
+                            ),
+                        },
+                    }
+                body = payload.get("body") or "{}"
+                return cast(Dict[str, Any], json.loads(body))
+
+            agent = agent_manager.get_agent(agent_id)
+            if not agent:
+                return {
+                    "success": False,
+                    "error": {"code": "AGENT_NOT_FOUND", "message": "Agent not found"},
+                }
+
+            raw_query = request.get("query", "")
+            query = str(raw_query).strip() if raw_query is not None else ""
+            if not query:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_QUERY", "message": "query is required"},
+                }
+            if len(query) > GLOBAL_SEARCH_MAX_QUERY_LENGTH:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_QUERY",
+                        "message": f"query length must be <= {GLOBAL_SEARCH_MAX_QUERY_LENGTH}",
+                    },
+                }
+
+            case_sensitive = bool(request.get("case_sensitive", False))
+            whole_word = bool(request.get("whole_word", False))
+            raw_max_results = request.get(
+                "max_results", GLOBAL_SEARCH_DEFAULT_MAX_RESULTS
+            )
+            try:
+                max_results = int(raw_max_results)
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_QUERY",
+                        "message": "max_results must be an integer",
+                    },
+                }
+            if max_results < 1 or max_results > GLOBAL_SEARCH_MAX_RESULTS_LIMIT:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_QUERY",
+                        "message": f"max_results must be between 1 and {GLOBAL_SEARCH_MAX_RESULTS_LIMIT}",
+                    },
+                }
+
+            raw_file_glob = request.get("file_glob", "")
+            file_glob = str(raw_file_glob).strip() if raw_file_glob is not None else ""
+            if len(file_glob) > GLOBAL_SEARCH_MAX_GLOB_LENGTH:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_QUERY",
+                        "message": f"file_glob length must be <= {GLOBAL_SEARCH_MAX_GLOB_LENGTH}",
+                    },
+                }
+            file_glob_patterns = [
+                item.strip()
+                for item in file_glob.split(",")
+                if isinstance(item, str) and item.strip()
+            ]
+
+            working_dir = pathlib.Path(agent.working_dir).resolve()
+            if not working_dir.exists() or not working_dir.is_dir():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "WORKING_DIR_NOT_FOUND",
+                        "message": f"Working directory not found: {working_dir}",
+                    },
+                }
+
+            rg_command = [
+                "rg",
+                "--line-number",
+                "--column",
+                "--no-heading",
+                "--color",
+                "never",
+                "--hidden",
+                "--glob",
+                "!.git",
+                "--glob",
+                "!node_modules",
+                "--glob",
+                "!__pycache__",
+                "--glob",
+                "!.venv",
+                "--glob",
+                "!venv",
+                "--glob",
+                "!dist",
+                "--glob",
+                "!build",
+                "--max-count",
+                str(max_results),
+            ]
+            if not case_sensitive:
+                rg_command.append("--ignore-case")
+            if whole_word:
+                rg_command.append("--word-regexp")
+            for glob_pattern in file_glob_patterns:
+                rg_command.extend(["--glob", glob_pattern])
+            rg_command.extend([query, str(working_dir)])
+
+            try:
+                result = subprocess.run(
+                    rg_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=GLOBAL_SEARCH_COMMAND_TIMEOUT_SECONDS,
+                    cwd=str(working_dir),
+                )
+            except FileNotFoundError:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "SEARCH_FAILED",
+                        "message": "ripgrep (rg) is not available",
+                    },
+                }
+            except subprocess.TimeoutExpired:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "SEARCH_TIMEOUT",
+                        "message": f"Search timed out after {GLOBAL_SEARCH_COMMAND_TIMEOUT_SECONDS} seconds",
+                    },
+                }
+
+            if result.returncode not in (0, 1):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "SEARCH_FAILED",
+                        "message": result.stderr.strip() or "Search command failed",
+                    },
+                }
+
+            results_by_file: Dict[str, list[Dict[str, Any]]] = {}
+            total_matches = 0
+            for line in result.stdout.splitlines():
+                if total_matches >= max_results:
+                    break
+                parts = line.split(":", 3)
+                if len(parts) != 4:
+                    continue
+                file_path_str, line_number_str, column_str, line_content = parts
+                try:
+                    absolute_path = pathlib.Path(file_path_str).resolve()
+                    relative_path = absolute_path.relative_to(working_dir)
+                    line_number = int(line_number_str)
+                    column = int(column_str)
+                except (ValueError, OSError):
+                    continue
+
+                if len(line_content) > GLOBAL_SEARCH_MAX_LINE_LENGTH:
+                    line_content = line_content[:GLOBAL_SEARCH_MAX_LINE_LENGTH] + "..."
+
+                expected_match_start = max(column - 1, 0)
+                search_line_content = (
+                    line_content if case_sensitive else line_content.lower()
+                )
+                search_query = query if case_sensitive else query.lower()
+                match_start = expected_match_start
+                nearest_match_start = search_line_content.find(search_query)
+                if nearest_match_start != -1:
+                    search_from = 0
+                    while True:
+                        candidate_match_start = search_line_content.find(
+                            search_query, search_from
+                        )
+                        if candidate_match_start == -1:
+                            break
+                        if abs(candidate_match_start - expected_match_start) < abs(
+                            nearest_match_start - expected_match_start
+                        ):
+                            nearest_match_start = candidate_match_start
+                        search_from = candidate_match_start + 1
+                    match_start = nearest_match_start
+                match_end = min(match_start + len(query), len(line_content))
+                file_key = str(relative_path)
+                results_by_file.setdefault(file_key, []).append(
+                    {
+                        "line_number": line_number,
+                        "line_content": line_content,
+                        "match_start": match_start,
+                        "match_end": match_end,
+                    }
+                )
+                total_matches += 1
+
+            structured_results = [
+                {
+                    "file_path": file_path,
+                    "matches": matches,
+                }
+                for file_path, matches in results_by_file.items()
+            ]
+
+            return {
+                "success": True,
+                "data": {
+                    "query": query,
+                    "file_glob": file_glob,
+                    "total_files": len(structured_results),
+                    "total_matches": total_matches,
+                    "results": structured_results,
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.post("/api/file-search/{agent_id}", dependencies=[Depends(verify_token)])
+    async def file_search(agent_id: str, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Perform a fuzzy search by file name within the Agent working directory."""
+        try:
+            resolved_target_node = str(request.get("node_id") or "").strip()
+            if not resolved_target_node:
+                route = node_runtime.agent_route_registry.get(agent_id)
+                if route is not None:
+                    resolved_target_node = str(route.node_id or "").strip()
+
+            if resolved_target_node and resolved_target_node not in (
+                node_runtime.local_node_id,
+                "master",
+            ):
+                forward_body = dict(request)
+                forward_body.pop("node_id", None)
+                response = await node_connection_manager.send_request_to_node(
+                    resolved_target_node,
+                    NODE_HTTP_PROXY_REQUEST,
+                    {
+                        "method": "POST",
+                        "path": f"file-search/{agent_id}",
+                        "query": "",
+                        "headers": {"content-type": "application/json"},
+                        "body": json.dumps(forward_body),
+                    },
+                )
+                payload = response.get("payload") or {}
+                if not payload.get("success"):
+                    error = payload.get("error") or {}
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": error.get("code", "FILE_SEARCH_FAILED"),
+                            "message": error.get(
+                                "message", "Remote file search failed"
+                            ),
+                        },
+                    }
+                body = payload.get("body") or "{}"
+                return cast(Dict[str, Any], json.loads(body))
+
+            agent = agent_manager.get_agent(agent_id)
+            if not agent:
+                return {
+                    "success": False,
+                    "error": {"code": "AGENT_NOT_FOUND", "message": "Agent not found"},
+                }
+
+            raw_query = request.get("query", "")
+            query = str(raw_query).strip() if raw_query is not None else ""
+            if not query:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_QUERY", "message": "query is required"},
+                }
+            if len(query) > GLOBAL_SEARCH_MAX_QUERY_LENGTH:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_QUERY",
+                        "message": f"query length must be <= {GLOBAL_SEARCH_MAX_QUERY_LENGTH}",
+                    },
+                }
+
+            case_sensitive = bool(request.get("case_sensitive", False))
+            raw_max_results = request.get(
+                "max_results", FILE_SEARCH_DEFAULT_MAX_RESULTS
+            )
+            try:
+                max_results = int(raw_max_results)
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_QUERY",
+                        "message": "max_results must be an integer",
+                    },
+                }
+            if max_results < 1 or max_results > FILE_SEARCH_MAX_RESULTS_LIMIT:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_QUERY",
+                        "message": f"max_results must be between 1 and {FILE_SEARCH_MAX_RESULTS_LIMIT}",
+                    },
+                }
+
+            raw_file_glob = request.get("file_glob", "")
+            file_glob = str(raw_file_glob).strip() if raw_file_glob is not None else ""
+            if len(file_glob) > GLOBAL_SEARCH_MAX_GLOB_LENGTH:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_QUERY",
+                        "message": f"file_glob length must be <= {GLOBAL_SEARCH_MAX_GLOB_LENGTH}",
+                    },
+                }
+            file_glob_patterns = [
+                item.strip()
+                for item in file_glob.split(",")
+                if isinstance(item, str) and item.strip()
+            ]
+
+            working_dir = pathlib.Path(agent.working_dir).resolve()
+            if not working_dir.exists() or not working_dir.is_dir():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "WORKING_DIR_NOT_FOUND",
+                        "message": f"Working directory not found: {working_dir}",
+                    },
+                }
+
+            rg_command = [
+                "rg",
+                "--files",
+                "--hidden",
+                "--glob",
+                "!.git",
+                "--glob",
+                "!node_modules",
+                "--glob",
+                "!__pycache__",
+                "--glob",
+                "!.venv",
+                "--glob",
+                "!venv",
+                "--glob",
+                "!dist",
+                "--glob",
+                "!build",
+            ]
+            for glob_pattern in file_glob_patterns:
+                rg_command.extend(["--glob", glob_pattern])
+            rg_command.append(str(working_dir))
+
+            try:
+                result = subprocess.run(
+                    rg_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=GLOBAL_SEARCH_COMMAND_TIMEOUT_SECONDS,
+                    cwd=str(working_dir),
+                )
+            except FileNotFoundError:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "SEARCH_FAILED",
+                        "message": "ripgrep (rg) is not available",
+                    },
+                }
+            except subprocess.TimeoutExpired:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "SEARCH_TIMEOUT",
+                        "message": f"Search timed out after {GLOBAL_SEARCH_COMMAND_TIMEOUT_SECONDS} seconds",
+                    },
+                }
+
+            if result.returncode not in (0, 1):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "SEARCH_FAILED",
+                        "message": result.stderr.strip() or "Search command failed",
+                    },
+                }
+
+            scored_results = []
+            for line in result.stdout.splitlines():
+                file_path_str = line.strip()
+                if not file_path_str:
+                    continue
+                try:
+                    absolute_path = pathlib.Path(file_path_str).resolve()
+                    relative_path = absolute_path.relative_to(working_dir)
+                except (ValueError, OSError):
+                    continue
+                name = relative_path.name
+                matched_query = query if case_sensitive else query.lower()
+# Match both the file name and the full relative path: file name matches take priority (better score),
+# Path matching is used to support "directory + filename" fuzzy search (e.g., scmodrs → sche/mod.rs).
+                name_score = _fuzzy_match_score(
+                    matched_query,
+                    name if case_sensitive else name.lower(),
+                )
+                path_score = _fuzzy_match_score(
+                    matched_query,
+                    str(relative_path)
+                    if case_sensitive
+                    else str(relative_path).lower(),
+                )
+                candidates = [
+                    score for score in (name_score, path_score) if score is not None
+                ]
+                if not candidates:
+                    continue
+                scored_results.append((min(candidates), str(relative_path), name))
+
+            scored_results.sort(key=lambda item: (item[0], item[1]))
+            limited = scored_results[:max_results]
+            structured_results = [
+                {"file_path": file_path, "name": name} for _, file_path, name in limited
+            ]
+
+            return {
+                "success": True,
+                "data": {
+                    "query": query,
+                    "file_glob": file_glob,
+                    "total_files": len(scored_results),
+                    "results": structured_results,
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    def _validate_absolute_file_path(file_path: str) -> pathlib.Path:
+        if not file_path:
+            raise ValueError("Path is required")
+
+        target_path = pathlib.Path(file_path)
+        if not target_path.is_absolute():
+            raise ValueError("Path must be absolute")
+
+        target_path = target_path.resolve()
+        if not target_path.exists():
+            raise FileNotFoundError(f"Path does not exist: {file_path}")
+
+        if not target_path.is_file():
+            raise IsADirectoryError(f"Path is not a file: {file_path}")
+
+        return target_path
+
+    def _parse_timer_schedule(request: Dict[str, Any]) -> Dict[str, Any]:
+        schedule = request.get("schedule")
+        if not isinstance(schedule, dict):
+            raise ValueError("schedule must be an object")
+
+        run_at = schedule.get("run_at")
+        delay_seconds = schedule.get("delay_seconds")
+        interval_seconds = schedule.get("interval_seconds")
+        cron = schedule.get("cron")
+        provided_fields = [
+            value is not None
+            for value in [run_at, delay_seconds, interval_seconds, cron]
+        ]
+        if sum(provided_fields) != 1:
+            raise ValueError(
+                "Exactly one of schedule.run_at, schedule.delay_seconds, schedule.interval_seconds or schedule.cron is required"
+            )
+
+        if run_at is not None:
+            if not isinstance(run_at, str) or not run_at.strip():
+                raise ValueError(
+                    "schedule.run_at must be a non-empty ISO datetime string"
+                )
+            parsed_run_at = datetime.fromisoformat(run_at)
+            return {"schedule_type": "run_at", "run_at": parsed_run_at}
+
+        if delay_seconds is not None:
+            if not isinstance(delay_seconds, (int, float)):
+                raise ValueError("schedule.delay_seconds must be a number")
+            if delay_seconds < 0:
+                raise ValueError("schedule.delay_seconds must be >= 0")
+            return {"schedule_type": "delay", "delay_seconds": float(delay_seconds)}
+
+        if cron is not None:
+            if not isinstance(cron, str) or not cron.strip():
+                raise ValueError("schedule.cron must be a non-empty string")
+            try:
+                parse_cron(cron)
+            except CronParseError as e:
+                raise ValueError(f"invalid schedule.cron: {e}")
+            return {"schedule_type": "cron", "cron": cron}
+
+        if not isinstance(interval_seconds, (int, float)):
+            raise ValueError("schedule.interval_seconds must be a number")
+        if interval_seconds <= 0:
+            raise ValueError("schedule.interval_seconds must be > 0")
+        return {
+            "schedule_type": "interval",
+            "interval_seconds": float(interval_seconds),
+        }
+
+    def _build_create_agent_callback(action_params: Dict[str, Any]):
+        agent_type = action_params.get("agent_type")
+        working_dir = action_params.get("working_dir")
+        name = action_params.get("name")
+        llm_group = action_params.get("llm_group", "default")
+        tool_group = action_params.get("tool_group", "default")
+        config_file = action_params.get("config_file")
+        task = action_params.get("task")
+        additional_args = action_params.get("additional_args")
+        worktree = bool(action_params.get("worktree", False))
+        owner_id = action_params.get("owner_id")
+
+        if not agent_type:
+            raise ValueError("action.params.agent_type is required")
+        if not working_dir:
+            raise ValueError("action.params.working_dir is required")
+
+        metadata = {
+            "type": "create_agent",
+            "params": {
+                "agent_type": agent_type,
+                "working_dir": working_dir,
+                "name": name,
+                "llm_group": llm_group,
+                "tool_group": tool_group,
+                "config_file": config_file,
+                "task": task,
+                "additional_args": additional_args,
+                "worktree": worktree,
+                "owner_id": owner_id,
+            },
+        }
+
+        def _create_agent_callback() -> None:
+            auth_token = os.environ.get("HAIJUNBOT_AUTH_TOKEN")
+            proxy_node = action_params.get("proxy_node")
+            agent_manager.create_agent_threadsafe(
+                auth_token=auth_token,
+                agent_type=agent_type,
+                working_dir=working_dir,
+                name=name,
+                llm_group=llm_group,
+                tool_group=tool_group,
+                config_file=config_file,
+                task=task,
+                additional_args=additional_args,
+                worktree=worktree,
+                proxy_node=proxy_node,
+                owner_id=owner_id,
+            )
+
+        return _create_agent_callback, metadata
+
+    def _build_shell_command_callback(action_params: Dict[str, Any]):
+        command = action_params.get("command")
+        working_dir = action_params.get("working_dir")
+        interpreter = action_params.get("interpreter") or os.environ.get(
+            "SHELL", "bash"
+        )
+
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("action.params.command must be a non-empty string")
+        if not isinstance(working_dir, str) or not working_dir.strip():
+            raise ValueError("action.params.working_dir must be a non-empty string")
+
+        working_path = pathlib.Path(working_dir).expanduser().resolve()
+        if not working_path.exists():
+            raise ValueError(f"Working directory not found: {working_dir}")
+        if not working_path.is_dir():
+            raise ValueError(f"Working directory is not a directory: {working_dir}")
+        if not isinstance(interpreter, str) or not interpreter.strip():
+            raise ValueError("action.params.interpreter must be a non-empty string")
+
+        metadata = {
+            "type": "run_shell_command",
+            "params": {
+                "command": command,
+                "working_dir": str(working_path),
+                "interpreter": interpreter,
+            },
+        }
+
+        def _run_shell_command_callback() -> None:
+            subprocess.run(
+                [interpreter, "-lc", command],
+                cwd=str(working_path),
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+
+        return _run_shell_command_callback, metadata
+
+    def _build_capability_call_callback(action_params: Dict[str, Any]):
+        session_id = action_params.get("session_id")
+        capability = action_params.get("capability")
+        params = action_params.get("params")
+        timeout = action_params.get("timeout", 30.0)
+        user_id = action_params.get("user_id")
+        is_admin = bool(action_params.get("is_admin", False))
+
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("action.params.session_id is required")
+        if not isinstance(capability, str) or not capability.strip():
+            raise ValueError("action.params.capability is required")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise ValueError("action.params.params must be an object")
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            raise ValueError("action.params.timeout must be a number")
+
+        metadata = {
+            "type": "capability_call",
+            "params": {
+                "session_id": session_id,
+                "capability": capability,
+                "params": params,
+                "timeout": timeout,
+                "user_id": user_id,
+                "is_admin": is_admin,
+            },
+        }
+
+        def _capability_call_callback() -> None:
+            daemon_capability_manager.call_capability_threadsafe(
+                session_id,
+                capability,
+                params=params,
+                timeout=timeout,
+                user_id=user_id,
+                is_admin=is_admin,
+            )
+
+        return _capability_call_callback, metadata
+
+    def _build_timer_action(request: Dict[str, Any]):
+        action = request.get("action")
+        if not isinstance(action, dict):
+            raise ValueError("action must be an object")
+
+        action_type = action.get("type")
+        action_params = action.get("params")
+        if not isinstance(action_type, str) or not action_type.strip():
+            raise ValueError("action.type is required")
+        if not isinstance(action_params, dict):
+            raise ValueError("action.params must be an object")
+
+        if action_type == "create_agent":
+            return _build_create_agent_callback(action_params)
+        if action_type == "run_shell_command":
+            return _build_shell_command_callback(action_params)
+        if action_type == "capability_call":
+            return _build_capability_call_callback(action_params)
+        raise ValueError(
+            "action.type must be one of create_agent, run_shell_command or capability_call"
+        )
+
+    timer_manager.load_persisted_tasks()
+
+    def _schedule_timer_task(request: Dict[str, Any]) -> Dict[str, Any]:
+        schedule_info = _parse_timer_schedule(request)
+        callback, action_metadata = _build_timer_action(request)
+        timer_metadata = {
+            "action": action_metadata,
+            "schedule": {
+                "type": schedule_info["schedule_type"],
+            },
+        }
+
+        if schedule_info["schedule_type"] == "run_at":
+            run_at = schedule_info["run_at"]
+            timer_metadata["schedule"]["run_at"] = run_at.isoformat()
+            timer_id = timer_manager.schedule_at(
+                run_at=run_at,
+                callback=callback,
+                metadata=timer_metadata,
+            )
+        elif schedule_info["schedule_type"] == "delay":
+            delay_seconds = schedule_info["delay_seconds"]
+            timer_metadata["schedule"]["delay_seconds"] = delay_seconds
+            timer_id = timer_manager.schedule_after(
+                delay_seconds=delay_seconds,
+                callback=callback,
+                metadata=timer_metadata,
+            )
+        elif schedule_info["schedule_type"] == "cron":
+            cron_expr = schedule_info["cron"]
+            timer_metadata["schedule"]["cron"] = cron_expr
+            timer_id = timer_manager.schedule_cron(
+                cron_expr=cron_expr,
+                callback=callback,
+                metadata=timer_metadata,
+            )
+        else:
+            interval_seconds = schedule_info["interval_seconds"]
+            timer_metadata["schedule"]["interval_seconds"] = interval_seconds
+            timer_id = timer_manager.schedule_every(
+                interval_seconds=interval_seconds,
+                callback=callback,
+                metadata=timer_metadata,
+            )
+
+        timer_info = timer_manager.get_task(timer_id)
+        if timer_info is None:
+            raise RuntimeError("Failed to load timer after scheduling")
+        return timer_info
+
+    @app.post("/api/timers", dependencies=[Depends(verify_token)])
+    async def create_timer(
+        request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Create a timer."""
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            if _check_permission(user_info, "timer:create"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: timer:create",
+                    },
+                }
+            timer_info = _schedule_timer_task(request_body)
+            return {"success": True, "data": timer_info}
+        except ValueError as e:
+            return {
+                "success": False,
+                "error": {"code": "INVALID_ARGUMENT", "message": str(e)},
+            }
+        except RuntimeError as e:
+            return {
+                "success": False,
+                "error": {"code": "CREATE_FAILED", "message": str(e)},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.get("/api/timers", dependencies=[Depends(verify_token)])
+    async def list_timers(request: Request) -> Dict[str, Any]:
+        """Query all timers."""
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            if _check_permission(user_info, "timer:read"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: timer:read",
+                    },
+                }
+            return {"success": True, "data": timer_manager.list_tasks()}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.get("/api/timers/{timer_id}", dependencies=[Depends(verify_token)])
+    async def get_timer(timer_id: str, request: Request) -> Dict[str, Any]:
+        """Query a single timer."""
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            if _check_permission(user_info, "timer:read"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: timer:read",
+                    },
+                }
+            timer_info = timer_manager.get_task(timer_id)
+            if timer_info is None:
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Timer not found"},
+                }
+            return {"success": True, "data": timer_info}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.delete("/api/timers/{timer_id}", dependencies=[Depends(verify_token)])
+    async def delete_timer(timer_id: str, request: Request) -> Dict[str, Any]:
+        """Delete the specified timer."""
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            if _check_permission(user_info, "timer:delete"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: timer:delete",
+                    },
+                }
+            success = timer_manager.cancel(timer_id)
+            if not success:
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Timer not found"},
+                }
+            return {"success": True}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _run_plugin_manage(
+        node_id: str, action: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Perform plugin management operations (list/install/uninstall/upgrade/serve_frontend) on the specified node.
+
+When node_id is local/master, directly call the plugin management function of haijunbot_agent.utils
+(Capture the internal output of the function using PrettyOutput's Sink); otherwise forward it through the node protocol
+Execute the corresponding child node.
+        """
+        if node_id in (node_runtime.local_node_id, "master"):
+            from haijunbot.haijunbot_agent.utils import (
+                install_plugin,
+                list_plugins_info,
+                uninstall_plugin,
+                upgrade_plugin,
+            )
+            from haijunbot.haijunbot_utils.output import OutputSink, PrettyOutput
+
+            captured: list[str] = []
+
+            class _CaptureSink(OutputSink):
+                def emit(self, event: Any) -> None:  # pragma: no cover - simple collection
+                    if getattr(event, "text", None):
+                        captured.append(event.text)
+
+            sink = _CaptureSink()
+            PrettyOutput.add_sink(sink)
+            try:
+                if action == "list":
+                    plugins = list_plugins_info()
+                    return {
+                        "success": True,
+                        "action": action,
+                        "plugins": plugins,
+                        "output": captured,
+                    }
+                if action == "install":
+                    source = str(payload.get("source") or "")
+                    force = bool(payload.get("force", False))
+                    ok = install_plugin(source, force=force)
+                    return {
+                        "success": ok,
+                        "action": action,
+                        "output": captured,
+                    }
+                if action == "uninstall":
+                    name = str(payload.get("name") or "")
+                    ok = uninstall_plugin(name)
+                    return {
+                        "success": ok,
+                        "action": action,
+                        "output": captured,
+                    }
+                if action == "upgrade":
+                    name = str(payload.get("name") or "")
+                    ok = upgrade_plugin(name)
+                    return {
+                        "success": ok,
+                        "action": action,
+                        "output": captured,
+                    }
+                if action == "serve_frontend":
+                    name = str(payload.get("name") or "")
+                    rel_path = str(payload.get("path") or "")
+                    content, content_type = (
+                        NodeConnectionManager._read_plugin_frontend_file(name, rel_path)
+                    )
+                    return {
+                        "success": True,
+                        "action": action,
+                        "content": content,
+                        "content_type": content_type,
+                    }
+                return {
+                    "success": False,
+                    "action": action,
+                    "error": {
+                        "code": "INVALID_ACTION",
+                        "message": f"unknown action: {action}",
+                    },
+                }
+            finally:
+                PrettyOutput.remove_sink(sink)
+        else:
+# Check the status of remote nodes
+            node_info = node_runtime.node_registry.get(node_id)
+            if node_info is None:
+                return {
+                    "success": False,
+                    "action": action,
+                    "error": {
+                        "code": "NODE_NOT_FOUND",
+                        "message": f"Node not found: {node_id}",
+                    },
+                }
+            if node_info.status != "online":
+                return {
+                    "success": False,
+                    "action": action,
+                    "error": {
+                        "code": "NODE_OFFLINE",
+                        "message": f"Node is offline: {node_id}",
+                    },
+                }
+            response = await node_connection_manager.send_request_to_node(
+                node_id,
+                PLUGIN_MANAGE_REQUEST,
+                {"action": action, **payload},
+                timeout=60.0,
+            )
+            result = response.get("payload") or {}
+            return result
+        return result
+
+# Plugin tool registry (lazy loading, in-process cache). Only load plugin tools (tools/ directory),
+# Do not load built-in tools (such as execute_script) to avoid introducing unrelated side effects in the gateway process,
+# It also naturally ensures that the front-end proxy can only call plugin tools.
+    _plugin_tool_registry_holder: Dict[str, Any] = {}
+
+    def _ensure_plugin_tool_registry():
+        """Lazy load plugin tool registry (only loads tools in the tools/ directory).
+
+Use ToolRegistry.__new__ to bypass __init__ (without loading built-in/external tools),
+Only traverse get_tool_load_dirs() (including each plugin's tools/ directory) using register_tool_by_file
+Load plugin tools. register_tool_by_file will register the source plugin to _external_tool_sources,
+Provide the tool to verify the ownership of the agent endpoint.
+        """
+        if _plugin_tool_registry_holder:
+            return _plugin_tool_registry_holder["registry"]
+        from haijunbot.haijunbot_tools.registry import ToolRegistry
+        from haijunbot.haijunbot_utils.config import get_tool_load_dirs
+
+        reg = ToolRegistry.__new__(ToolRegistry)
+        reg.tools = {}
+        reg._builtin_tool_names = set()
+        reg._external_tool_sources = {}
+        reg._required_tools = ["execute_script"]
+        reg._all_tools = {}
+
+        for tool_dir in get_tool_load_dirs():
+            p_tool_dir = pathlib.Path(tool_dir)
+            if not p_tool_dir.exists() or not p_tool_dir.is_dir():
+                continue
+            for file_path in sorted(p_tool_dir.glob("*.py")):
+                if file_path.name == "__init__.py":
+                    continue
+                reg.register_tool_by_file(str(file_path))
+
+        _plugin_tool_registry_holder["registry"] = reg
+        return reg
+
+    def _list_plugin_tools() -> List[Dict[str, Any]]:
+        """List all plugin tools that can be called by the front-end proxy (including the source plugin names)."""
+        """List all plugin tools that can be called by the front-end proxy (including the source plugin names)."""
+        reg = _ensure_plugin_tool_registry()
+        result = []
+        for name in sorted(reg._all_tools.keys()):
+            tool = reg._all_tools[name]
+            result.append(
+                {
+                    "name": name,
+                    "plugin": reg._external_tool_sources.get(name, ""),
+                    "description": getattr(tool, "description", ""),
+                    "parameters": getattr(tool, "parameters", {}),
+                }
+            )
+        return result
+
+    def _call_plugin_tool(
+        plugin: str, tool: str, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Execute the plugin tool locally (the source of the verification tool must match the specified plugin)."""
+        reg = _ensure_plugin_tool_registry()
+# Only allow calling tools from the specified plugin to prevent unauthorized calls to other plugins/built-in tools
+        if tool not in reg._external_tool_sources:
+            return {
+                "success": False,
+                "error": {
+                    "code": "TOOL_NOT_FOUND",
+"message": f"The plugin tool does not exist or cannot be called via proxy: {tool}"
+                },
+            }
+        if reg._external_tool_sources[tool] != plugin:
+            return {
+                "success": False,
+                "error": {
+                    "code": "TOOL_PLUGIN_MISMATCH",
+"message": f"Tool {tool} does not belong to plugin {plugin}"
+                },
+            }
+        if tool not in reg._all_tools:
+            return {
+                "success": False,
+                "error": {
+                    "code": "TOOL_NOT_LOADED",
+"message": f"Plugin tool not loaded: {tool}"
+                },
+            }
+        try:
+            result = reg.execute_tool(tool, dict(arguments or {}))
+            if isinstance(result, dict):
+                return result
+            return {"success": True, "stdout": str(result), "stderr": ""}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "TOOL_EXEC_FAILED", "message": str(e)},
+            }
+
+    async def _run_plugin_tool(
+        node_id: str, plugin: str, tool: str, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Execute the plugin tool on the specified node (execute directly on local/master, forward on child nodes)."""
+        if node_id in (node_runtime.local_node_id, "master"):
+            return _call_plugin_tool(plugin, tool, arguments)
+# Child Node Forwarding (Reusing Plugin Management Request Channel)
+        node_info = node_runtime.node_registry.get(node_id)
+        if node_info is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": "NODE_NOT_FOUND",
+                    "message": f"Node not found: {node_id}",
+                },
+            }
+        if node_info.status != "online":
+            return {
+                "success": False,
+                "error": {
+                    "code": "NODE_OFFLINE",
+                    "message": f"Node is offline: {node_id}",
+                },
+            }
+        response = await node_connection_manager.send_request_to_node(
+            node_id,
+            PLUGIN_MANAGE_REQUEST,
+            {
+                "action": "call_tool",
+                "plugin": plugin,
+                "tool": tool,
+                "arguments": arguments or {},
+            },
+            timeout=60.0,
+        )
+        result = response.get("payload") or {}
+        return result
+
+    @app.get("/api/plugins/{node_id}/tools", dependencies=[Depends(verify_token)])
+    async def list_plugin_tools(node_id: str, request: Request) -> Dict[str, Any]:
+        """List the plugin tools on the specified node that can be called by the front-end proxy (available to logged-in users)."""
+        try:
+            if node_id in (node_runtime.local_node_id, "master"):
+                tools = _list_plugin_tools()
+                return {
+                    "success": True,
+                    "data": {"node_id": node_id, "tools": tools},
+                }
+            result = await _run_plugin_manage(node_id, "list_tools", {})
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "tools": result.get("tools", []),
+                    },
+                }
+            return {
+                "success": False,
+                "error": result.get("error")
+                or {
+                    "code": "LIST_TOOLS_FAILED",
+                    "message": "Failed to list plugin tools",
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.post("/api/plugins/{node_id}/tool-call", dependencies=[Depends(verify_token)])
+    async def call_plugin_tool(
+        node_id: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Proxy call plugin tool on the specified node (logged-in users only).
+
+Request body: { plugin, tool, arguments }
+Only tools from the specified plugin are allowed to be called; built-in tools cannot be called through a proxy.
+        """
+        try:
+            plugin = str(request_body.get("plugin") or "").strip()
+            tool = str(request_body.get("tool") or "").strip()
+            arguments = request_body.get("arguments") or {}
+            if not plugin or not tool:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": "plugin and tool are required",
+                    },
+                }
+            result = await _run_plugin_tool(node_id, plugin, tool, arguments)
+            return result
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    def _list_plugin_functions(node_id: str) -> List[Dict[str, Any]]:
+        """List all private functions of local plugins (read the PUBLIC_FUNCTIONS in each plugin's plugin/api.py).
+
+The plugin's private functions run on the gateway and are invoked by the front-end proxy; they do not go through the ToolRegistry.
+        """
+        from haijunbot.haijunbot_agent.utils import list_plugins_info
+
+        result: List[Dict[str, Any]] = []
+        try:
+            plugins = list_plugins_info()
+        except Exception:
+            plugins = []
+        for p in plugins:
+            name = str(p.get("name") or "") if isinstance(p, dict) else str(p)
+            if not name:
+                continue
+            api = NodeConnectionManager._load_plugin_api(name)
+            if api is None:
+                continue
+            functions = []
+            for fn in getattr(api, "PUBLIC_FUNCTIONS", []) or []:
+                if callable(getattr(api, fn, None)):
+                    functions.append(fn)
+            if functions:
+                result.append({"plugin": name, "functions": functions})
+        return result
+
+    def _call_plugin_function(
+        plugin: str, function: str, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Execute the plugin's private functions locally (whitelist verification, without going through ToolRegistry)."""
+        api = NodeConnectionManager._load_plugin_api(plugin)
+        if api is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": "FUNCTION_API_NOT_FOUND",
+"message": f"The plugin {plugin} has no private function layer (plugin/api.py)"
+                },
+            }
+        whitelist = getattr(api, "PUBLIC_FUNCTIONS", []) or []
+        if function not in whitelist or not callable(getattr(api, function, None)):
+            return {
+                "success": False,
+                "error": {
+                    "code": "FUNCTION_NOT_ALLOWED",
+"message": f"The function {function} is not in the whitelist of plugin {plugin}"
+                },
+            }
+        try:
+            result = getattr(api, function)(**dict(arguments or {}))
+            if isinstance(result, dict):
+                return {"success": True, "result": result}
+            return {"success": True, "result": {"success": True, "data": result}}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "FUNCTION_EXEC_FAILED", "message": str(e)},
+            }
+
+    async def _run_plugin_function(
+        node_id: str, plugin: str, function: str, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Execute plugin private functions on the specified node (local/master executes directly, child nodes forward)."""
+        if node_id in (node_runtime.local_node_id, "master"):
+            return _call_plugin_function(plugin, function, arguments)
+        node_info = node_runtime.node_registry.get(node_id)
+        if node_info is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": "NODE_NOT_FOUND",
+                    "message": f"Node not found: {node_id}",
+                },
+            }
+        if node_info.status != "online":
+            return {
+                "success": False,
+                "error": {
+                    "code": "NODE_OFFLINE",
+                    "message": f"Node is offline: {node_id}",
+                },
+            }
+        response = await node_connection_manager.send_request_to_node(
+            node_id,
+            PLUGIN_MANAGE_REQUEST,
+            {
+                "action": "call_function",
+                "name": plugin,
+                "function": function,
+                "arguments": arguments or {},
+            },
+            timeout=60.0,
+        )
+        result = response.get("payload") or {}
+        return result
+
+    @app.get("/api/plugins/{node_id}/functions", dependencies=[Depends(verify_token)])
+    async def list_plugin_functions(node_id: str, request: Request) -> Dict[str, Any]:
+        """List the plugin private features on the specified node that can be called by the front-end proxy (logged-in users only)."""
+        try:
+            if node_id in (node_runtime.local_node_id, "master"):
+                functions = _list_plugin_functions(node_id)
+                return {
+                    "success": True,
+                    "data": {"node_id": node_id, "plugins": functions},
+                }
+            result = await _run_plugin_manage(node_id, "list_functions", {})
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "plugins": result.get("functions", []),
+                    },
+                }
+            return {
+                "success": False,
+                "error": result.get("error")
+                or {
+                    "code": "LIST_FUNCTIONS_FAILED",
+                    "message": "Failed to list plugin functions",
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.post(
+        "/api/plugins/{node_id}/function-call", dependencies=[Depends(verify_token)]
+    )
+    async def call_plugin_function(
+        node_id: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Proxy call the plugin's private functions at the specified node (logged-in users only).
+
+Request body: { plugin, function, arguments }
+Only functions within the PUBLIC_FUNCTIONS whitelist of the plugin api.py are allowed to be called; not through ToolRegistry.
+        """
+        try:
+            plugin = str(request_body.get("plugin") or "").strip()
+            function = str(request_body.get("function") or "").strip()
+            arguments = request_body.get("arguments") or {}
+            if not plugin or not function:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": "plugin and function are required",
+                    },
+                }
+            result = await _run_plugin_function(node_id, plugin, function, arguments)
+            return result
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.get("/api/plugins", dependencies=[Depends(verify_token)])
+    async def list_plugins(request: Request, node_id: str = "master") -> Dict[str, Any]:
+        """List the plugins installed on the specified node (requires admin:plugins permission)."""
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            if _check_permission(user_info, "admin:plugins"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: admin:plugins",
+                    },
+                }
+            result = await _run_plugin_manage(node_id, "list", {})
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "plugins": result.get("plugins", []),
+                        "output": result.get("output", []),
+                    },
+                }
+            error = result.get("error") or {
+                "code": "LIST_PLUGINS_FAILED",
+                "message": "Failed to list plugins",
+            }
+            return {"success": False, "error": error}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.post("/api/plugins/install", dependencies=[Depends(verify_token)])
+    async def install_plugin_api(
+        request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Install plugins on the specified node (requires admin:plugins permission)."""
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            if _check_permission(user_info, "admin:plugins"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: admin:plugins",
+                    },
+                }
+            node_id = str(request_body.get("node_id") or "master")
+            source = str(request_body.get("source") or "")
+            force = bool(request_body.get("force", False))
+            if not source:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": "source is required",
+                    },
+                }
+            result = await _run_plugin_manage(
+                node_id, "install", {"source": source, "force": force}
+            )
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "output": result.get("output", []),
+                    },
+                }
+            error = result.get("error") or {
+                "code": "INSTALL_PLUGIN_FAILED",
+                "message": "Failed to install plugin",
+            }
+            return {"success": False, "error": error}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.post("/api/plugins/{name}/uninstall", dependencies=[Depends(verify_token)])
+    async def uninstall_plugin_api(
+        name: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Uninstall plugins from a specified node (requires admin:plugins permission)."""
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            if _check_permission(user_info, "admin:plugins"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: admin:plugins",
+                    },
+                }
+            node_id = str(request_body.get("node_id") or "master")
+            result = await _run_plugin_manage(node_id, "uninstall", {"name": name})
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "output": result.get("output", []),
+                    },
+                }
+            error = result.get("error") or {
+                "code": "UNINSTALL_PLUGIN_FAILED",
+                "message": "Failed to uninstall plugin",
+            }
+            return {"success": False, "error": error}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.post("/api/plugins/{name}/upgrade", dependencies=[Depends(verify_token)])
+    async def upgrade_plugin_api(
+        name: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Upgrade the plugin of the specified node (requires admin:plugins permission)."""
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            if _check_permission(user_info, "admin:plugins"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: admin:plugins",
+                    },
+                }
+            node_id = str(request_body.get("node_id") or "master")
+            result = await _run_plugin_manage(node_id, "upgrade", {"name": name})
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "output": result.get("output", []),
+                    },
+                }
+            error = result.get("error") or {
+                "code": "UPGRADE_PLUGIN_FAILED",
+                "message": "Failed to upgrade plugin",
+            }
+            return {"success": False, "error": error}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    @app.get(
+        "/api/plugins/{node_id}/{name}/frontend/{path:path}",
+        dependencies=[Depends(verify_token)],
+    )
+    async def serve_plugin_frontend(
+        node_id: str, name: str, path: str, request: Request
+    ) -> Dict[str, Any]:
+        """Read the front-end resource files of the specified node plugin (requires admin:plugins permission)."""
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            if _check_permission(user_info, "admin:plugins"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PERMISSION_DENIED",
+                        "message": "Permission denied: admin:plugins",
+                    },
+                }
+            result = await _run_plugin_manage(
+                node_id, "serve_frontend", {"name": name, "path": path}
+            )
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": node_id,
+                        "name": name,
+                        "content": result.get("content", ""),
+                        "content_type": result.get("content_type", "text/plain"),
+                    },
+                }
+            error = result.get("error") or {
+                "code": "SERVE_FRONTEND_FAILED",
+                "message": "Failed to serve plugin frontend",
+            }
+            return {"success": False, "error": error}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_file_content_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            file_path = str(payload.get("path", "")).strip()
+            try:
+                target_path = _validate_absolute_file_path(file_path)
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": str(exc),
+                    },
+                }
+            except FileNotFoundError as exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": str(exc),
+                    },
+                }
+            except IsADirectoryError as exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_A_FILE",
+                        "message": str(exc),
+                    },
+                }
+
+            if target_path.stat().st_size > MAX_FILE_SIZE_BYTES:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "FILE_TOO_LARGE",
+                        "message": "File size exceeds 10MB limit",
+                    },
+                }
+
+            with open(target_path, "rb") as binary_file:
+                file_header = binary_file.read(BINARY_FILE_SAMPLE_SIZE)
+
+            if b"\x00" in file_header:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "BINARY_FILE_NOT_SUPPORTED",
+                        "message": "Binary file is not supported",
+                    },
+                }
+
+            try:
+                with open(target_path, "r", encoding="utf-8") as file:
+                    file_content = file.read()
+            except UnicodeDecodeError:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "BINARY_FILE_NOT_SUPPORTED",
+                        "message": "Binary file is not supported",
+                    },
+                }
+
+            return {
+                "success": True,
+                "data": {
+                    "path": str(target_path),
+                    "content": file_content,
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied",
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_file_stat_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            file_path = str(payload.get("path", "")).strip()
+            try:
+                target_path = _validate_absolute_file_path(file_path)
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": str(exc),
+                    },
+                }
+            except FileNotFoundError as exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": str(exc),
+                    },
+                }
+            except IsADirectoryError as exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_A_FILE",
+                        "message": str(exc),
+                    },
+                }
+
+            file_stat = target_path.stat()
+            return {
+                "success": True,
+                "data": {
+                    "path": str(target_path),
+                    "mtime_ns": file_stat.st_mtime_ns,
+                    "size": file_stat.st_size,
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied",
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # ------------------------------------------------------------------
+# Node File Direct Transfer (file-transfer): Moving Large Files Between Daemon and Nodes
+    # ------------------------------------------------------------------
+# Background: On the daemon side, fs.transfer.push/pull loops in blocks internally within the daemon and goes through the gateway
+# WS forwards to the target node, bytes do not enter the Agent context. Because the WS forwarding body is JSON
+# Strings and binary data are uniformly carried using base64, with a single block limit of 8MiB (about 10.7MiB after base64,
+# Below the WS message limit of 16MiB by default in uvicorn).
+    #
+# Security: All disk paths on the node side must converge under ~/.haijunbot/transfers/, absolute path
+# Keep the original structure after removing the root (/data/a.txt -> transfers/data/a.txt), relative paths directly
+# Concatenation; any path attempting to escape this directory (.. traversal) will be denied.
+    _TRANSFER_MAX_CHUNK_BYTES = 8 * 1024 * 1024
+
+# Directory mode packaging cache: {tar_path: (source_path, mtime, size)}.
+# download Each chunk request will reach this function. If the entire directory is repackaged every time, large directories
+# Will be packaged N times (N = number of chunks), which is very costly. Here it is cached according to the tar path, hitting and the source directory
+# Reuse directly if mtime hasn’t changed; after reading chunks to EOF, delete the tar and clear the cache.
+    _transfer_dir_tar_cache: Dict[str, Any] = {}
+
+    def _transfer_pack_dir(source_path: str) -> str:
+        """Package the directory as <source>.outgoing.tar and return the tar path (with cache)."""
+        import tarfile
+
+        tar_path = source_path.rstrip("/\\") + ".outgoing.tar"
+        try:
+            mtime = os.path.getmtime(source_path)
+        except OSError:
+            mtime = None
+        cached = _transfer_dir_tar_cache.get(tar_path)
+        if (
+            cached is not None
+            and os.path.isfile(tar_path)
+            and cached[0] == source_path
+            and cached[1] == mtime
+        ):
+            return tar_path
+# Use the directory name as the top-level directory in the tar, retaining the relative structure
+        with tarfile.open(tar_path, "w") as tar:
+            tar.add(source_path, arcname=os.path.basename(source_path))
+        _transfer_dir_tar_cache[tar_path] = (
+            source_path,
+            mtime,
+            os.path.getsize(tar_path),
+        )
+        return tar_path
+
+    def _transfer_cleanup_dir_tar(tar_path: str) -> None:
+        """Delete dir temporary tar and clear cache (idempotent)."""
+        _transfer_dir_tar_cache.pop(tar_path, None)
+        try:
+            os.remove(tar_path)
+        except OSError:
+            pass
+
+    def _transfer_root_dir() -> str:
+        """Return the root directory for direct file transfers (~/.haijunbot/transfers)."""
+        from haijunbot.haijunbot_utils.config import get_data_dir
+
+        root = os.path.join(get_data_dir(), "transfers")
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _resolve_transfer_path(raw_path: str) -> str:
+        """Constrain the path provided by the user to under the transfers root directory.
+
+- Absolute path: remove the root (including Windows drive letter), keep the original path structure, and then concatenate;
+- Relative path: directly concatenate;
+- Any path that escapes the root directory after normalization (such as ../../etc/passwd) will raise a ValueError.
+        """
+        root = os.path.realpath(_transfer_root_dir())
+        text = str(raw_path or "").strip()
+        if not text:
+            raise ValueError("path is required")
+
+# Windows drive letters (C:\... or C:/...) need to be stripped separately, os.path.isabs in
+# POSIX does not recognize drive letters, but the node may be Windows, so handle uniformly.
+        drive, rest = os.path.splitdrive(text)
+        if drive or os.path.isabs(text):
+# Remove the root and drive letter, keeping only the relative structure
+            relative = rest.lstrip("/\\") if drive else text.lstrip("/\\")
+        else:
+            relative = text
+
+        candidate = os.path.realpath(os.path.join(root, relative))
+# Use commonpath to check whether it is still within the root directory, preventing .. traversal
+        if candidate != root and os.path.commonpath([root, candidate]) != root:
+            raise ValueError(f"path escapes transfer root: {raw_path}")
+        return candidate
+
+    async def _handle_file_transfer_upload(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle file direct upload in chunks: write base64 chunks to the target file according to the offset.
+
+payload field:
+- path: Target path (will be consolidated under the transfers root directory)
+- data: chunked data encoded in base64
+- offset: Write offset (>=0)
+- mode: "file" | "dir" (dir indicates that data is a tar chunk)
+- truncate: When the first block is passed as True, the target file is cleared
+- final: When the last block in dir mode passes True, unpack the tar to the target directory
+        """
+        import base64
+        import hashlib
+        import tarfile
+
+        try:
+            raw_path = str(payload.get("path", "")).strip()
+            try:
+                target_path = _resolve_transfer_path(raw_path)
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_PATH", "message": str(exc)},
+                }
+
+            mode = str(payload.get("mode") or "file").strip().lower()
+            if mode not in ("file", "dir"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_MODE",
+                        "message": "mode must be 'file' or 'dir'",
+                    },
+                }
+
+            data_b64 = payload.get("data")
+            if not isinstance(data_b64, str):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_DATA",
+                        "message": "data must be a base64 string",
+                    },
+                }
+            try:
+                chunk = base64.b64decode(data_b64)
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_DATA",
+                        "message": f"invalid base64 data: {exc}",
+                    },
+                }
+
+            if len(chunk) > _TRANSFER_MAX_CHUNK_BYTES:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "CHUNK_TOO_LARGE",
+                        "message": f"chunk exceeds {_TRANSFER_MAX_CHUNK_BYTES} bytes",
+                    },
+                }
+
+            try:
+                offset = int(payload.get("offset") or 0)
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_OFFSET",
+                        "message": "offset must be an integer",
+                    },
+                }
+            if offset < 0:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_OFFSET",
+                        "message": "offset must be >= 0",
+                    },
+                }
+
+# dir mode: chunks are first saved to <target>.incoming.tar, and the last chunk is then unpacked
+            write_path = target_path + ".incoming.tar" if mode == "dir" else target_path
+            os.makedirs(os.path.dirname(write_path) or ".", exist_ok=True)
+
+            truncate = bool(payload.get("truncate"))
+# Use "wb" if it's the first truncate or the file does not exist, otherwise use "r+b" to position for writing.
+# The truncate branch also seeks to the offset: truncate only means "rebuild from scratch",
+# Does not imply offset==0, the caller may still write with a non-zero offset.
+            if truncate or not os.path.exists(write_path):
+                with open(write_path, "wb") as fh:
+                    if offset:
+                        fh.seek(offset)
+                    fh.write(chunk)
+            else:
+                with open(write_path, "r+b") as fh:
+                    fh.seek(offset)
+                    fh.write(chunk)
+
+            written = len(chunk)
+            size = os.path.getsize(write_path)
+            chunk_sha256 = hashlib.sha256(chunk).hexdigest()
+
+# The last part of the dir mode: unpack the tar to the target directory and delete the temporary tar
+            if mode == "dir" and bool(payload.get("final")):
+                os.makedirs(target_path, exist_ok=True)
+                with tarfile.open(write_path, "r") as tar:
+                    _safe_extract_tar(tar, target_path)
+                os.remove(write_path)
+
+            return {
+                "success": True,
+                "data": {
+                    "path": target_path,
+                    "offset": offset,
+                    "written": written,
+                    "size": size,
+                    "sha256": chunk_sha256,
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(exc)},
+            }
+
+    def _safe_extract_tar(tar: Any, dest_dir: str) -> None:
+        """Unpack the tar to dest_dir, rejecting any members that escape the target directory (prevent tar traversal)."""
+        root = os.path.realpath(dest_dir)
+        for member in tar.getmembers():
+            member_path = os.path.realpath(os.path.join(root, member.name))
+            if member_path != root and os.path.commonpath([root, member_path]) != root:
+                raise ValueError(f"tar member escapes dest dir: {member.name}")
+        try:
+# Python 3.12+ supports filter; "tar" preserves permissions/time and other metadata while refusing
+# Absolute paths and .. traversal, complementing the manual verification of this function. Older versions do not have this parameter.
+            tar.extractall(root, filter="tar")
+        except TypeError:
+            tar.extractall(root)
+
+    async def _handle_file_transfer_download(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle download chunking for direct file transfer: read length bytes from the file (or directory tar) starting at the offset.
+
+payload field:
+- path: Source path (will be consolidated under the transfers root directory)
+- offset: starting offset (>=0)
+- length: Read length (<= 8MiB)
+- mode: "file" | "dir" (dir means packing the directory into a tar file and then splitting it)
+        """
+        import base64
+        import hashlib
+
+        try:
+            raw_path = str(payload.get("path", "")).strip()
+            try:
+                source_path = _resolve_transfer_path(raw_path)
+            except ValueError as exc:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_PATH", "message": str(exc)},
+                }
+
+            mode = str(payload.get("mode") or "file").strip().lower()
+            if mode not in ("file", "dir"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_MODE",
+                        "message": "mode must be 'file' or 'dir'",
+                    },
+                }
+
+            try:
+                offset = int(payload.get("offset") or 0)
+                length = int(payload.get("length") or _TRANSFER_MAX_CHUNK_BYTES)
+            except (TypeError, ValueError):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_RANGE",
+                        "message": "offset/length must be integers",
+                    },
+                }
+            if offset < 0 or length < 0:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_RANGE",
+                        "message": "offset/length must be >= 0",
+                    },
+                }
+            if length > _TRANSFER_MAX_CHUNK_BYTES:
+                length = _TRANSFER_MAX_CHUNK_BYTES
+
+# dir mode: package the directory into a tar at <path>.outgoing.tar and then read it as a file
+            read_path = source_path
+            is_dir_tar = False
+            if mode == "dir":
+                if not os.path.isdir(source_path):
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NOT_A_DIRECTORY",
+                            "message": f"not a directory: {raw_path}",
+                        },
+                    }
+# Chunked requests will arrive multiple times, and the packed results are cached and reused according to the source directory mtime
+                read_path = _transfer_pack_dir(source_path)
+                is_dir_tar = True
+            elif not os.path.isfile(source_path):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": f"file not found: {raw_path}",
+                    },
+                }
+
+            total_size = os.path.getsize(read_path)
+            with open(read_path, "rb") as fh:
+                fh.seek(offset)
+                chunk = fh.read(length)
+
+            eof = offset + len(chunk) >= total_size
+            # After the last block in dir mode is read, clean up the temporary tar to avoid leftovers
+            if is_dir_tar and eof:
+                _transfer_cleanup_dir_tar(read_path)
+            return {
+                "success": True,
+                "data": {
+                    "path": source_path,
+                    "offset": offset,
+                    "size": total_size,
+                    "eof": eof,
+                    "data": base64.b64encode(chunk).decode("ascii"),
+                    "sha256": hashlib.sha256(chunk).hexdigest(),
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(exc)},
+            }
+
+    async def _handle_file_write_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            file_path = str(payload.get("path", "")).strip()
+            if not file_path:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": "Path is required",
+                    },
+                }
+
+            target_path = pathlib.Path(file_path)
+            if not target_path.is_absolute():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": "Path must be absolute",
+                    },
+                }
+
+            file_content = payload.get("content")
+            if not isinstance(file_content, str):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_CONTENT",
+                        "message": "Content must be a string",
+                    },
+                }
+
+            encoded_content = file_content.encode("utf-8")
+            if len(encoded_content) > MAX_FILE_SIZE_BYTES:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "FILE_TOO_LARGE",
+                        "message": "File size exceeds 10MB limit",
+                    },
+                }
+
+            target_path = target_path.resolve(strict=False)
+            parent_directory = target_path.parent
+
+            if not parent_directory.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PARENT_DIRECTORY_NOT_FOUND",
+                        "message": f"Parent directory does not exist: {parent_directory}",
+                    },
+                }
+
+            if not parent_directory.is_dir():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PARENT_NOT_A_DIRECTORY",
+                        "message": f"Parent path is not a directory: {parent_directory}",
+                    },
+                }
+
+            with open(target_path, "w", encoding="utf-8") as file:
+                file.write(file_content)
+
+            return {
+                "success": True,
+                "data": {
+                    "path": str(target_path),
+                    "bytes_written": len(encoded_content),
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied",
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_file_upload_raw_request(
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Write the Base64-encoded file content to the specified absolute path under the original file name (binary safe).
+
+Difference with /upload: does not rename with UUID, does not limit to the uploads directory, writes directly to the caller
+The given absolute path is for the frontend directory tree 'upload' usage.
+        """
+        import base64
+
+        try:
+            file_path = str(payload.get("path", "")).strip()
+            if not file_path:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_PATH", "message": "Path is required"},
+                }
+
+            target_path = pathlib.Path(file_path)
+            if not target_path.is_absolute():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": "Path must be absolute",
+                    },
+                }
+
+            raw_data = payload.get("data")
+            if not isinstance(raw_data, str) or not raw_data:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_DATA",
+                        "message": "Data must be a non-empty base64 string",
+                    },
+                }
+
+# Compatible with dataURL prefix (data:...;base64,xxxx)
+            if "," in raw_data and raw_data.strip().lower().startswith("data:"):
+                raw_data = raw_data.split(",", 1)[1]
+
+            try:
+                file_bytes = base64.b64decode(raw_data, validate=True)
+            except Exception:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_DATA",
+                        "message": "Data is not valid base64",
+                    },
+                }
+
+            if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "FILE_TOO_LARGE",
+                        "message": "File size exceeds 10MB limit",
+                    },
+                }
+
+            target_path = target_path.resolve(strict=False)
+            overwrite = bool(payload.get("overwrite", True))
+            if not overwrite and target_path.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "ALREADY_EXISTS",
+                        "message": f"Path already exists: {target_path}",
+                    },
+                }
+
+            parent_directory = target_path.parent
+            if not parent_directory.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PARENT_DIRECTORY_NOT_FOUND",
+                        "message": f"Parent directory does not exist: {parent_directory}",
+                    },
+                }
+
+            if not parent_directory.is_dir():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PARENT_NOT_A_DIRECTORY",
+                        "message": f"Parent path is not a directory: {parent_directory}",
+                    },
+                }
+
+            with open(target_path, "wb") as file:
+                file.write(file_bytes)
+
+            return {
+                "success": True,
+                "data": {
+                    "path": str(target_path),
+                    "bytes_written": len(file_bytes),
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_file_create_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            file_path = str(payload.get("path", "")).strip()
+            if not file_path:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": "Path is required",
+                    },
+                }
+
+            target_path = pathlib.Path(file_path)
+            if not target_path.is_absolute():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": "Path must be absolute",
+                    },
+                }
+
+            file_content = payload.get("content", "")
+            if not isinstance(file_content, str):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_CONTENT",
+                        "message": "Content must be a string",
+                    },
+                }
+
+            encoded_content = file_content.encode("utf-8")
+            if len(encoded_content) > MAX_FILE_SIZE_BYTES:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "FILE_TOO_LARGE",
+                        "message": "File size exceeds 10MB limit",
+                    },
+                }
+
+            kind = str(payload.get("kind", "file")).strip() or "file"
+            if kind not in ("file", "directory"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_KIND",
+                        "message": "Kind must be 'file' or 'directory'",
+                    },
+                }
+
+            target_path = target_path.resolve(strict=False)
+            if target_path.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "ALREADY_EXISTS",
+                        "message": f"Path already exists: {target_path}",
+                    },
+                }
+
+            parent_directory = target_path.parent
+            if not parent_directory.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PARENT_DIRECTORY_NOT_FOUND",
+                        "message": f"Parent directory does not exist: {parent_directory}",
+                    },
+                }
+
+            if not parent_directory.is_dir():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PARENT_NOT_A_DIRECTORY",
+                        "message": f"Parent path is not a directory: {parent_directory}",
+                    },
+                }
+
+            if kind == "directory":
+                target_path.mkdir(parents=False, exist_ok=False)
+                bytes_written = 0
+            else:
+                with open(target_path, "x", encoding="utf-8") as file:
+                    file.write(file_content)
+                bytes_written = len(encoded_content)
+
+            return {
+                "success": True,
+                "data": {
+                    "path": str(target_path),
+                    "kind": kind,
+                    "bytes_written": bytes_written,
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {
+                    "code": "PERMISSION_DENIED",
+                    "message": "Permission denied",
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_file_delete_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            file_path = str(payload.get("path", "")).strip()
+            if not file_path:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_PATH", "message": "Path is required"},
+                }
+
+            target_path = pathlib.Path(file_path)
+            if not target_path.is_absolute():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": "Path must be absolute",
+                    },
+                }
+
+            target_path = target_path.resolve(strict=False)
+            if not target_path.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": f"Path does not exist: {target_path}",
+                    },
+                }
+
+            recursive = bool(payload.get("recursive", False))
+            kind = "file"
+            if target_path.is_dir():
+                kind = "directory"
+                if recursive:
+                    shutil.rmtree(target_path)
+                else:
+                    try:
+                        target_path.rmdir()
+                    except OSError:
+                        return {
+                            "success": False,
+                            "error": {
+                                "code": "DIRECTORY_NOT_EMPTY",
+                                "message": f"Directory is not empty: {target_path}",
+                            },
+                        }
+            else:
+                target_path.unlink()
+
+            return {
+                "success": True,
+                "data": {"path": str(target_path), "kind": kind},
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_file_rename_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            old_path = str(payload.get("path", "")).strip()
+            new_path = str(payload.get("new_path", "")).strip()
+            if not old_path or not new_path:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": "Both path and new_path are required",
+                    },
+                }
+
+            source_path = pathlib.Path(old_path)
+            target_path = pathlib.Path(new_path)
+            if not source_path.is_absolute() or not target_path.is_absolute():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PATH",
+                        "message": "Paths must be absolute",
+                    },
+                }
+
+            source_path = source_path.resolve(strict=False)
+            target_path = target_path.resolve(strict=False)
+            if not source_path.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": f"Path does not exist: {source_path}",
+                    },
+                }
+
+            if source_path == target_path:
+                return {
+                    "success": True,
+                    "data": {
+                        "path": str(source_path),
+                        "new_path": str(target_path),
+                        "kind": "directory" if source_path.is_dir() else "file",
+                    },
+                }
+
+            if target_path.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "ALREADY_EXISTS",
+                        "message": f"Path already exists: {target_path}",
+                    },
+                }
+
+            parent_directory = target_path.parent
+            if not parent_directory.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PARENT_DIRECTORY_NOT_FOUND",
+                        "message": f"Parent directory does not exist: {parent_directory}",
+                    },
+                }
+
+            if not parent_directory.is_dir():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "PARENT_NOT_A_DIRECTORY",
+                        "message": f"Parent path is not a directory: {parent_directory}",
+                    },
+                }
+
+            kind = "directory" if source_path.is_dir() else "file"
+            source_path.rename(target_path)
+
+            return {
+                "success": True,
+                "data": {
+                    "path": str(source_path),
+                    "new_path": str(target_path),
+                    "kind": kind,
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+# --- Git Read-Only Interface (View Commit History/Details/Diff/Branches) ---
+    GIT_COMMAND_TIMEOUT_SECONDS = 30
+    GIT_LOG_MAX_LIMIT = 500
+
+    def _resolve_git_repo_path(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Verify and parse the working directory of the git command (must be an existing absolute path directory)."""
+        import pathlib
+
+        raw_path = str(payload.get("path", "")).strip()
+        if not raw_path:
+            return {
+                "success": False,
+                "error": {"code": "INVALID_PATH", "message": "Path is required"},
+            }
+        target_path = pathlib.Path(raw_path).expanduser()
+        if not target_path.is_absolute():
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_PATH",
+                    "message": "Path must be absolute",
+                },
+            }
+        target_path = target_path.resolve()
+        if not target_path.exists():
+            return {
+                "success": False,
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": f"Path does not exist: {raw_path}",
+                },
+            }
+        if not target_path.is_dir():
+            return {
+                "success": False,
+                "error": {
+                    "code": "NOT_A_DIRECTORY",
+                    "message": f"Path is not a directory: {raw_path}",
+                },
+            }
+        return {"success": True, "data": {"path": target_path}}
+
+    def _run_git(args: List[str], repo_path: "pathlib.Path") -> Dict[str, Any]:
+        """Execute git commands non-interactively in the specified directory, handling exceptions and errors uniformly."""
+        import subprocess
+
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=GIT_COMMAND_TIMEOUT_SECONDS,
+            )
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "error": {
+                    "code": "GIT_NOT_AVAILABLE",
+                    "message": "git executable not found",
+                },
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "error": {
+                    "code": "GIT_TIMEOUT",
+                    "message": "git command timed out",
+                },
+            }
+        except Exception as e:  # noqa: BLE001
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+        if completed.returncode != 0:
+            stderr = (completed.stderr or "").strip()
+            if "not a git repository" in stderr.lower():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_A_GIT_REPO",
+                        "message": stderr or "Not a git repository",
+                    },
+                }
+            return {
+                "success": False,
+                "error": {
+                    "code": "GIT_COMMAND_FAILED",
+                    "message": stderr or "git command failed",
+                },
+            }
+        return {"success": True, "data": {"stdout": completed.stdout or ""}}
+
+    async def _handle_git_log_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Get the submission history list (including parents/author/time/refs)."""
+        try:
+            resolved = _resolve_git_repo_path(payload)
+            if not resolved.get("success"):
+                return resolved
+            repo_path = resolved["data"]["path"]
+
+            try:
+                limit = int(payload.get("limit", 100))
+            except (TypeError, ValueError):
+                limit = 100
+            limit = max(1, min(limit, GIT_LOG_MAX_LIMIT))
+            try:
+                skip = int(payload.get("skip", 0))
+            except (TypeError, ValueError):
+                skip = 0
+            skip = max(0, skip)
+
+# Take one more to determine if there are more
+# %b is the body of the commit (excluding the first line subject), for front-end display/copying of the complete commit information.
+# Use %x1e (record separator) to separate each submission to prevent line breaks in multi-line bodies from breaking the record structure.
+            fmt = "%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%D%x1f%b%x1e"
+            result = _run_git(
+                [
+                    "log",
+                    f"--pretty=format:{fmt}",
+                    f"--skip={skip}",
+                    "-n",
+                    str(limit + 1),
+                ],
+                repo_path,
+            )
+            if not result.get("success"):
+                return result
+
+            raw = result["data"]["stdout"]
+# Each record ends with %x1e, and git will add a newline between records, so strip the leading and trailing whitespace of the record
+            records = [rec.strip() for rec in raw.split("\x1e") if rec.strip()]
+            has_more = len(records) > limit
+            records = records[:limit]
+
+# Only count the actual total submissions on the homepage (skip==0), for displaying the real number on the frontend
+            total = None
+            if skip == 0:
+                count_result = _run_git(["rev-list", "--count", "HEAD"], repo_path)
+                if count_result.get("success"):
+                    try:
+                        total = int(count_result["data"]["stdout"].strip())
+                    except (TypeError, ValueError):
+                        total = None
+
+            commits = []
+            for record in records:
+                parts = record.split("\x1f")
+                while len(parts) < 8:
+                    parts.append("")
+                refs_raw = parts[6].strip()
+                refs = [r.strip() for r in refs_raw.split(",") if r.strip()]
+                commits.append(
+                    {
+                        "hash": parts[0],
+                        "parents": [p for p in parts[1].split() if p],
+                        "author": parts[2],
+                        "email": parts[3],
+                        "date": parts[4],
+                        "subject": parts[5],
+                        "refs": refs,
+                        "body": parts[7].strip(),
+                    }
+                )
+
+            return {
+                "success": True,
+                "data": {"commits": commits, "has_more": has_more, "total": total},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[GIT] git log failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_git_commit_detail_request(
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Get the metadata and list of file changes for a specific commit (including statistics of additions and deletions)."""
+        try:
+            resolved = _resolve_git_repo_path(payload)
+            if not resolved.get("success"):
+                return resolved
+            repo_path = resolved["data"]["path"]
+
+            commit_hash = str(payload.get("hash", "")).strip()
+            if not commit_hash:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_HASH", "message": "Hash is required"},
+                }
+
+            fmt = "%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s"
+            result = _run_git(
+                [
+                    "show",
+                    "--numstat",
+                    f"--pretty=format:{fmt}",
+                    "--no-renames",
+                    commit_hash,
+                ],
+                repo_path,
+            )
+            if not result.get("success"):
+                return result
+
+            raw = result["data"]["stdout"]
+            lines = raw.split("\n")
+            if not lines:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "COMMIT_NOT_FOUND",
+                        "message": f"Commit not found: {commit_hash}",
+                    },
+                }
+
+            header_parts = lines[0].split("\x1f")
+            while len(header_parts) < 6:
+                header_parts.append("")
+            commit = {
+                "hash": header_parts[0],
+                "parents": [p for p in header_parts[1].split() if p],
+                "author": header_parts[2],
+                "email": header_parts[3],
+                "date": header_parts[4],
+                "subject": header_parts[5],
+            }
+
+            files = []
+            for line in lines[1:]:
+                if not line.strip():
+                    continue
+                fields = line.split("\t")
+                if len(fields) < 3:
+                    continue
+                additions_raw, deletions_raw, file_path = (
+                    fields[0],
+                    fields[1],
+                    "\t".join(fields[2:]),
+                )
+                is_binary = additions_raw == "-" or deletions_raw == "-"
+                try:
+                    additions = 0 if is_binary else int(additions_raw)
+                    deletions = 0 if is_binary else int(deletions_raw)
+                except ValueError:
+                    additions, deletions, is_binary = 0, 0, True
+                files.append(
+                    {
+                        "path": file_path,
+                        "additions": additions,
+                        "deletions": deletions,
+                        "binary": is_binary,
+                    }
+                )
+
+            return {
+                "success": True,
+                "data": {"commit": commit, "files": files},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[GIT] git commit-detail failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_git_diff_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Get the diff text of a certain file in a certain commit."""
+        try:
+            resolved = _resolve_git_repo_path(payload)
+            if not resolved.get("success"):
+                return resolved
+            repo_path = resolved["data"]["path"]
+
+            commit_hash = str(payload.get("hash", "")).strip()
+            if not commit_hash:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_HASH", "message": "Hash is required"},
+                }
+            file_path = str(payload.get("file", "")).strip()
+            if not file_path:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_FILE", "message": "File is required"},
+                }
+
+            result = _run_git(
+                [
+                    "show",
+                    "--no-renames",
+                    "--format=",
+                    commit_hash,
+                    "--",
+                    file_path,
+                ],
+                repo_path,
+            )
+            if not result.get("success"):
+                return result
+
+# Do not truncate: Return the full diff text (truncated is always False, retain the field for frontend compatibility)
+            return {
+                "success": True,
+                "data": {"diff": result["data"]["stdout"], "truncated": False},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[GIT] git diff failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_git_patch_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a patch for one or more selected commits (read-only).
+
+A single commit returns the .patch text generated by format-patch;
+Package each commit's patch from multiple commits into a .tar.gz (in memory) and return it as base64.
+        """
+        import base64
+        import io
+        import re
+        import tarfile
+
+        try:
+            resolved = _resolve_git_repo_path(payload)
+            if not resolved.get("success"):
+                return resolved
+            repo_path = resolved["data"]["path"]
+
+            raw_commits = payload.get("commits")
+            if not isinstance(raw_commits, list) or not raw_commits:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_COMMITS",
+                        "message": "commits must be a non-empty list",
+                    },
+                }
+            commits = [str(c).strip() for c in raw_commits if str(c).strip()]
+            if not commits:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_COMMITS",
+                        "message": "commits must be a non-empty list",
+                    },
+                }
+
+# Generate patch text one by one (format-patch -1 <hash> --stdout)
+            patches = []  # [(filename, content)]
+            for index, commit_hash in enumerate(commits):
+                result = _run_git(
+                    ["format-patch", "-1", commit_hash, "--stdout"],
+                    repo_path,
+                )
+                if not result.get("success"):
+                    return result
+                patch_text = result["data"]["stdout"]
+                if not patch_text.strip():
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "COMMIT_NOT_FOUND",
+                            "message": f"Commit not found or has no patch: {commit_hash}",
+                        },
+                    }
+# Extract the subject from the patch's From line as the filename (remove the [PATCH] prefix and number)
+                subject = ""
+                for line in patch_text.splitlines():
+                    if line.startswith("Subject:"):
+                        subject = line[len("Subject:") :].strip()
+                        break
+                # Normalize filename: remove [PATCH n/m] prefix, invalid characters, take first 60 chars
+                clean = re.sub(r"^\[PATCH[^\]]*\]\s*", "", subject)
+                clean = re.sub(r"[^\w\u4e00-\u9fff.-]+", "-", clean).strip("-")
+                clean = clean[:60].strip("-") or "commit"
+                filename = f"{index + 1:04d}-{clean}.patch"
+                patches.append((filename, patch_text))
+
+            if len(patches) == 1:
+                filename, content = patches[0]
+                return {
+                    "success": True,
+                    "data": {
+                        "format": "patch",
+                        "filename": filename,
+                        "content": content,
+                    },
+                }
+
+            # Multiple commits: package as tar.gz (in-memory), return as base64
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+                for filename, content in patches:
+                    data = content.encode("utf-8")
+                    info = tarfile.TarInfo(name=filename)
+                    info.size = len(data)
+                    info.mtime = 0
+                    tar.addfile(info, io.BytesIO(data))
+            encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return {
+                "success": True,
+                "data": {
+                    "format": "tar.gz",
+                    "filename": "commits-patches.tar.gz",
+                    "content_base64": encoded,
+                },
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[GIT] git patch failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_git_file_content_request(
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Get full content of a file at specified commit (or revision) (read-only).
+
+        Used for frontend to display "full file + absolute line numbers" diff:
+        - if ref is commit hash, return full content of that commit version (new version)
+        - if ref is revision like "<hash>^", return full content of that version (old version)
+        """
+        try:
+            resolved = _resolve_git_repo_path(payload)
+            if not resolved.get("success"):
+                return resolved
+            repo_path = resolved["data"]["path"]
+
+            revision = str(payload.get("ref", "")).strip()
+            if not revision:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_REF", "message": "Ref is required"},
+                }
+            file_path = str(payload.get("file", "")).strip()
+            if not file_path:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_FILE", "message": "File is required"},
+                }
+            # `git show <rev>:<path>` does not support `--` separator, so do basic protection for path,
+            # to avoid paths starting with '-' being parsed as options.
+            if file_path.startswith("-"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_FILE",
+                        "message": "File path must not start with '-'",
+                    },
+                }
+
+            result = _run_git(["show", f"{revision}:{file_path}"], repo_path)
+            if not result.get("success"):
+                error = result.get("error") or {}
+                # File not existing in this version (e.g. parent of newly added file) is normal case,
+                # normalize as NOT_FOUND so frontend can treat as "empty file".
+                if error.get("code") == "GIT_COMMAND_FAILED":
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NOT_FOUND",
+                            "message": error.get("message")
+                            or "File not found at given revision",
+                        },
+                    }
+                return result
+
+            # No truncation: return full file content (truncated always False, keep field for frontend compatibility)
+            return {
+                "success": True,
+                "data": {"content": result["data"]["stdout"], "truncated": False},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[GIT] git file-content failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_git_branches_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Get local/remote branches and tags list, and current branch."""
+        try:
+            resolved = _resolve_git_repo_path(payload)
+            if not resolved.get("success"):
+                return resolved
+            repo_path = resolved["data"]["path"]
+
+            branch_result = _run_git(
+                [
+                    "for-each-ref",
+                    "--format=%(refname:short)%00%(objectname:short)",
+                    "refs/heads",
+                    "refs/remotes",
+                ],
+                repo_path,
+            )
+            if not branch_result.get("success"):
+                return branch_result
+
+            branches = []
+            for line in branch_result["data"]["stdout"].split("\n"):
+                if not line.strip():
+                    continue
+                # git --format only supports few escapes like %00, so use NUL as field separator
+                parts = line.split("\x00")
+                name = parts[0].strip()
+                short_hash = parts[1].strip() if len(parts) > 1 else ""
+                if not name:
+                    continue
+                is_remote = name.startswith("remotes/") or name.startswith("origin/")
+                branches.append({"name": name, "hash": short_hash, "remote": is_remote})
+
+            tag_result = _run_git(["tag", "--format=%(refname:short)"], repo_path)
+            tags = []
+            if tag_result.get("success"):
+                tags = [
+                    {"name": t.strip()}
+                    for t in tag_result["data"]["stdout"].split("\n")
+                    if t.strip()
+                ]
+
+            current = ""
+            head_result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
+            if head_result.get("success"):
+                current = head_result["data"]["stdout"].strip()
+
+            return {
+                "success": True,
+                "data": {"current": current, "branches": branches, "tags": tags},
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("[GIT] git branches failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    async def _handle_directories_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+        import pathlib
+
+        try:
+            path = str(payload.get("path", ""))
+            if not path or path == "~":
+                target_path = pathlib.Path.home()
+            else:
+                target_path = pathlib.Path(path).expanduser()
+
+            target_path = target_path.resolve()
+
+            if not target_path.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": f"Path does not exist: {path}",
+                    },
+                }
+
+            if not target_path.is_dir():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_A_DIRECTORY",
+                        "message": f"Path is not a directory: {path}",
+                    },
+                }
+
+            parent_path = None
+            if target_path.parent != target_path:
+                parent_path = str(target_path.parent)
+
+            items = []
+            try:
+                for entry in target_path.iterdir():
+                    entry_type = "directory" if entry.is_dir() else "file"
+                    items.append(
+                        {
+                            "name": entry.name,
+                            "path": str(entry),
+                            "type": entry_type,
+                        }
+                    )
+                items.sort(key=lambda x: (x["type"] != "directory", x["name"]))
+            except PermissionError:
+                pass
+
+            return {
+                "success": True,
+                "data": {
+                    "current_path": str(target_path),
+                    "parent_path": parent_path,
+                    "items": items,
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            }
+        except Exception as e:
+            logger.exception("[DIRECTORIES] list_directories failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+
+    async def _handle_parse_orchestration_request(
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Read and parse orchestration YAML file, return agents list from config.
+
+        For frontend "orchestration" feature: after user selects orchestration file, read its content and parse
+        agents list; frontend auto-fills form based on this. Only read and parse, no Agent creation.
+        """
+        import pathlib
+
+        try:
+            path = str(payload.get("path", "")).strip()
+            if not path:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_PATH", "message": "path is required"},
+                }
+
+            target_path = pathlib.Path(path).expanduser().resolve()
+            if not target_path.exists():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": f"File does not exist: {path}",
+                    },
+                }
+            if not target_path.is_file():
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "NOT_A_FILE",
+                        "message": f"Path is not a file: {path}",
+                    },
+                }
+
+            # Size limit: orchestration file should be much smaller than this to avoid misreading large files
+            max_size = 5 * 1024 * 1024
+            if target_path.stat().st_size > max_size:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "FILE_TOO_LARGE",
+                        "message": f"File exceeds {max_size} bytes",
+                    },
+                }
+
+            try:
+                from haijunbot.haijunbot_tools.orchestration_loader import load_orchestration
+
+                config = load_orchestration(target_path)
+            except ValueError as e:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "ORCHESTRATION_PARSE_ERROR",
+                        "message": f"Invalid orchestration file: {e}",
+                    },
+                }
+            except Exception as e:  # pylint: disable=broad-except
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "ORCHESTRATION_PARSE_ERROR",
+                        "message": f"Invalid orchestration file: {e}",
+                    },
+                }
+
+            if not isinstance(config, dict):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_ORCHESTRATION",
+                        "message": "Orchestration file must be a mapping",
+                    },
+                }
+
+            agents = config.get("agents")
+            if agents is None:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_ORCHESTRATION",
+                        "message": "Missing 'agents' field in orchestration file",
+                    },
+                }
+            if not isinstance(agents, list):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_ORCHESTRATION",
+                        "message": "'agents' field must be a list",
+                    },
+                }
+
+            # has_flow: whether orchestration file contains non-empty flow field (for frontend to decide run pipeline or create Agent)
+            flow = config.get("flow")
+            has_flow = isinstance(flow, list) and len(flow) > 0
+
+            # DAG nodes for preview: reuse pipeline_runner's DAG building logic to ensure consistency with actual execution.
+            # Return empty array if no flow or build fails (frontend prompts based on this, doesn't block parsing agents).
+            nodes: list = []
+            if has_flow:
+                try:
+                    from haijunbot.haijunbot_tools.pipeline_runner import PipelineRunnerTool
+
+                    agents_by_name = {a.get("name"): a for a in agents if a.get("name")}
+                    default_on_error = str(
+                        config.get("default_on_error") or "abort"
+                    ).strip()
+                    dag = PipelineRunnerTool()._build_dag(
+                        flow, agents_by_name, default_on_error
+                    )
+                    if dag.get("success"):
+                        nodes = dag.get("nodes", [])
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception("[ORCHESTRATION] build dag for preview failed")
+                    nodes = []
+
+            return {
+                "success": True,
+                "data": {
+                    "path": str(target_path),
+                    "agents": agents,
+                    "has_flow": has_flow,
+                    "nodes": nodes,
+                },
+            }
+        except PermissionError:
+            return {
+                "success": False,
+                "error": {"code": "PERMISSION_DENIED", "message": "Permission denied"},
+            }
+        except Exception as e:
+            logger.exception("[ORCHESTRATION] parse failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+
+    def _start_pipeline_run(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Run pipeline in background thread by calling pipeline_runner tool (same path as Agent calls).
+
+        For frontend "run pipeline" entry: directly reuse built-in tool PipelineRunnerTool,
+        so it goes through same execution path and event bus as Agent manually calling pipeline_runner,
+        run progress broadcast to frontend via _pipeline_event_pump to drive DAG visualization.
+
+        PipelineRunnerTool.execute is blocking (runs full DAG synchronously), so put in background
+        thread; this function returns immediately. Actual pipeline_id is generated internally by execute and
+        broadcast with pipeline_start event; frontend uses pipeline_id from event.
+        """
+        import threading
+
+        orchestration_file = str(payload.get("orchestration_file") or "").strip()
+        working_dir = str(payload.get("working_dir") or "").strip() or "."
+        if not orchestration_file:
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_ARGUMENT",
+                    "message": "orchestration_file is required",
+                },
+            }
+        try:
+            from haijunbot.haijunbot_tools.pipeline_runner import PipelineRunnerTool
+
+            tool = PipelineRunnerTool()
+            args: Dict[str, Any] = {
+                "orchestration_file": orchestration_file,
+                "working_dir": working_dir,
+                "approve": bool(payload.get("approve", False)),
+                "dry_run": bool(payload.get("dry_run", False)),
+            }
+            if payload.get("max_workers") is not None:
+                args["max_workers"] = int(payload.get("max_workers"))
+        except Exception as e:  # pylint: disable=broad-except
+            logger.exception("[ORCHESTRATION] prepare pipeline run failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+
+        def _run() -> None:
+            try:
+                result = tool.execute(args)
+                if isinstance(result, dict) and not result.get("success", True):
+                    logger.warning(
+                        "[ORCHESTRATION] pipeline run finished with error: %r",
+                        result.get("error"),
+                    )
+            except Exception as e:  # pylint: disable=broad-except
+                logger.exception("[ORCHESTRATION] pipeline run failed: %r", e)
+
+        threading.Thread(
+            target=_run,
+            name="pipeline-run",
+            daemon=True,
+        ).start()
+        return {"success": True, "data": {"started": True}}
+
+    async def _handle_plugin_orchestrations_request() -> Dict[str, Any]:
+        """List all orchestration pipeline templates declared by plugins on current node.
+
+        For frontend "orchestration" feature: users do not need to manually input orchestration file path, can directly select from
+        orchestration templates declared by plugins. Read config.yaml in plugin dirs on this node,
+        render {{plugin_dir}} then extract orchestration declarations.
+        """
+        try:
+            from haijunbot.haijunbot_agent.utils import list_plugin_orchestrations
+
+            orchestrations = list_plugin_orchestrations()
+            local_node_id = _node_runtime.local_node_id if _node_runtime else "master"
+            return {
+                "success": True,
+                "data": {
+                    "node_id": local_node_id,
+                    "orchestrations": orchestrations,
+                },
+            }
+        except Exception as e:
+            logger.exception("[PLUGIN] list orchestrations failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+
+    async def _handle_plugin_manage_dispatch(
+        method: str, path: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Node-level plugin management distribution (list/install/uninstall/upgrade).
+
+        For node HTTP proxy (/api/node/{node_id}/plugins...) to execute locally on target node,
+        so child nodes can also manage their own plugins. Permission admin:plugins is checked by master before forwarding,
+        child nodes trust master's decision, no duplicate check.
+        """
+        from haijunbot.haijunbot_agent.utils import (
+            install_plugin,
+            list_plugins_info,
+            uninstall_plugin,
+            upgrade_plugin,
+        )
+        from haijunbot.haijunbot_utils.output import OutputSink, PrettyOutput
+
+        captured: list[str] = []
+
+        class _CaptureSink(OutputSink):
+            def emit(self, event: Any) -> None:  # pragma: no cover - simple collection
+                if getattr(event, "text", None):
+                    captured.append(event.text)
+
+        sink = _CaptureSink()
+        PrettyOutput.add_sink(sink)
+        try:
+            normalized_path = "/" + str(path or "").lstrip("/")
+            local_node_id = _node_runtime.local_node_id if _node_runtime else "master"
+            if method == "GET" and normalized_path == "/plugins":
+                plugins = list_plugins_info()
+                return {
+                    "success": True,
+                    "data": {
+                        "node_id": local_node_id,
+                        "plugins": plugins,
+                        "output": captured,
+                    },
+                }
+            if method == "POST" and normalized_path == "/plugins/install":
+                source = str(payload.get("source") or "")
+                force = bool(payload.get("force", False))
+                ok = install_plugin(source, force=force)
+                return {
+                    "success": bool(ok),
+                    "data": {"node_id": local_node_id, "output": captured},
+                }
+            if method == "POST" and normalized_path.startswith("/plugins/"):
+                rest = normalized_path[len("/plugins/") :].strip("/")
+                if rest.endswith("/uninstall"):
+                    name = rest[: -len("/uninstall")].strip("/")
+                    ok = uninstall_plugin(name)
+                    return {
+                        "success": bool(ok),
+                        "data": {"node_id": local_node_id, "output": captured},
+                    }
+                if rest.endswith("/upgrade"):
+                    name = rest[: -len("/upgrade")].strip("/")
+                    ok = upgrade_plugin(name)
+                    return {
+                        "success": bool(ok),
+                        "data": {"node_id": local_node_id, "output": captured},
+                    }
+            return {
+                "success": False,
+                "error": {
+                    "code": "INVALID_ACTION",
+                    "message": f"unsupported plugin manage path: {method} {path}",
+                },
+            }
+        except Exception as e:
+            logger.exception("[PLUGIN] manage dispatch failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+        finally:
+            PrettyOutput.remove_sink(sink)
+
+    def _check_permission(
+        user_info: Optional[Dict[str, Any]], permission: str
+    ) -> Optional[Dict[str, Any]]:
+        """Check general operation permission (following _check_file_permission pattern).
+
+        Return None if passed; otherwise return 403 error response dict.
+        system user passes directly; admin user handled internally by permission_manager.check_permission.
+        """
+        user_id = user_info.get("user_id", "") if user_info else ""
+        if user_id and user_id != "system":
+            if not permission_manager.check_permission(user_id, permission):
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "headers": {"content-type": "application/json"},
+                    "body": json.dumps({"error": f"Permission denied: {permission}"}),
+                }
+        return None
+
+    def _check_file_permission(
+        user_info: Optional[Dict[str, Any]], permission: str
+    ) -> Optional[Dict[str, Any]]:
+        """Check file/data operation permission (following /upload pattern).
+
+        Return None if passed; otherwise return 403 error response dict.
+        system user passes directly; admin user handled internally by permission_manager.check_permission.
+        """
+        user_id = user_info.get("user_id", "") if user_info else ""
+        if user_id and user_id != "system":
+            if not permission_manager.check_permission(user_id, permission):
+                return {
+                    "success": False,
+                    "status_code": 403,
+                    "headers": {"content-type": "application/json"},
+                    "body": json.dumps({"error": f"Permission denied: {permission}"}),
+                }
+        return None
+
+    async def _dispatch_node_http_request(
+        method: str,
+        path: str,
+        query: str,
+        headers: Dict[str, Any],
+        body: str,
+        user_info: Optional[Dict[str, Any]] = None,
+        trusted_proxy: bool = False,
+    ) -> Dict[str, Any]:
+        normalized_method = str(method or "GET").upper()
+        normalized_path = "/" + str(path or "").lstrip("/")
+        if normalized_path.startswith("/api/"):
+            normalized_path = "/" + normalized_path[len("/api/") :].lstrip("/")
+
+        # Construct mock Request, pass user_info to API functions that need request param
+        # Note: Request.state is read-only property (no setter), cannot assign directly,
+        # must inject via internal _state attr, otherwise AttributeError.
+        from starlette.datastructures import State as _State
+
+        class _MockRequest(Request):
+            pass
+
+        _mock_req = _MockRequest.__new__(_MockRequest)
+        _mock_req.scope = {"type": "http", "state": {}}
+        _mock_req._state = _State(
+            {"user_info": user_info, "trusted_proxy": trusted_proxy}
+        )
+        # If no user_info, try to parse JWT from headers
+        if user_info is None:
+            auth_header = headers.get("authorization", headers.get("Authorization", ""))
+            if auth_header and auth_header.startswith("Bearer "):
+                try:
+                    from haijunbot.haijunbot_web_gateway.jwt_utils import validate_jwt_token
+
+                    token = auth_header[7:]
+                    token_payload = validate_jwt_token(token)
+                    if token_payload:
+                        _mock_req._state.user_info = token_payload
+                except Exception:
+                    pass
+
+        payload: Dict[str, Any] = {}
+        if normalized_method == "GET":
+            params = dict(parse_qsl(query, keep_blank_values=True))
+            payload.update(params)
+        elif body:
+            try:
+                parsed_body = json.loads(body)
+                if isinstance(parsed_body, dict):
+                    payload = parsed_body
+                else:
+                    return {
+                        "success": False,
+                        "status_code": 400,
+                        "headers": {"content-type": "application/json"},
+                        "body": json.dumps(
+                            {"error": "request body must be a JSON object"}
+                        ),
+                    }
+            except json.JSONDecodeError:
+                return {
+                    "success": False,
+                    "status_code": 400,
+                    "headers": {"content-type": "application/json"},
+                    "body": json.dumps({"error": "invalid JSON body"}),
+                }
+
+        # --- File/data operation permission check (master checks uniformly, following /upload pattern) ---
+        # Child nodes have no local auth data, cannot determine independently; cross-node request perms already checked by master
+        # before forwarding, so child nodes trust master's decision, no duplicate check.
+        _file_perm_map = {
+            "/file-content": "file:read",
+            "/file-stat": "file:read",
+            "/file-write": "file:write",
+            "/file-upload": "file:upload",
+            "/file-create": "file:write",
+            "/file-delete": "file:write",
+            "/file-rename": "file:write",
+            "/directories": "file:read",
+            "/parse-orchestration": "file:read",
+            "/run-orchestration": "file:read",
+            "/plugins/orchestrations": "file:read",
+            "/git/log": "file:read",
+            "/git/commit-detail": "file:read",
+            "/git/diff": "file:read",
+            "/git/branches": "file:read",
+            "/git/file-content": "file:read",
+            "/git/patch": "file:read",
+        }
+        _required_perm = _file_perm_map.get(normalized_path)
+        if normalized_path.startswith("/data/"):
+            _required_perm = (
+                "file:write" if normalized_method in ("POST", "DELETE") else "file:read"
+            )
+        if node_config.is_master and _required_perm:
+            _perm_resp = _check_file_permission(
+                _mock_req.state.user_info, _required_perm
+            )
+            if _perm_resp:
+                return _perm_resp
+
+        if normalized_method == "GET" and normalized_path == "/directories":
+            result = await _handle_directories_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/parse-orchestration":
+            result = await _handle_parse_orchestration_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/run-orchestration":
+            result = _start_pipeline_run(payload)
+        elif (
+            normalized_method == "GET" and normalized_path == "/plugins/orchestrations"
+        ):
+            result = await _handle_plugin_orchestrations_request()
+        elif (
+            normalized_path == "/plugins"
+            or normalized_path == "/plugins/install"
+            or normalized_path.startswith("/plugins/")
+        ):
+            # Plugin management: master checks admin:plugins uniformly, child nodes trust master
+            if node_config.is_master:
+                _plugin_perm_resp = _check_permission(
+                    _mock_req.state.user_info, "admin:plugins"
+                )
+                if _plugin_perm_resp:
+                    return _plugin_perm_resp
+            result = await _handle_plugin_manage_dispatch(
+                normalized_method, normalized_path, payload
+            )
+        elif normalized_method == "POST" and normalized_path == "/file-content":
+            result = await _handle_file_content_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/file-stat":
+            result = await _handle_file_stat_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/file-write":
+            result = await _handle_file_write_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/file-upload":
+            result = await _handle_file_upload_raw_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/file-create":
+            result = await _handle_file_create_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/file-delete":
+            result = await _handle_file_delete_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/file-rename":
+            result = await _handle_file_rename_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/git/log":
+            result = await _handle_git_log_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/git/commit-detail":
+            result = await _handle_git_commit_detail_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/git/diff":
+            result = await _handle_git_diff_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/git/branches":
+            result = await _handle_git_branches_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/git/file-content":
+            result = await _handle_git_file_content_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/git/patch":
+            result = await _handle_git_patch_request(payload)
+        elif normalized_method == "POST" and normalized_path == "/upload":
+            # Permission check: file:upload
+            # Node access check: only on master.
+            # Child nodes have no local auth data (perms not synced), cannot determine independently;
+            # cross-node request perms already checked by master before forwarding,
+            # so child nodes trust master's decision, no duplicate check.
+            if node_config.is_master:
+                _upload_user_info = getattr(_mock_req.state, "user_info", None)
+                _upload_user_id = (
+                    _upload_user_info.get("user_id", "") if _upload_user_info else ""
+                )
+                if _upload_user_id and _upload_user_id != "system":
+                    if not permission_manager.check_permission(
+                        _upload_user_id, "file:upload"
+                    ):
+                        return {
+                            "success": False,
+                            "status_code": 403,
+                            "headers": {"content-type": "application/json"},
+                            "body": json.dumps(
+                                {"error": "Permission denied: file:upload"}
+                            ),
+                        }
+            result = await _handle_file_upload(payload)
+        elif normalized_method == "POST" and normalized_path == "/file-transfer/upload":
+            # Direct file upload (chunked): same perms as /upload, checked uniformly by master
+            if node_config.is_master:
+                _xfer_user_info = getattr(_mock_req.state, "user_info", None)
+                _xfer_user_id = (
+                    _xfer_user_info.get("user_id", "") if _xfer_user_info else ""
+                )
+                if _xfer_user_id and _xfer_user_id != "system":
+                    if not permission_manager.check_permission(
+                        _xfer_user_id, "file:upload"
+                    ):
+                        return {
+                            "success": False,
+                            "status_code": 403,
+                            "headers": {"content-type": "application/json"},
+                            "body": json.dumps(
+                                {"error": "Permission denied: file:upload"}
+                            ),
+                        }
+            result = await _handle_file_transfer_upload(payload)
+        elif (
+            normalized_method == "POST" and normalized_path == "/file-transfer/download"
+        ):
+            # Direct file download (chunked): read perm same as file-content, checked uniformly by master
+            if node_config.is_master:
+                _xfer_dl_user_info = getattr(_mock_req.state, "user_info", None)
+                _xfer_dl_user_id = (
+                    _xfer_dl_user_info.get("user_id", "") if _xfer_dl_user_info else ""
+                )
+                if _xfer_dl_user_id and _xfer_dl_user_id != "system":
+                    if not permission_manager.check_permission(
+                        _xfer_dl_user_id, "file:upload"
+                    ):
+                        return {
+                            "success": False,
+                            "status_code": 403,
+                            "headers": {"content-type": "application/json"},
+                            "body": json.dumps(
+                                {"error": "Permission denied: file:upload"}
+                            ),
+                        }
+            result = await _handle_file_transfer_download(payload)
+        elif normalized_path.startswith("/data/"):
+            from haijunbot.haijunbot_web_gateway.data_storage import (
+                save_data,
+                load_data,
+                delete_data,
+            )
+
+            key = normalized_path[len("/data/") :]
+            if normalized_method == "POST":
+                # If payload contains data field, extract data field value for storage
+                data_to_save = payload.get("data", payload)
+                success, error = save_data(key, data_to_save)
+                if success:
+                    result = {"success": True, "message": "Data saved successfully"}
+                else:
+                    result = {"success": False, "error": error}
+            elif normalized_method == "GET":
+                success, data, error = load_data(key)
+                if success:
+                    result = {"success": True, "data": data}
+                else:
+                    result = {"success": False, "error": error}
+            elif normalized_method == "DELETE":
+                success, error = delete_data(key)
+                if success:
+                    result = {"success": True, "message": "Data deleted successfully"}
+                else:
+                    result = {"success": False, "error": error}
+            else:
+                result = {"success": False, "error": "Method not allowed"}
+        elif normalized_method == "GET" and normalized_path == "/node/status":
+            result = await get_node_status()
+        elif normalized_method == "POST" and normalized_path == "/service/restart":
+            result = await restart_service(payload, _mock_req)
+        elif normalized_method == "GET" and normalized_path == "/agents":
+            result = await get_agents(_mock_req)
+        elif normalized_method == "POST" and normalized_path == "/agents":
+            result = await create_agent(payload, _mock_req)
+        elif normalized_path.startswith("/agents/") and normalized_path.endswith(
+            "/sessions"
+        ):
+            agent_id = normalized_path[len("/agents/") : -len("/sessions")].strip("/")
+            if normalized_method == "GET":
+                result = await list_agent_sessions(
+                    agent_id, _mock_req, str(payload.get("node_id") or "")
+                )
+            elif normalized_method == "POST":
+                result = await restore_agent_session(agent_id, payload, _mock_req)
+            else:
+                result = {
+                    "success": False,
+                    "error": {
+                        "code": "METHOD_NOT_ALLOWED",
+                        "message": "Unsupported method",
+                    },
+                }
+        elif (
+            normalized_path.startswith("/agents/")
+            and normalized_path.endswith("/access")
+            and normalized_method == "PUT"
+        ):
+            agent_id = normalized_path[len("/agents/") : -len("/access")].strip("/")
+            result = await update_agent_access(agent_id, payload, _mock_req)
+        elif (
+            normalized_path.startswith("/agents/")
+            and normalized_path.endswith("/stop")
+            and normalized_method == "DELETE"
+        ):
+            agent_id = normalized_path[len("/agents/") : -len("/stop")].strip("/")
+            result = await stop_agent(agent_id, _mock_req)
+        elif normalized_path.startswith("/completions/") and normalized_path.endswith(
+            "/search"
+        ):
+            agent_id = normalized_path[len("/completions/") : -len("/search")].strip(
+                "/"
+            )
+            result = await search_completions(
+                agent_id,
+                query=str(payload.get("query") or ""),
+                node_id=str(payload.get("node_id") or ""),
+            )
+        elif normalized_path.startswith("/completions/"):
+            agent_id = normalized_path[len("/completions/") :].strip("/")
+            result = await get_completions(agent_id, str(payload.get("node_id") or ""))
+        elif (
+            normalized_path.startswith("/global-search/")
+            and normalized_method == "POST"
+        ):
+            agent_id = normalized_path[len("/global-search/") :].strip("/")
+            result = await global_search(agent_id, payload)
+        elif (
+            normalized_path.startswith("/file-search/") and normalized_method == "POST"
+        ):
+            agent_id = normalized_path[len("/file-search/") :].strip("/")
+            result = await file_search(agent_id, payload)
+        elif normalized_method == "GET" and normalized_path == "/model-groups":
+            result = await get_model_groups()
+        elif normalized_path.startswith("/agents/") and "/" not in normalized_path[
+            len("/agents/") :
+        ].strip("/"):
+            agent_id = normalized_path[len("/agents/") :].strip("/")
+            if normalized_method == "DELETE":
+                result = await delete_agent(
+                    agent_id, _mock_req, str(payload.get("node_id") or "")
+                )
+            elif normalized_method == "PATCH":
+                result = await patch_agent(agent_id, payload, _mock_req)
+            else:
+                result = {
+                    "success": False,
+                    "error": {
+                        "code": "METHOD_NOT_ALLOWED",
+                        "message": "Unsupported method",
+                    },
+                }
+        elif (
+            normalized_path.startswith("/agents/")
+            and normalized_path.endswith("/regenerate")
+            and normalized_method == "POST"
+        ):
+            agent_id = normalized_path[len("/agents/") : -len("/regenerate")].strip("/")
+            result = await regenerate_agent(
+                agent_id, _mock_req, str(payload.get("node_id") or "")
+            )
+        elif normalized_path.startswith("/http_proxy/"):
+            # Remote node HTTP proxy: forward requests to external API
+            # Path format: /http_proxy/{target_url}
+            target_url = normalized_path[len("/http_proxy/") :]
+            logger.info(
+                f"[REMOTE HTTP PROXY] received proxy request: target_url={target_url}, method={normalized_method}, query={query}"
+            )
+            if not target_url.startswith(("http://", "https://")):
+                logger.error(f"[REMOTE HTTP PROXY] invalid URL format: {target_url}")
+                return {
+                    "success": False,
+                    "status_code": 400,
+                    "headers": {"content-type": "application/json"},
+                    "body": json.dumps(
+                        {"error": "URL must start with http:// or https://"}
+                    ),
+                }
+            safe, safe_msg = _is_safe_proxy_url(target_url)
+            if not safe:
+                logger.error(
+                    f"[REMOTE HTTP PROXY] target URL not safe: {target_url} ({safe_msg})"
+                )
+                return {
+                    "success": False,
+                    "status_code": 400,
+                    "headers": {"content-type": "application/json"},
+                    "body": json.dumps(
+                        {"error": f"Proxying to this URL is not allowed: {safe_msg}"}
+                    ),
+                }
+            if query:
+                target_url = f"{target_url}?{query}"
+            logger.info(f"[REMOTE HTTP PROXY] making request: {target_url}")
+            try:
+                proxy_headers = {
+                    k: str(v) for k, v in headers.items() if k.lower() != "host"
+                }
+                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+                    response = await client.request(
+                        method=normalized_method,
+                        url=target_url,
+                        headers=proxy_headers,
+                        content=body,
+                    )
+                logger.info(f"[REMOTE HTTP PROXY] response status: {response.status_code}")
+                logger.info(f"[REMOTE HTTP PROXY] response headers: {dict(response.headers)}")
+                # log first 500 chars of response body for debugging
+                response_text = response.text
+                logger.info(
+                    f"[REMOTE HTTP PROXY] response body (first 500 chars): {response_text[:500] if response_text else 'empty'}"
+                )
+                excluded_headers = {
+                    "content-encoding",
+                    "content-length",
+                    "transfer-encoding",
+                    "connection",
+                }
+                response_headers = {
+                    k: v
+                    for k, v in response.headers.items()
+                    if k.lower() not in excluded_headers
+                }
+                result = {
+                    "success": True,
+                    "status_code": response.status_code,
+                    "headers": response_headers,
+                    "body": response.text,
+                }
+            except httpx.TimeoutException:
+                result = {
+                    "success": False,
+                    "status_code": 504,
+                    "headers": {"content-type": "application/json"},
+                    "body": json.dumps({"error": "Request timeout"}),
+                }
+            except httpx.RequestError as e:
+                logger.error(f"[REMOTE HTTP PROXY] Request error: {e}")
+                result = {
+                    "success": False,
+                    "status_code": 502,
+                    "headers": {"content-type": "application/json"},
+                    "body": json.dumps({"error": f"Request failed: {str(e)}"}),
+                }
+        else:
+            return {
+                "success": False,
+                "status_code": 404,
+                "headers": {"content-type": "application/json"},
+                "body": json.dumps(
+                    {"error": f"unsupported node api path: {normalized_path}"}
+                ),
+            }
+
+        return {
+            "success": result.get("success", False),
+            "status_code": 200 if result.get("success") else 400,
+            "headers": {"content-type": "application/json"},
+            "body": json.dumps(result),
+        }
+
+    @app.post("/api/file-content", dependencies=[Depends(verify_token)])
+    async def get_file_content(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Read content of file at specified absolute path."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        return await _handle_file_content_request(body)
+
+    @app.post("/api/file-stat", dependencies=[Depends(verify_token)])
+    async def get_file_stat(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Read metadata of file at specified absolute path."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        return await _handle_file_stat_request(body)
+
+    @app.post("/api/file-write", dependencies=[Depends(verify_token)])
+    async def write_file_content(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Write content to text file at specified absolute path."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:write"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:write")
+        return await _handle_file_write_request(body)
+
+    @app.post("/api/file-upload", dependencies=[Depends(verify_token)])
+    async def upload_file_raw(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Write base64-encoded file content to specified absolute path with original filename."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:upload"):
+            raise HTTPException(
+                status_code=403, detail="Permission denied: file:upload"
+            )
+        return await _handle_file_upload_raw_request(body)
+
+    @app.post("/api/file-create", dependencies=[Depends(verify_token)])
+    async def create_file_or_directory(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Create file or directory at specified absolute path (do not overwrite existing path)."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:write"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:write")
+        return await _handle_file_create_request(body)
+
+    @app.post("/api/file-delete", dependencies=[Depends(verify_token)])
+    async def delete_file_or_directory(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Delete file or directory at specified absolute path (dir requires recursive for recursive delete)."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:write"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:write")
+        return await _handle_file_delete_request(body)
+
+    @app.post("/api/file-rename", dependencies=[Depends(verify_token)])
+    async def rename_file_or_directory(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Rename/move file or directory at specified absolute path (do not overwrite existing path)."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:write"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:write")
+        return await _handle_file_rename_request(body)
+
+    @app.post("/api/data/{key}", dependencies=[Depends(verify_token)])
+    async def save_data_api(
+        key: str, request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Save data to storage."""
+        from fastapi import HTTPException
+        from haijunbot.haijunbot_web_gateway.data_storage import save_data
+
+        if _check_file_permission(request.state.user_info, "file:write"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:write")
+        success, error = save_data(key, body)
+        if success:
+            return {"success": True, "message": "Data saved successfully"}
+        else:
+            return {"success": False, "error": error}
+
+    @app.get("/api/data/{key}", dependencies=[Depends(verify_token)])
+    async def load_data_api(key: str, request: Request) -> Dict[str, Any]:
+        """Read data from storage."""
+        from fastapi import HTTPException
+        from haijunbot.haijunbot_web_gateway.data_storage import load_data
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        success, data, error = load_data(key)
+        if success:
+            return {"success": True, "data": data}
+        else:
+            return {"success": False, "error": error}
+
+    @app.delete("/api/data/{key}", dependencies=[Depends(verify_token)])
+    async def delete_data_api(key: str, request: Request) -> Dict[str, Any]:
+        """Delete data from storage."""
+        from fastapi import HTTPException
+        from haijunbot.haijunbot_web_gateway.data_storage import delete_data
+
+        if _check_file_permission(request.state.user_info, "file:write"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:write")
+        success, error = delete_data(key)
+        if success:
+            return {"success": True, "message": "Data deleted successfully"}
+        else:
+            return {"success": False, "error": error}
+
+    @app.get("/api/directories", dependencies=[Depends(verify_token)])
+    async def list_directories(
+        request: Request, path: str = "", node_id: str = ""
+    ) -> Dict[str, Any]:
+        """Get directory listing under specified path."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        try:
+            resolved_node_id = str(node_id or "").strip()
+            target_node_id = resolved_node_id or node_runtime.local_node_id
+
+            if target_node_id not in (node_runtime.local_node_id, "master"):
+                logger.info(
+                    "[DIRECTORIES] remote list request path=%s target_node_id=%s local_node_id=%s",
+                    path,
+                    target_node_id,
+                    node_runtime.local_node_id,
+                )
+                node_info = node_runtime.node_registry.get(target_node_id)
+                if node_info is None:
+                    logger.warning(
+                        "[DIRECTORIES] target node not found: %s", target_node_id
+                    )
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_NOT_FOUND",
+                            "message": f"Node not found: {target_node_id}",
+                        },
+                    }
+                logger.info(
+                    "[DIRECTORIES] target node status=%s connection_id=%s",
+                    node_info.status,
+                    node_info.connection_id,
+                )
+                if node_info.status != "online":
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_OFFLINE",
+                            "message": f"Node is offline: {target_node_id}",
+                        },
+                    }
+                response = await node_connection_manager.send_request_to_node(
+                    target_node_id,
+                    DIRECTORY_LIST_REQUEST,
+                    {
+                        "path": path,
+                    },
+                )
+                logger.info(
+                    "[DIRECTORIES] remote node response type=%s", response.get("type")
+                )
+                payload = response.get("payload") or {}
+                if payload.get("success"):
+                    logger.info(
+                        "[DIRECTORIES] remote list success current_path=%s item_count=%s",
+                        (payload.get("data") or {}).get("current_path"),
+                        len((payload.get("data") or {}).get("items") or []),
+                    )
+                    return {"success": True, "data": payload.get("data") or {}}
+                error = payload.get("error") or {}
+                logger.warning(
+                    "[DIRECTORIES] remote list failed code=%s message=%s",
+                    error.get("code"),
+                    error.get("message"),
+                )
+                return {
+                    "success": False,
+                    "error": {
+                        "code": error.get("code", "DIRECTORY_LIST_FAILED"),
+                        "message": error.get(
+                            "message", "Remote directory listing failed"
+                        ),
+                    },
+                }
+
+            return await _handle_directories_request({"path": path})
+        except Exception as e:
+            logger.exception("[DIRECTORIES] list_directories failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+
+    @app.post("/api/parse-orchestration", dependencies=[Depends(verify_token)])
+    async def parse_orchestration(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Read and parse orchestration YAML file at specified path, return agents list.
+
+        Cross-node support: if node_id not local, forward to target node for execution.
+        """
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        try:
+            path = str(body.get("path") or "").strip()
+            resolved_node_id = str(body.get("node_id") or "").strip()
+            target_node_id = resolved_node_id or node_runtime.local_node_id
+
+            if target_node_id not in (node_runtime.local_node_id, "master"):
+                logger.info(
+                    "[ORCHESTRATION] remote parse request path=%s target_node_id=%s",
+                    path,
+                    target_node_id,
+                )
+                node_info = node_runtime.node_registry.get(target_node_id)
+                if node_info is None:
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_NOT_FOUND",
+                            "message": f"Node not found: {target_node_id}",
+                        },
+                    }
+                if node_info.status != "online":
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_OFFLINE",
+                            "message": f"Node is offline: {target_node_id}",
+                        },
+                    }
+                response = await node_connection_manager.send_request_to_node(
+                    target_node_id,
+                    DIRECTORY_LIST_REQUEST,
+                    {
+                        "path": path,
+                        "parse_orchestration": True,
+                    },
+                )
+                payload = response.get("payload") or {}
+                if payload.get("success"):
+                    return {"success": True, "data": payload.get("data") or {}}
+                error = payload.get("error") or {}
+                return {
+                    "success": False,
+                    "error": {
+                        "code": error.get("code", "PARSE_ORCHESTRATION_FAILED"),
+                        "message": error.get(
+                            "message", "Remote orchestration parse failed"
+                        ),
+                    },
+                }
+
+            return await _handle_parse_orchestration_request({"path": path})
+        except Exception as e:
+            logger.exception("[ORCHESTRATION] parse_orchestration failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+
+    @app.post("/api/run-orchestration", dependencies=[Depends(verify_token)])
+    async def run_orchestration(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Run multi-Agent pipeline for specified orchestration file (same path as Agent calling pipeline_runner).
+
+        For frontend "run pipeline" entry: directly call built-in tool PipelineRunnerTool,
+        Run progress broadcast via event bus to frontend to drive DAG visualization. Cross-node: if node_id not
+        local, forward to target node for execution.
+        """
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        try:
+            orchestration_file = str(body.get("orchestration_file") or "").strip()
+            working_dir = str(body.get("working_dir") or "").strip()
+            resolved_node_id = str(body.get("node_id") or "").strip()
+            target_node_id = resolved_node_id or node_runtime.local_node_id
+
+            if target_node_id not in (node_runtime.local_node_id, "master"):
+                logger.info(
+                    "[ORCHESTRATION] remote run request orchestration_file=%s target_node_id=%s",
+                    orchestration_file,
+                    target_node_id,
+                )
+                node_info = node_runtime.node_registry.get(target_node_id)
+                if node_info is None:
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_NOT_FOUND",
+                            "message": f"Node not found: {target_node_id}",
+                        },
+                    }
+                if node_info.status != "online":
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "NODE_OFFLINE",
+                            "message": f"Node is offline: {target_node_id}",
+                        },
+                    }
+                response = await node_connection_manager.send_request_to_node(
+                    target_node_id,
+                    DIRECTORY_LIST_REQUEST,
+                    {
+                        "run_orchestration": True,
+                        "orchestration_file": orchestration_file,
+                        "working_dir": working_dir,
+                        "approve": bool(body.get("approve", False)),
+                        "dry_run": bool(body.get("dry_run", False)),
+                        "max_workers": body.get("max_workers"),
+                    },
+                )
+                payload = response.get("payload") or {}
+                if payload.get("success"):
+                    return {"success": True, "data": payload.get("data") or {}}
+                error = payload.get("error") or {}
+                return {
+                    "success": False,
+                    "error": {
+                        "code": error.get("code", "RUN_ORCHESTRATION_FAILED"),
+                        "message": error.get(
+                            "message", "Remote orchestration run failed"
+                        ),
+                    },
+                }
+
+            return _start_pipeline_run(
+                {
+                    "orchestration_file": orchestration_file,
+                    "working_dir": working_dir,
+                    "approve": bool(body.get("approve", False)),
+                    "dry_run": bool(body.get("dry_run", False)),
+                    "max_workers": body.get("max_workers"),
+                }
+            )
+        except Exception as e:
+            logger.exception("[ORCHESTRATION] run_orchestration failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+
+    @app.post("/api/pipeline-events", dependencies=[Depends(verify_token)])
+    async def pipeline_events_ingest(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Receive cross-process reported pipeline progress events and write to local process event bus.
+
+        When pipeline_runner runs in Agent process (e.g. user dialog Agent calls tool),
+        events go to Agent process in-memory bus, event pump (in web_gateway process) cannot read them.
+        pipeline_runner reports events to this endpoint via HTTP; this endpoint writes events to
+        web_gateway process event bus so event pump can broadcast to frontend.
+
+        Internal bridge only: event source (pipeline_runner) and event pump (web_gateway) both belong to
+        trusted processes, both hold gateway token. Permission check by file:read (same as run-orchestration
+        , orchestration run needs file read permission).
+        """
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        try:
+            from haijunbot.haijunbot_tools.pipeline_events import get_event_bus
+
+            bus = get_event_bus()
+            events = body.get("events") or []
+            if not isinstance(events, list):
+                return {"success": False, "error": "events must be a list"}
+            for event in events:
+                if isinstance(event, dict):
+                    bus.emit(event)
+            return {"success": True, "data": {"ingested": len(events)}}
+        except Exception as e:
+            logger.exception("[ORCHESTRATION] pipeline_events_ingest failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+
+    @app.post("/api/pipeline-approval", dependencies=[Depends(verify_token)])
+    async def pipeline_approval(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Record gate manual approval decision and broadcast approval event (allow/reject/retry).
+
+        After gate blocked (gate_blocked), frontend approval UI calls this to record approver,
+        time, action, remarks, broadcast `pipeline_approval` event for audit and frontend display.
+        Only records decision and broadcasts event; doesn't directly drive pipeline continuation (allow/retry done by frontend
+        re-running pipeline with approve=true). Permission checked by file:read (same as
+        run-orchestration , orchestration run needs file read permission).
+        """
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        try:
+            pipeline_id = str(body.get("pipeline_id") or "").strip()
+            action = str(body.get("action") or "").strip().lower()
+            note = str(body.get("note") or "").strip()
+            # Approver: prefer request identity, fallback to explicitly passed in body
+            ui = request.state.user_info or {}
+            approver = (
+                ui.get("display_name") or ui.get("username") or ui.get("user_id") or ""
+            )
+            if not approver:
+                approver = str(body.get("approver") or "").strip()
+
+            from haijunbot.haijunbot_tools.pipeline_runner import PipelineRunnerTool
+
+            result = PipelineRunnerTool().record_approval(
+                pipeline_id=pipeline_id,
+                action=action,
+                approver=approver,
+                note=note,
+            )
+            if not result.get("success"):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_APPROVAL",
+                        "message": result.get("error", "Invalid approval"),
+                    },
+                }
+            return {"success": True, "data": result.get("data") or {}}
+        except Exception as e:
+            logger.exception("[ORCHESTRATION] pipeline_approval failed: %r", e)
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": repr(e)},
+            }
+
+    # HTTP API: Git read-only endpoints (commit history/detail/diff/branches)
+    async def _forward_git_request_to_node(
+        node_id: str, api_path: str, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """If target node not local/master, forward request; else return None meaning local processing.
+
+        Return None if needs local processing; return dict if final response already obtained.
+        Request constants reuse NODE_HTTP_PROXY_REQUEST (same as /api/node/{id}/... proxy).
+        """
+        resolved_node_id = str(node_id or "").strip()
+        target_node_id = resolved_node_id or node_runtime.local_node_id
+        if target_node_id in (node_runtime.local_node_id, "master"):
+            return None
+
+        node_info = node_runtime.node_registry.get(target_node_id)
+        if node_info is None:
+            return {
+                "success": False,
+                "error": {
+                    "code": "NODE_NOT_FOUND",
+                    "message": f"Node not found: {target_node_id}",
+                },
+            }
+        if node_info.status != "online":
+            return {
+                "success": False,
+                "error": {
+                    "code": "NODE_OFFLINE",
+                    "message": f"Node is offline: {target_node_id}",
+                },
+            }
+
+        response = await node_connection_manager.send_request_to_node(
+            target_node_id,
+            NODE_HTTP_PROXY_REQUEST,
+            {
+                "method": "POST",
+                "path": api_path,
+                "headers": {},
+                "body": json.dumps(
+                    {k: v for k, v in payload.items() if not k.startswith("_")}
+                ),
+            },
+        )
+        response_payload = response.get("payload") or {}
+        body_text = response_payload.get("body")
+        if body_text:
+            try:
+                parsed = json.loads(body_text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return {
+            "success": False,
+            "error": {
+                "code": "REMOTE_GIT_FAILED",
+                "message": "Remote git request failed",
+            },
+        }
+
+    @app.post("/api/git/log", dependencies=[Depends(verify_token)])
+    async def git_log(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Get commit history list (read-only)."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        payload = dict(body or {})
+        node_id = str(payload.get("node_id") or "")
+        forwarded = await _forward_git_request_to_node(node_id, "/api/git/log", payload)
+        if forwarded is not None:
+            return forwarded
+        return await _handle_git_log_request(payload)
+
+    @app.post("/api/git/commit-detail", dependencies=[Depends(verify_token)])
+    async def git_commit_detail(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Get metadata and file change list for a commit (read-only)."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        payload = dict(body or {})
+        node_id = str(payload.get("node_id") or "")
+        forwarded = await _forward_git_request_to_node(
+            node_id, "/api/git/commit-detail", payload
+        )
+        if forwarded is not None:
+            return forwarded
+        return await _handle_git_commit_detail_request(payload)
+
+    @app.post("/api/git/diff", dependencies=[Depends(verify_token)])
+    async def git_diff(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Get diff text for a file in a commit (read-only)."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        payload = dict(body or {})
+        node_id = str(payload.get("node_id") or "")
+        forwarded = await _forward_git_request_to_node(
+            node_id, "/api/git/diff", payload
+        )
+        if forwarded is not None:
+            return forwarded
+        return await _handle_git_diff_request(payload)
+
+    @app.post("/api/git/branches", dependencies=[Depends(verify_token)])
+    async def git_branches(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Get branches and tags list (read-only)."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        payload = dict(body or {})
+        node_id = str(payload.get("node_id") or "")
+        forwarded = await _forward_git_request_to_node(
+            node_id, "/api/git/branches", payload
+        )
+        if forwarded is not None:
+            return forwarded
+        return await _handle_git_branches_request(payload)
+
+    @app.post("/api/git/file-content", dependencies=[Depends(verify_token)])
+    async def git_file_content(
+        request: Request, body: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Get full content of file at specified commit/revision (read-only)."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        payload = dict(body or {})
+        node_id = str(payload.get("node_id") or "")
+        forwarded = await _forward_git_request_to_node(
+            node_id, "/api/git/file-content", payload
+        )
+        if forwarded is not None:
+            return forwarded
+        return await _handle_git_file_content_request(payload)
+
+    @app.post("/api/git/patch", dependencies=[Depends(verify_token)])
+    async def git_patch(request: Request, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate patch for selected commit(s) (read-only)."""
+        from fastapi import HTTPException
+
+        if _check_file_permission(request.state.user_info, "file:read"):
+            raise HTTPException(status_code=403, detail="Permission denied: file:read")
+        payload = dict(body or {})
+        node_id = str(payload.get("node_id") or "")
+        forwarded = await _forward_git_request_to_node(
+            node_id, "/api/git/patch", payload
+        )
+        if forwarded is not None:
+            return forwarded
+        return await _handle_git_patch_request(payload)
+
+    # HTTP API: Create terminal session
+    @app.post("/api/terminals", dependencies=[Depends(verify_token)])
+    async def create_terminal(
+        request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Create new terminal session.
+
+        Args:
+            request_body: {
+                "interpreter": "bash",  # optional, default bash
+                "working_dir": "."     # optional, default current dir
+            }
+
+        Returns:
+            {"success": True, "data": {"terminal_id": "xxx"}}
+        """
+        try:
+            # Multi-user mode: per-user session isolation
+            user_info = getattr(request.state, "user_info", None)
+            user_id = (
+                user_info.get("user_id", "anonymous") if user_info else "anonymous"
+            )
+            session_id = f"session_{user_id}"
+
+            interpreter = request_body.get("interpreter") or os.environ.get(
+                "SHELL", "bash"
+            )
+            raw_working_dir = request_body.get("working_dir")
+            working_dir = str(raw_working_dir).strip() if raw_working_dir else ""
+            if not working_dir:
+                working_dir = str(pathlib.Path.home())
+
+            terminal_id, error = terminal_session_manager.create_session(
+                interpreter=interpreter,
+                working_dir=working_dir,
+                stream_publisher=router,
+                session_id=session_id,
+                owner_id=user_id,
+            )
+
+            if terminal_id is None:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "CREATE_FAILED",
+                        "message": error or "failed to create terminal",
+                    },
+                }
+
+            return {"success": True, "data": {"terminal_id": terminal_id}}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: List all terminal sessions
+    @app.get("/api/terminals", dependencies=[Depends(verify_token)])
+    async def list_terminals(request: Request) -> Dict[str, Any]:
+        """List active terminal sessions for current user.
+
+        Returns:
+            {"success": True, "data": [{"terminal_id": "xxx", ...}]}
+        """
+        try:
+            # Multi-user mode: per-user session isolation
+            user_info = getattr(request.state, "user_info", None)
+            user_id = (
+                user_info.get("user_id", "anonymous") if user_info else "anonymous"
+            )
+            session_id = f"session_{user_id}"
+
+            sessions = terminal_session_manager.list_sessions_for_user(session_id)
+            # Fill node_id (shadow sessions already have node_id; local sessions get master node if missing)
+            local_node_id = _node_runtime.local_node_id if _node_runtime else "master"
+            for s in sessions:
+                if not s.get("node_id"):
+                    s["node_id"] = local_node_id
+            return {"success": True, "data": sessions}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: Close terminal session
+    @app.delete("/api/terminals/{terminal_id}", dependencies=[Depends(verify_token)])
+    async def close_terminal(terminal_id: str, request: Request) -> Dict[str, Any]:
+        """Close specified terminal session.
+
+        Args:
+            terminal_id: terminal ID
+
+        Returns:
+            {"success": True}
+        """
+        try:
+            # Multi-user mode: verify session ownership to prevent unauthorized closure of others' sessions
+            user_info = getattr(request.state, "user_info", None)
+            user_id = (
+                user_info.get("user_id", "anonymous") if user_info else "anonymous"
+            )
+
+            session = terminal_session_manager.get_session(terminal_id)
+            if session is None or session.owner_id != user_id:
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "terminal does not exist"},
+                }
+
+            success = terminal_session_manager.close_session(terminal_id)
+            if not success:
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "terminal does not exist"},
+                }
+            return {"success": True}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: Take over terminal session and get output buffer (for reconnection replay)
+    @app.post(
+        "/api/terminals/{terminal_id}/attach",
+        dependencies=[Depends(verify_token)],
+    )
+    async def attach_terminal(terminal_id: str, request: Request) -> Dict[str, Any]:
+        """Take over terminal session and return output buffer for frontend replay after reconnection.
+
+        Verify session ownership (only owner can take over), return base64-encoded output chunks list,
+        frontend replays in order to sync with live output.
+
+        Args:
+            terminal_id: terminal ID
+
+        Returns:
+            {"success": True, "data": {"terminal_id": "xxx", "output": [base64...]}}
+        """
+        try:
+            # Multi-user mode: per-user session isolation
+            user_info = getattr(request.state, "user_info", None)
+            user_id = (
+                user_info.get("user_id", "anonymous") if user_info else "anonymous"
+            )
+            session_id = f"session_{user_id}"
+
+            if not terminal_session_manager.attach_session(terminal_id, session_id):
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "terminal does not exist"},
+                }
+
+            session = terminal_session_manager.get_session(terminal_id)
+            if session is None:
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "terminal does not exist"},
+                }
+
+            import base64
+
+            # Shadow session of child node terminal: real output buffer on child node, forward attach to child node to get buffer
+            local_node_id = _node_runtime.local_node_id if _node_runtime else "master"
+            node_id = session.node_id or "master"
+            if node_id not in ("master", local_node_id) and _node_connection_manager:
+                try:
+                    resp = await _node_connection_manager.send_request_to_node(
+                        node_id,
+                        NODE_TERMINAL_REQUEST,
+                        {
+                            "action": "terminal_attach",
+                            "payload": {"terminal_id": terminal_id},
+                            "session_id": session_id,
+                        },
+                    )
+                    resp_payload = resp.get("payload") or {}
+                    if resp_payload.get("success"):
+                        data = resp_payload.get("data") or {}
+                        return {
+                            "success": True,
+                            "data": {
+                                "terminal_id": terminal_id,
+                                "interpreter": data.get(
+                                    "interpreter", session.interpreter
+                                ),
+                                "working_dir": data.get(
+                                    "working_dir", session.working_dir
+                                ),
+                                "output": data.get("output") or [],
+                            },
+                        }
+                except Exception as e:
+                    return {
+                        "success": False,
+                        "error": {
+                            "code": "INTERNAL_ERROR",
+                            "message": f"failed to forward to child node: {e}",
+                        },
+                    }
+
+            output = [
+                base64.b64encode(chunk).decode("utf-8")
+                for chunk in session.get_output_buffer()
+            ]
+            return {
+                "success": True,
+                "data": {
+                    "terminal_id": terminal_id,
+                    "interpreter": session.interpreter,
+                    "working_dir": session.working_dir,
+                    "output": output,
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: Set terminal session ACL (share with other users)
+    @app.put(
+        "/api/terminals/{terminal_id}/acl",
+        dependencies=[Depends(verify_token)],
+    )
+    async def set_terminal_acl(
+        terminal_id: str, request_body: Dict[str, Any], request: Request
+    ) -> Dict[str, Any]:
+        """Set terminal session ACL (only owner can operate).
+
+        Args:
+            request_body: {
+                "read": ["user_id", ...],      # read-only users
+                "interact": ["user_id", ...]   # interactive users
+            }
+
+        Returns:
+            {"success": True, "data": {"terminal_id": "xxx", "access_acl": {...}}}
+        """
+        try:
+            user_info = getattr(request.state, "user_info", None)
+            user_id = (
+                user_info.get("user_id", "anonymous") if user_info else "anonymous"
+            )
+
+            acl = {
+                "read": list(request_body.get("read") or []),
+                "interact": list(request_body.get("interact") or []),
+            }
+            if not terminal_session_manager.set_access_acl(terminal_id, user_id, acl):
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "FORBIDDEN",
+                        "message": "only session owner can set access control",
+                    },
+                }
+
+            info = terminal_session_manager.get_session_info(terminal_id)
+            # Live terminal sharing: push terminal_created to all shared users (read/interact),
+            # so they immediately see the terminal (even if not seen before)
+            if info:
+                acl_now = info.get("access_acl") or {}
+                node_id = str(
+                    _node_runtime.local_node_id if _node_runtime else "master"
+                )
+                for level in ("read", "interact"):
+                    for uid in acl_now.get(level, []):
+                        if not uid:
+                            continue
+                        evt = {
+                            "type": "terminal_created",
+                            "payload": {
+                                "terminal_id": terminal_id,
+                                "interpreter": info.get("interpreter") or "bash",
+                                "working_dir": info.get("working_dir") or ".",
+                                "node_id": node_id,
+                                "access": level,
+                            },
+                        }
+                        _router.publish(evt, session_id=f"session_{uid}")
+            return {
+                "success": True,
+                "data": {
+                    "terminal_id": terminal_id,
+                    "access_acl": (info or {}).get("access_acl", {}),
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: Create group
+    @app.post("/api/groups", dependencies=[Depends(verify_token)])
+    async def create_group(request: Request) -> Dict[str, Any]:
+        """Create group.
+
+        Args:
+            request: request body, contains name (group name)
+
+        Returns:
+            {"success": True, "data": {"group_id": str, "name": str, "members": list}}
+        """
+        try:
+            body = await request.json()
+            name = body.get("name")
+            if not name:
+                return {
+                    "success": False,
+                    "error": {"code": "INVALID_PARAMS", "message": "name is required"},
+                }
+
+            # generate group ID
+            group_id = str(uuid.uuid4())[:8]
+
+            # create group
+            groups[group_id] = {
+                "name": name,
+                "members": set(),
+            }
+
+            return {
+                "success": True,
+                "data": {
+                    "group_id": group_id,
+                    "name": name,
+                    "members": [],
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: List all groups
+    @app.get("/api/groups", dependencies=[Depends(verify_token)])
+    async def list_groups() -> Dict[str, Any]:
+        """List all groups.
+
+        Returns:
+            {"success": True, "data": [{"group_id": str, "name": str, "members": list}]}
+        """
+        try:
+            group_list = [
+                {
+                    "group_id": group_id,
+                    "name": info["name"],
+                    "members": list(info["members"]),
+                }
+                for group_id, info in groups.items()
+            ]
+            return {"success": True, "data": group_list}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: Get group details
+    @app.get("/api/groups/{group_id}", dependencies=[Depends(verify_token)])
+    async def get_group(group_id: str) -> Dict[str, Any]:
+        """Get group details.
+
+        Args:
+            group_id: group ID
+
+        Returns:
+            {"success": True, "data": {"group_id": str, "name": str, "members": list}}
+        """
+        try:
+            if group_id not in groups:
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Group not found"},
+                }
+
+            info = groups[group_id]
+            return {
+                "success": True,
+                "data": {
+                    "group_id": group_id,
+                    "name": info["name"],
+                    "members": list(info["members"]),
+                },
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: Join group
+    @app.post("/api/groups/{group_id}/join", dependencies=[Depends(verify_token)])
+    async def join_group(group_id: str, request: Request) -> Dict[str, Any]:
+        """Join group.
+
+        Args:
+            group_id: group ID
+            request: request body, contains agent_id
+
+        Returns:
+            {"success": True}
+        """
+        try:
+            if group_id not in groups:
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Group not found"},
+                }
+
+            try:
+                body = await request.json()
+            except Exception:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PARAMS",
+                        "message": "Invalid JSON body",
+                    },
+                }
+
+            agent_id = body.get("agent_id") if body else None
+            if not agent_id:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PARAMS",
+                        "message": "agent_id is required",
+                    },
+                }
+
+            groups[group_id]["members"].add(agent_id)
+            return {"success": True}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: Leave group
+    @app.post("/api/groups/{group_id}/leave", dependencies=[Depends(verify_token)])
+    async def leave_group(group_id: str, request: Request) -> Dict[str, Any]:
+        """Leave group.
+
+        Args:
+            group_id: group ID
+            request: request body, containing agent_id
+
+        Returns:
+            {"success": True}
+        """
+        try:
+            if group_id not in groups:
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Group not found"},
+                }
+
+            try:
+                body = await request.json()
+            except Exception:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PARAMS",
+                        "message": "Invalid JSON body",
+                    },
+                }
+
+            agent_id = body.get("agent_id") if body else None
+            if not agent_id:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PARAMS",
+                        "message": "agent_id is required",
+                    },
+                }
+
+            groups[group_id]["members"].discard(agent_id)
+            return {"success": True}
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # HTTP API: send group message
+    @app.post("/api/groups/{group_id}/message", dependencies=[Depends(verify_token)])
+    async def send_group_message(group_id: str, request: Request) -> Dict[str, Any]:
+        """Send a group message.
+
+        Send a message to all members of the group (excluding the sender).
+
+        Args:
+            group_id: group ID
+            request: request body, containing sender_id and content
+
+        Returns:
+            {"success": True, "data": {"sent_to": list, "failed": list}}
+        """
+        try:
+            if group_id not in groups:
+                return {
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Group not found"},
+                }
+
+            body = await request.json()
+            sender_id = body.get("sender_id")
+            content = body.get("content")
+            if not sender_id or not content:
+                return {
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_PARAMS",
+                        "message": "sender_id and content are required",
+                    },
+                }
+
+            # Get group members (excluding the sender)
+            members = groups[group_id]["members"]
+            recipients = [m for m in members if m != sender_id]
+
+            if not recipients:
+                return {
+                    "success": True,
+                    "data": {"sent_to": [], "failed": [], "message": "No recipients"},
+                }
+
+            # Send a message to each member
+            sent_to = []
+            failed = []
+            for agent_id in recipients:
+                try:
+                    # Call the agent's /message endpoint
+                    agent_info = agent_manager.get_agent(agent_id)
+                    if not agent_info or not agent_info.port:
+                        failed.append(
+                            {"agent_id": agent_id, "error": "Agent not found"}
+                        )
+                        continue
+
+                    port = agent_info.port
+                    async with httpx.AsyncClient(trust_env=False) as client:
+                        resp = await client.post(
+                            f"http://127.0.0.1:{port}/message",
+                            json={
+                                "sender_id": sender_id,
+                                "content": content,
+                                "group_id": group_id,
+                                "group_name": groups[group_id]["name"],
+                                "message_type": "group_message",
+                            },
+                            timeout=5.0,
+                        )
+                        if resp.status_code == 200:
+                            sent_to.append(agent_id)
+                        else:
+                            failed.append(
+                                {
+                                    "agent_id": agent_id,
+                                    "error": f"HTTP {resp.status_code}",
+                                }
+                            )
+                except Exception as e:
+                    failed.append({"agent_id": agent_id, "error": str(e)})
+
+            return {
+                "success": True,
+                "data": {"sent_to": sent_to, "failed": failed},
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": {"code": "INTERNAL_ERROR", "message": str(e)},
+            }
+
+    # Inject local HTTP dispatcher into node_connection_manager
+    node_connection_manager._node_http_dispatcher = _dispatch_node_http_request
+
+    return app
+
+
+def run(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    node_config: Optional[NodeRuntimeConfig] = None,
+) -> None:
+    """Local startup entry point."""
+
+    import uvicorn
+
+    from haijunbot.haijunbot_utils.utils import init_env
+
+    # Initialize the environment and load the configuration file
+    init_env(welcome_str="", config_file=None)
+
+    uvicorn.run(
+        create_app(node_config=node_config, port=port, host=host),
+        host=host,
+        port=port,
+    )
+
+
+def _normalize_auth_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    """Normalize the payload of a WebSocket authentication message.
+
+    Args:
+        payload: payload of the authentication message
+
+    Returns:
+        The normalized authentication payload, containing the token
+    """
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "token": payload.get("token"),
+    }
+
+
+def _extract_auth_from_headers(websocket: WebSocket) -> Optional[Dict[str, Any]]:
+    """Extract authentication information from the WebSocket handshake headers."""
+    protocol_header = websocket.headers.get("sec-websocket-protocol", "")
+    for item in protocol_header.split(","):
+        protocol = item.strip()
+        if protocol.startswith("haijunbot-token."):
+            encoded_token = protocol[len("haijunbot-token.") :]
+            token = unquote(encoded_token)
+            if token:
+                return {"token": token}
+    return None
+
+
+def _build_sender(websocket: WebSocket, loop: asyncio.AbstractEventLoop):
+    def _sender(message: Dict[str, Any]) -> None:
+        async def _send():
+            try:
+                await websocket.send_json(message)
+            except Exception as e:
+                save_exception(e, module="haijunbot_web_gateway.app", function="_sender")
+                pass
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        except Exception as e:
+            save_exception(e, module="haijunbot_web_gateway.app", function="_sender")
+            pass
+
+    return _sender
+
+
+async def _handle_file_upload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle a file upload request.
+
+    Args:
+        payload: a dictionary containing the file data
+            - agent_id: Agent ID
+            - file_name: file name
+            - file_data: Base64-encoded file data
+            - target_dir: target directory (defaults to the uploads subdirectory under the HaijunBot data directory)
+
+    Returns:
+        A dictionary of the processing result
+    """
+    import base64
+    import uuid
+    import os
+
+    try:
+        from haijunbot.haijunbot_utils.config import get_data_dir
+
+        file_name = payload.get("file_name")
+        file_data = payload.get("file_data")
+        target_dir = payload.get("target_dir", "")
+
+        # If target_dir is empty or unspecified, use the uploads subdirectory under the HaijunBot data directory
+        if not target_dir:
+            target_dir = os.path.join(get_data_dir(), "uploads")
+
+        if not file_data:
+            return {"success": False, "error": "Missing file data"}
+
+        # Parse the Base64 data
+        if "," in file_data:
+            header, data = file_data.split(",", 1)
+            # Try to extract the extension from the header
+            try:
+                mime_type = header.split(":")[1].split(";")[0]
+                ext = mime_type.split("/")[1]
+            except Exception:
+                ext = "png"
+        else:
+            data = file_data
+            ext = "png"
+
+        # Decode
+        try:
+            file_bytes = base64.b64decode(data)
+        except Exception as e:
+            return {"success": False, "error": f"Invalid base64 data: {str(e)}"}
+
+        # Validate file size (limit 20MB)
+        if len(file_bytes) > 20 * 1024 * 1024:
+            return {"success": False, "error": "File too large (>20MB)"}
+
+        # Generate a unique file name
+        # If file_name already has an extension, remove it to avoid duplication
+        base_name = os.path.splitext(file_name or "image")[0] if file_name else "image"
+        unique_name = f"{uuid.uuid4().hex[:8]}_{base_name}.{ext}"
+        file_path = os.path.join(target_dir, unique_name)
+
+        # Ensure the directory exists
+        os.makedirs(target_dir, exist_ok=True)
+
+        # Write the file
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+
+        # Build an accessible HTTP URL (relative to the uploads static mount point)
+        file_url = f"/uploads/{unique_name}"
+        return {
+            "success": True,
+            "data": {
+                "file_path": file_path,
+                "file_url": file_url,
+                "file_size": len(file_bytes),
+            },
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+async def _send_error(websocket: WebSocket, code: str, message: str) -> None:
+    error_msg = {"type": "error", "payload": {"code": code, "message": message}}
+    await websocket.send_json(error_msg)

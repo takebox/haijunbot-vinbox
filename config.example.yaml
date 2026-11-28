@@ -1,0 +1,148 @@
+# HaijunBot configuration template — free tier first.
+#
+# Copy this file to ~/.haijunbot/config.yaml, then fill in ONE free-tier API key.
+# Every provider below speaks the OpenAI-compatible protocol and is reached
+# through the single platform: free. Only llm_config.provider changes.
+#
+# Get a key (all free tiers):
+#   openrouter   https://openrouter.ai/keys
+#   groq         https://console.groq.com/keys
+#   together     https://api.together.ai/settings/api-keys
+#   huggingface  https://huggingface.co/settings/tokens
+#   gemini       https://aistudio.google.com/apikey
+#   9router / omniroute / opencode   self-hosted, set openai_api_base yourself
+#   freebuff     https://freebuff.com/account/api
+# Paid, optional:
+#   openai       https://platform.openai.com/api-keys
+#   anthropic    https://console.anthropic.com/settings/keys (OpenAI-compatible gateway)
+#   google       https://aistudio.google.com/apikey
+#
+# A key can live here (openai_api_key) or in the environment variable named in
+# the catalog (GROQ_API_KEY, HF_TOKEN, OPENROUTER_API_KEY, ...). Nothing is
+# required: without a key HaijunBot keeps running on the local vinbox lane.
+
+llm_group: free-first
+
+llm_groups:
+  # 1) Free tier, first choice. Change normal_llm to any *-free entry below.
+  free-first:
+    normal_llm: groq-free
+    smart_llm: groq-free
+    cheap_llm: groq-free
+    fallback_group: free-backup
+
+  # 2) Free tier, backup. Reached only when the first lane keeps failing.
+  free-backup:
+    normal_llm: hf-free
+    smart_llm: hf-free
+    cheap_llm: hf-free
+    fallback_group: paid-optional
+
+  # 3) Paid, optional. Delete this group to run free tier only.
+  paid-optional:
+    normal_llm: openai-paid
+    smart_llm: openai-paid
+    cheap_llm: openai-paid
+
+llms:
+  # ---------------------------------------------------------------- free tier
+  openrouter-free:
+    platform: free
+    model: deepseek/deepseek-chat-v3-0324:free
+    max_input_token_count: 128000
+    llm_config:
+      provider: openrouter
+      openai_api_key: ""          # or export OPENROUTER_API_KEY
+
+  groq-free:
+    platform: free
+    model: llama-3.3-70b-versatile
+    max_input_token_count: 131072
+    llm_config:
+      provider: groq
+      openai_api_key: ""          # or export GROQ_API_KEY
+
+  together-free:
+    platform: free
+    model: meta-llama/Llama-3.3-70B-Instruct-Turbo
+    max_input_token_count: 32768
+    llm_config:
+      provider: together
+      openai_api_key: ""          # or export TOGETHER_API_KEY
+
+  hf-free:
+    platform: free
+    model: meta-llama/Llama-3.1-8B-Instruct
+    max_input_token_count: 32768
+    llm_config:
+      provider: huggingface
+      openai_api_key: ""          # or export HF_TOKEN
+
+  gemini-free:
+    platform: free
+    model: gemini-2.0-flash
+    max_input_token_count: 1000000
+    llm_config:
+      provider: gemini
+      openai_api_key: ""          # or export GEMINI_API_KEY
+
+  ninerouter-free:
+    platform: free
+    model: 9router/auto
+    max_input_token_count: 200000
+    llm_config:
+      provider: 9router
+      openai_api_base: ""         # your 9Router endpoint
+      openai_api_key: ""          # or export NINE_ROUTER_API_KEY
+
+  omniroute-free:
+    platform: free
+    model: omniroute/auto
+    max_input_token_count: 200000
+    llm_config:
+      provider: omniroute
+      openai_api_base: ""         # your OmniRoute endpoint
+      openai_api_key: ""          # or export OMNIROUTE_API_KEY
+
+  opencode-free:
+    platform: free
+    model: opencode/default
+    max_input_token_count: 200000
+    llm_config:
+      provider: opencode
+      openai_api_base: ""         # local OpenCode gateway, no paid key
+      openai_api_key: ""          # usually not needed
+
+  freebuff-free:
+    platform: free
+    model: freebuff/auto
+    max_input_token_count: 200000
+    llm_config:
+      provider: freebuff
+      openai_api_key: ""          # or export FREEBUFF_API_KEY
+
+  # ------------------------------------------------- paid, only if you have it
+  openai-paid:
+    platform: free
+    model: gpt-4o-mini
+    max_input_token_count: 128000
+    llm_config:
+      provider: openai
+      openai_api_key: ""          # or export OPENAI_API_KEY
+
+  anthropic-paid:
+    platform: free
+    model: claude-sonnet-4-5
+    max_input_token_count: 200000
+    llm_config:
+      provider: anthropic
+      openai_api_base: ""         # OpenAI-compatible gateway for Anthropic models
+      openai_api_key: ""          # or export ANTHROPIC_API_KEY
+
+  google-paid:
+    platform: free
+    model: gemini-2.5-pro
+    max_input_token_count: 1000000
+    llm_config:
+      provider: google
+      openai_api_key: ""          # or export GOOGLE_API_KEY

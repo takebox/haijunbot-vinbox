@@ -1,0 +1,12 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include src/haijunbot *
+recursive-include builtin **
+recursive-include browser_extension *
+recursive-include docs **
+prune src/haijunbot/haijunbot_service/frontend/node_modules
+recursive-exclude src/haijunbot/haijunbot_service/frontend/node_modules *
+exclude __pycache__
+exclude .venv
+exclude *.pyc

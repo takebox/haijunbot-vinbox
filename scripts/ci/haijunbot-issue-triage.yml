@@ -1,0 +1,115 @@
+---
+# yamllint disable rule:line-length
+# =============================================================================
+# HaijunBot Issue auto triage workflow template
+# -----------------------------------------------------------------------------
+# Purpose: on issue triggers, use HaijunBot CodeAgent to automatically analyze the issue content and classify/label it.
+#
+# Usage:
+#   1. Copy this file into your repository at .github/workflows/haijunbot-issue-triage.yml
+#   2. Configure environment variables (HaijunBot reads the API Key from the standard LLM environment variables, see below):
+#      - OPENAI_API_KEY     (OpenAI platform) API Key for calling the LLM
+#      - JUGLOW_API_KEY  (Juglow platform) API Key for calling the LLM
+#      - OPENAI_API_BASE    (optional) custom OpenAI-compatible endpoint
+#      - HAIJUNBOT_MODEL       (optional) specify the model, defaults to gpt-5
+#      - HAIJUNBOT_PLATFORM    (optional) specify the platform, defaults to openai
+#   3. Grant the workflow issues: write permission (for adding labels/comments)
+#
+#   Note: On first run HaijunBot automatically generates default config (non-interactive); the API Key is injected via standard
+#        environment variables (OPENAI_API_KEY / JUGLOW_API_KEY), no preexisting config.yaml required.
+#        You can also persist config using hqc non-interactive mode: hqc --platform openai --base-url <url>
+#        --api-key <key> --model <model> --skip-test (writes to ~/.haijunbot/config.yaml).
+# Principle: reuse HaijunBot headless non-interactive mode (hjb -n --task-file), taking the issue title
+#       and body as task input, output the classification conclusion, then parse .output to add labels and comments.
+# =============================================================================
+name: HaijunBot Issue Triage
+
+"on":
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  haijunbot-issue-triage:
+    name: HaijunBot Issue Triage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install HaijunBot
+        run: |
+          pip install --upgrade pip
+          # Install HaijunBot (haijunbot-ai-assistant) from PyPI, suitable for any user repository
+          pip install haijunbot-ai-assistant
+
+      - name: Prepare HaijunBot task file
+        id: task
+        run: |
+          # Write the issue title and body into the task file (avoid special characters breaking the JSON)
+          cat > /tmp/issue-body.txt <<'EOF'
+          ${{ github.event.issue.body }}
+          EOF
+          cat > /tmp/haijunbot-task.json <<'EOF'
+          {
+            "task_desc": "Please automatically classify the following GitHub issue. Output a structured conclusion: 1) category (one of bug/feature/documentation/question/enhancement, multiple allowed); 2) suggested labels (GitHub label names, comma-separated); 3) one-sentence summary; 4) suggested next step.",
+            "background": "This is HaijunBot automatic issue classification in GitHub Actions. Please read the issue body in /tmp/issue-body.txt and give classification suggestions based on the repository type.",
+            "status_file": "/tmp/haijunbot-status.json"
+          }
+          EOF
+
+      - name: Run HaijunBot triage (headless)
+        id: haijunbot
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JUGLOW_API_KEY: ${{ secrets.JUGLOW_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
+          HAIJUNBOT_MODEL: ${{ secrets.HAIJUNBOT_MODEL }}
+          HAIJUNBOT_PLATFORM: ${{ secrets.HAIJUNBOT_PLATFORM }}
+          # Skip the interactive config wizard on first run (no TTY in the CI environment)
+          HAIJUNBOT_SKIP_INTERACTIVE_CONFIG: "1"
+        run: |
+          hjb -n --task-file /tmp/haijunbot-task.json || true
+
+      - name: Read HaijunBot triage result
+        id: result
+        run: |
+          if [ -f /tmp/haijunbot-status.json ]; then
+            echo "status=$(jq -r '.status' /tmp/haijunbot-status.json)" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f /tmp/haijunbot-status.output ]; then
+            {
+              echo "output<<EOF"
+              cat /tmp/haijunbot-status.output
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post triage comment
+        if: steps.result.outputs.output != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = [
+              '## 🤖 HaijunBot Issue Auto Triage',
+              '',
+              '```',
+              process.env.TRIAGE_OUTPUT || '(no output)',
+              '```'
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+        env:
+          TRIAGE_OUTPUT: ${{ steps.result.outputs.output }}

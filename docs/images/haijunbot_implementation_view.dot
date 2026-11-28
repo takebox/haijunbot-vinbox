@@ -1,0 +1,151 @@
+digraph G {
+  // --- Global Settings ---
+  graph [rankdir="TB", splines=ortho, fontname="Sans-serif", label="Diagram Title: [Implementation View] Code Physical Organization and Key Dependencies", labelloc="t", newrank=true, nodesep=0.6, ranksep=1.0, overlap=false];
+  node [shape=box, style="rounded,filled", fillcolor="#EFEFEF", fontname="Sans-serif"];
+  edge [fontname="Sans-serif"];
+
+  // Package structure groups
+  subgraph cluster_agent {
+    label = "haijunbot_agent (Core Agent)";
+    style = "filled";
+    color = "#dddddd";
+    node [fillcolor="#DAE8FC", color="#6C8EBF"];
+    ag_agent [label="Agent Core Module"];
+    ag_runloop [label="Run Loop"];
+    ag_session [label="Session Management"];
+    ag_prompt_mgr [label="Prompt Management"];
+    ag_memory_mgr [label="Memory Management"];
+    ag_task_analyzer [label="Task Analysis"];
+    ag_event_bus [label="Event Bus/Event Definitions"];
+    ag_tool_exec [label="Tool Invocation Bridge"];
+    ag_input_shell [label="Shell Input Processing"];
+    ag_input_builtin [label="Built-in Input Processing"];
+    ag_edit_handler [label="Edit Patch Parser"];
+    ag_manager_cli [label="CLI and Entry Points (haijunbot/haijunbot_agent/haijunbot.py, main.py, agent_manager.py)"];
+  }
+
+  subgraph cluster_tools {
+    label = "haijunbot_tools (Built-in Tools and Registry)";
+    style = "filled";
+    color = "#e8e8e8";
+    node [fillcolor="#F8CECC", color="#B85450"];
+    tr_registry [label="Tool Registry (ToolRegistry)"];
+    t_read_code [label="Read Code"];
+    t_execute_script [label="Execute Script"];
+    t_edit_file [label="Precise File Editing"];
+    t_rewrite_file [label="Rewrite File"];
+    t_save_memory [label="Save Memory"];
+    t_retrieve_memory [label="Retrieve Memory"];
+    t_search_web [label="Web Search"];
+    t_sub_agent [label="Sub-Agent (General)"];
+    t_sub_code_agent [label="Sub-Agent (Code)"];
+    t_virtual_tty [label="Virtual Terminal"];
+    t_file_analyzer [label="File Analysis"];
+    t_methodology [label="Methodology Management"];
+    { rank=same; t_read_code; t_execute_script; t_edit_file; t_rewrite_file; t_save_memory; t_retrieve_memory; t_search_web; t_sub_agent; t_sub_code_agent; t_virtual_tty; t_file_analyzer; t_methodology; }
+  }
+
+  subgraph cluster_platform {
+    label = "haijunbot_platform (LLM Platform and Registry)";
+    style = "filled";
+    color = "#e8e8e8";
+    node [fillcolor="#D5E8D4", color="#82B366"];
+    pf_base [label="Platform Base Class (BasePlatform)"];
+    pf_registry [label="Platform Registry (PlatformRegistry)"];
+    pf_openai [label="Platform Implementation: OpenAI"];
+    pf_haijun [label="Platform Implementation: Haijun"];
+    { rank=same; pf_openai; pf_haijun; }
+  }
+
+  subgraph cluster_utils {
+    label = "haijunbot_utils (General Utilities)";
+    style = "filled";
+    color = "#f0f0f0";
+    node [fillcolor="#FFF2CC", color="#B57800"];
+    u_config [label="Config Parsing (config)"];
+    u_output [label="Output and Beautification (output)"];
+    u_input [label="Input and Interaction (input)"];
+    u_globals [label="Global State (globals)"];
+    u_embedding [label="tokenization and chunking (embedding)"];
+    u_tag [label="Tag Wrapper (tag)"];
+  }
+
+  subgraph cluster_mcp {
+    label = "haijunbot_mcp (External Tool Client)";
+    style = "filled";
+    color = "#f7f7f7";
+    node [fillcolor="#E1D5E7", color="#9673A6"];
+    mcp_stdio [label="MCP Client: stdio"];
+    mcp_sse [label="MCP Client: sse"];
+    mcp_stream [label="MCP Client: streamable"];
+  }
+
+
+
+  // Key dependency relationships (abstracted to module level)
+  // Agent core dependencies
+  ag_agent -> ag_runloop [label="Delegate Run"];
+  ag_agent -> ag_session [label="Session"];
+  ag_agent -> ag_prompt_mgr [label="Prompts"];
+  ag_agent -> ag_memory_mgr [label="Memory"];
+  ag_agent -> ag_task_analyzer [label="Analysis"];
+  ag_agent -> ag_event_bus [label="Events"];
+  ag_agent -> ag_tool_exec [label="Execute Tools"];
+  ag_agent -> tr_registry [label="Acquire Tools"];
+  ag_agent -> pf_registry [label="Create Platform"];
+
+  // Runtime and platform
+  ag_runloop -> pf_openai [label="Conversation"];
+  ag_runloop -> pf_haijun [label="Conversation"];
+  pf_registry -> pf_base [label="Base Class Dependency", style=dashed];
+  pf_registry -> pf_openai;
+  pf_registry -> pf_haijun;
+
+  // Input processing mounting
+  ag_agent -> ag_input_shell [label="Input Chain"];
+  ag_agent -> ag_input_builtin [label="Input Chain"];
+
+  // Edit patch and tool bridge
+  ag_edit_handler -> st_stats [label="Record Tool Usage"];
+  ag_tool_exec -> tr_registry [label="Locate/Execute Tools"];
+
+  // Tool registry and tool implementation
+  tr_registry -> t_read_code;
+  tr_registry -> t_execute_script;
+  tr_registry -> t_edit_file;
+  tr_registry -> t_rewrite_file;
+  tr_registry -> t_save_memory;
+  tr_registry -> t_retrieve_memory;
+  tr_registry -> t_search_web;
+  tr_registry -> t_sub_agent;
+  tr_registry -> t_sub_code_agent;
+  tr_registry -> t_virtual_tty;
+  tr_registry -> t_file_analyzer;
+  tr_registry -> t_methodology;
+
+  // Tools and general utilities
+  { t_read_code; t_execute_script; t_edit_file; t_rewrite_file; t_save_memory; t_retrieve_memory; t_search_web; t_sub_agent; t_sub_code_agent; t_virtual_tty; t_file_analyzer; t_methodology } -> u_output [label="Display/Logging", style=dashed];
+  { t_read_code; t_edit_file; t_rewrite_file } -> u_embedding [label="Line Numbers/Chunking", style=dashed];
+  { t_save_memory; t_retrieve_memory } -> u_globals [label="Short-term Memory", style=dashed];
+  t_search_web -> pf_registry [label="Summarization Sub-model", style=dashed];
+
+  // Registry usage of MCP
+  tr_registry -> mcp_stdio [label="Load Tools"];
+  tr_registry -> mcp_sse [label="Load Tools"];
+  tr_registry -> mcp_stream [label="Load Tools"];
+
+  // General utilities empower the core
+  ag_agent -> u_config [label="Thresholds/Feature Flags", style=dashed];
+  ag_agent -> u_output [label="Rich Output", style=dashed];
+  ag_agent -> u_input [label="Input Framework", style=dashed];
+  ag_agent -> u_globals [label="Global State", style=dashed];
+
+  // Stats usage points
+  tr_registry -> st_stats [label="Tool Call Count"];
+  ag_manager_cli -> ag_agent [label="Initialize/Run"];
+  ag_manager_cli -> u_config [label="Preload Config", style=dashed];
+
+  // Alignment
+  { rank=same; pf_openai; pf_haijun; }
+  { rank=same; t_read_code; t_execute_script; t_edit_file; t_rewrite_file; t_save_memory; t_retrieve_memory; t_search_web; t_sub_agent; t_sub_code_agent; t_virtual_tty; t_file_analyzer; t_methodology; }
+}

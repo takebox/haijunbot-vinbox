@@ -1,0 +1,132 @@
+digraph G {
+  // --- Global Settings ---
+  graph [rankdir="TB", splines=ortho, fontname="Sans-serif", label="Diagram Title: [Logical View] HaijunBot Overall Architecture (Core Components and Responsibility Relationships)", labelloc="t", newrank=true, nodesep=0.6, ranksep=1.0, overlap=false];
+  node [shape=box, style="rounded,filled", fillcolor="#EFEFEF", fontname="Sans-serif"];
+  edge [fontname="Sans-serif"];
+
+  // Top-level entry (CLI)
+  node [group=interface, shape=cds, fillcolor="#FFE6CC", color="#D79B00"];
+  cli_entry [label="CLI Entry (Command Line Interface)"];
+
+  // Agent core layer
+  subgraph cluster_agent_core {
+    label = "Agent Core Layer";
+    style = "filled";
+    color = "#dddddd";
+    node [group=core, fillcolor="#DAE8FC", color="#6C8EBF"];
+    agent [label="Agent (Session Orchestration)"];
+    run_loop [label="Run Loop (AgentRunLoop)"];
+    session_mgr [label="Session Management (SessionManager)"];
+    prompt_mgr [label="Prompt Management (PromptManager)"];
+    memory_mgr [label="Memory Management (MemoryManager)"];
+    task_analyzer [label="Task Analysis (TaskAnalyzer)"];
+    event_bus [label="Event Bus (EventBus)"];
+  }
+
+  // Input processing layer
+  subgraph cluster_input {
+    label = "Input Processing Layer";
+    style = "filled";
+    color = "#e8e8e8";
+    node [group=input, fillcolor="#FFF2CC", color="#B57800"];
+    shell_handler [label="Shell Input Processing (! Script Execution Bridge)"];
+    builtin_handler [label="Built-in Input Processing (Tag Parsing/Session Control)"];
+  }
+
+  // Tool registration and tool layer
+  subgraph cluster_tools {
+    label = "Tool Registration and Tool Layer";
+    style = "filled";
+    color = "#e8e8e8";
+    node [group=tools, fillcolor="#F8CECC", color="#B85450"];
+    tool_registry [label="Tool Registry (ToolRegistry)"];
+    // Representative tools (abstract)
+    t_read_code [label="Read Code"];
+    t_execute_script [label="Execute Script"];
+    t_edit_file [label="Precise File Editing"];
+    t_rewrite_file [label="Rewrite File"];
+    t_save_memory [label="Save Memory"];
+    t_retrieve_memory [label="Retrieve Memory"];
+    t_search_web [label="Web Search"];
+    t_sub_agent [label="Sub-Agent (General)"];
+    t_sub_code_agent [label="Sub-Agent (Code)"];
+    t_virtual_tty [label="Virtual Terminal"];
+    t_file_analyzer [label="File Analysis"];
+    t_methodology [label="Methodology Management"];
+    { rank=same; t_read_code; t_execute_script; t_edit_file; t_rewrite_file; t_save_memory; t_retrieve_memory; t_search_web; t_sub_agent; t_sub_code_agent; t_virtual_tty; t_file_analyzer; t_methodology; }
+  }
+
+  // Platform and model layer
+  subgraph cluster_platforms {
+    label = "Model Platform Layer";
+    style = "filled";
+    color = "#e8e8e8";
+    node [group=platform, fillcolor="#D5E8D4", color="#82B366"];
+    platform_registry [label="Platform Registry (PlatformRegistry)"];
+    p_openai [label="Platform: OpenAI (Basic Conversation)"];
+    p_haijun [label="Platform: Haijun (Basic Conversation)"];
+    { rank=same; p_openai; p_haijun; }
+  }
+
+  // Data and external resources layer
+  subgraph cluster_data_external {
+    label = "Data and External Resources";
+    style = "filled";
+    color = "#f0f0f0";
+    node [group=data, shape=cylinder, fillcolor="#E1D5E7", color="#9673A6"];
+    memory_store [label="Memory Store\n(~/.haijunbot / project.memory)"];
+    tools_repo [label="Tools and Methodology Repository\n(central Git/local directory)"];
+    node [group=external, shape=box, fillcolor="#F5F5F5", color="#888888"];
+    web_internet [label="Internet/HTTP Resources"];
+    mcp_servers [label="MCP Servers (External Tool Providers)"];
+  }
+
+  // Relationships
+  // Entry to Agent core
+  cli_entry -> agent [label="User Task"];
+  // Agent core internal
+  agent -> run_loop [label="Delegate Run"];
+  agent -> session_mgr [label="Session State"];
+  agent -> prompt_mgr [label="System and Additional Prompt Construction"];
+  agent -> memory_mgr [label="Memory Prompts/Save Strategy"];
+  agent -> task_analyzer [label="Task Analysis/Summary Phase"];
+  agent -> event_bus [label="Event Broadcast"];
+  // Input processing
+  agent -> shell_handler [label="Input Chain"];
+  agent -> builtin_handler [label="Input Chain"];
+  // Tool invocation
+  agent -> tool_registry [label="Tool List/Invocation"];
+  tool_registry -> t_read_code;
+  tool_registry -> t_execute_script;
+  tool_registry -> t_edit_file;
+  tool_registry -> t_rewrite_file;
+  tool_registry -> t_save_memory;
+  tool_registry -> t_retrieve_memory;
+  tool_registry -> t_search_web;
+  tool_registry -> t_sub_agent;
+  tool_registry -> t_sub_code_agent;
+  tool_registry -> t_virtual_tty;
+  tool_registry -> t_file_analyzer;
+  tool_registry -> t_methodology;
+  // Platform interaction
+  agent -> platform_registry [label="Create Platform Instance"];
+  platform_registry -> p_openai;
+  platform_registry -> p_haijun;
+  run_loop -> p_openai [label="Conversation/Streaming Output"];
+  run_loop -> p_haijun [label="Conversation/Streaming Output"];
+  // Data and external resource interaction
+  memory_mgr -> memory_store [label="Read/Write Memory"];
+  t_save_memory -> memory_store [label="Write"];
+  t_retrieve_memory -> memory_store [label="Read"];
+  t_methodology -> tools_repo [label="Methodology Files"];
+  tool_registry -> tools_repo [label="Load Tools/Methodologies"];
+  t_search_web -> web_internet [label="Scrape/Summarize"];
+  t_execute_script -> web_internet [label="External Commands/Network"];
+  tool_registry -> mcp_servers [label="Load MCP Tools"];
+  t_sub_agent -> agent [label="Sub-task Orchestration", style=dashed];
+  t_sub_code_agent -> agent [label="Code Task Orchestration", style=dashed];
+
+  // Intra-layer alignment
+  { rank=same; shell_handler; builtin_handler; }
+  { rank=same; agent; run_loop; }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "HaijunBot Web Gateway",
+  "short_name": "HaijunBot",
+  "description": "HaijunBot Web Gateway PWA",
+  "start_url": "/",
+  "scope": "/",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone", "minimal-ui"],
+  "background_color": "#060911",
+  "theme_color": "#060911",
+  "icons": [
+    {
+      "src": "/icons/haijunbot-pet.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
